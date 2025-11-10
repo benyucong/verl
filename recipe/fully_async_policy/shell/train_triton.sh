@@ -9,4 +9,5 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
+cd /scratch/cs/adis/yuc10/verl
 bash dapo_7b_math_fsdp2_4_4.sh
