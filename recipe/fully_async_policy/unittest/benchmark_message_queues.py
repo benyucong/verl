@@ -30,12 +30,16 @@ from omegaconf import OmegaConf
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 # Import both implementations
-from recipe.fully_async_policy.message_queue import MessageQueue as MessageQueueLock
-from recipe.fully_async_policy.message_queue import MessageQueueClient as ClientLock
+from recipe.fully_async_policy.message_queue import \
+    MessageQueue as MessageQueueLock
+from recipe.fully_async_policy.message_queue import \
+    MessageQueueClient as ClientLock
 
 try:
-    from recipe.fully_async_policy.message_queue_new import MessageQueue as MessageQueueFast
-    from recipe.fully_async_policy.message_queue_new import MessageQueueClient as ClientFast
+    from recipe.fully_async_policy.message_queue_new import \
+        MessageQueue as MessageQueueFast
+    from recipe.fully_async_policy.message_queue_new import \
+        MessageQueueClient as ClientFast
     FASTMQ_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: fastmq not available: {e}")
@@ -163,15 +167,27 @@ class MessageQueueBenchmark:
             "async_training": {"staleness_threshold": 10}
         })
         
+        # Ensure queue size is large enough for all tests
+        max_needed = max(
+            self.config.latency_num_samples,
+            self.config.get_throughput_num_samples,
+            self.config.num_producers * self.config.samples_per_producer
+        )
+        actual_queue_size = max(self.config.max_queue_size, max_needed)
+        
+        if actual_queue_size > self.config.max_queue_size:
+            print(f"\n⚠️  Warning: Increasing queue size from {self.config.max_queue_size} to {actual_queue_size}")
+            print(f"   to accommodate test requirements (largest test needs {max_needed} samples)")
+        
         print(f"\n[{self.name}] Setting up queue...")
-        print(f"  Max queue size: {self.config.max_queue_size}")
+        print(f"  Max queue size: {actual_queue_size}")
         if "num_shards" in kwargs:
             print(f"  Num shards: {kwargs['num_shards']}")
             print(f"  Shard capacity: {kwargs['shard_capacity_bytes'] / 1024:.0f} KB")
         
         self.queue_actor = self.queue_class.remote(
             config=queue_config,
-            max_queue_size=self.config.max_queue_size,
+            max_queue_size=actual_queue_size,
             **kwargs
         )
         await asyncio.sleep(0.2)  # Let polling thread start
@@ -182,11 +198,22 @@ class MessageQueueBenchmark:
     
     async def teardown(self):
         """Cleanup"""
+        print(f"[{self.name}] Tearing down...")
         if self.client:
             try:
-                await asyncio.wait_for(self.client.shutdown(), timeout=2.0)
+                await asyncio.wait_for(self.client.shutdown(), timeout=5.0)
             except asyncio.TimeoutError:
-                pass
+                print(f"Warning: client shutdown timed out")
+            except Exception as e:
+                print(f"Warning: client shutdown failed: {e}")
+        
+        if self.queue_actor:
+            try:
+                # Try to kill the actor
+                ray.kill(self.queue_actor)
+            except Exception as e:
+                print(f"Warning: failed to kill queue actor: {e}")
+        
         await asyncio.sleep(0.2)
     
     async def benchmark_put_latency(self, num_samples: int = 1000) -> List[float]:
@@ -212,20 +239,37 @@ class MessageQueueBenchmark:
         """Measure get operation latency"""
         print(f"[{self.name}] Benchmarking get latency ({num_samples} samples)...")
         
-        # Pre-fill queue
+        # Pre-fill queue and track successful puts
+        successful_puts = 0
         for i in range(num_samples):
-            await self.client.put_sample({"id": i}, param_version=0)
+            try:
+                result = await self.client.put_sample({"id": i}, param_version=0)
+                if result:
+                    successful_puts += 1
+            except Exception as e:
+                print(f"Warning: put_sample failed: {e}")
+                break
+        
+        if successful_puts < num_samples:
+            print(f"Warning: Only {successful_puts}/{num_samples} samples were successfully put")
         
         await asyncio.sleep(0.3)  # Let queue fill
         
         latencies = []
-        for _ in range(num_samples):
-            start = time.perf_counter_ns()
-            result = await self.client.get_sample()
-            end = time.perf_counter_ns()
-            
-            if result is not None:
-                latencies.append((end - start) / 1000.0)  # Microseconds
+        for i in range(successful_puts):
+            try:
+                start = time.perf_counter_ns()
+                result = await asyncio.wait_for(self.client.get_sample(), timeout=5.0)
+                end = time.perf_counter_ns()
+                
+                if result is not None:
+                    latencies.append((end - start) / 1000.0)  # Microseconds
+            except asyncio.TimeoutError:
+                print(f"Warning: get_sample timed out at sample {i}/{successful_puts}")
+                break
+            except Exception as e:
+                print(f"Warning: get_sample failed: {e}")
+                break
         
         return latencies
     
@@ -238,16 +282,26 @@ class MessageQueueBenchmark:
             sample = {"id": i, "timestamp": time.perf_counter_ns()}
             
             start = time.perf_counter_ns()
-            await self.client.put_sample(sample, param_version=0)
-            
-            # Wait a tiny bit for processing
-            await asyncio.sleep(0.0001)
-            
-            result = await self.client.get_sample()
-            end = time.perf_counter_ns()
-            
-            if result is not None:
-                latencies.append((end - start) / 1000.0)  # Microseconds
+            try:
+                put_result = await self.client.put_sample(sample, param_version=0)
+                if not put_result:
+                    print(f"Warning: put_sample failed at sample {i}/{num_samples}")
+                    continue
+                
+                # Wait a tiny bit for processing
+                await asyncio.sleep(0.0001)
+                
+                result = await asyncio.wait_for(self.client.get_sample(), timeout=5.0)
+                end = time.perf_counter_ns()
+                
+                if result is not None:
+                    latencies.append((end - start) / 1000.0)  # Microseconds
+            except asyncio.TimeoutError:
+                print(f"Warning: get_sample timed out during roundtrip test at sample {i}/{num_samples}")
+                break
+            except Exception as e:
+                print(f"Warning: roundtrip test failed at sample {i}: {e}")
+                break
         
         return latencies
     
@@ -274,25 +328,42 @@ class MessageQueueBenchmark:
         """Measure get throughput (samples/second)"""
         print(f"[{self.name}] Benchmarking get throughput ({num_samples} samples)...")
         
-        # Pre-fill queue
+        # Pre-fill queue and track successful puts
+        successful_puts = 0
         for i in range(num_samples):
-            await self.client.put_sample({"id": i}, param_version=0)
+            try:
+                result = await self.client.put_sample({"id": i}, param_version=0)
+                if result:
+                    successful_puts += 1
+            except Exception as e:
+                print(f"Warning: put_sample failed during throughput test: {e}")
+                break
+        
+        if successful_puts < num_samples:
+            print(f"Warning: Only {successful_puts}/{num_samples} samples were successfully put")
         
         await asyncio.sleep(0.5)  # Let queue fill
         
-        # Measure get throughput
+        # Measure get throughput - only try to get what was actually put
         count = 0
         start = time.perf_counter()
         
-        for _ in range(num_samples):
-            result = await self.client.get_sample()
-            if result is not None:
-                count += 1
+        for i in range(successful_puts):
+            try:
+                result = await asyncio.wait_for(self.client.get_sample(), timeout=5.0)
+                if result is not None:
+                    count += 1
+            except asyncio.TimeoutError:
+                print(f"Warning: get_sample timed out at {i}/{successful_puts}")
+                break
+            except Exception as e:
+                print(f"Warning: get_sample failed: {e}")
+                break
         
         elapsed = time.perf_counter() - start
-        throughput = count / elapsed
+        throughput = count / elapsed if elapsed > 0 else 0
         
-        print(f"[{self.name}] Get throughput: {throughput:.2f} samples/sec")
+        print(f"[{self.name}] Get throughput: {throughput:.2f} samples/sec ({count} samples)")
         return throughput
     
     async def benchmark_concurrent_throughput(self, 
@@ -535,8 +606,18 @@ async def main(benchmark_config: BenchmarkConfig = None):
     await bench_lock.setup()
     
     try:
-        result_lock = await bench_lock.run_full_benchmark()
+        # Add timeout to prevent hanging forever
+        result_lock = await asyncio.wait_for(
+            bench_lock.run_full_benchmark(), 
+            timeout=300.0  # 5 minutes max
+        )
         results.append(result_lock)
+    except asyncio.TimeoutError:
+        print(f"\n❌ Lock-based benchmark timed out after 5 minutes!")
+    except Exception as e:
+        print(f"\n❌ Lock-based benchmark failed: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         await bench_lock.teardown()
     
@@ -558,8 +639,18 @@ async def main(benchmark_config: BenchmarkConfig = None):
         )
         
         try:
-            result_fast = await bench_fast.run_full_benchmark()
+            # Add timeout to prevent hanging forever
+            result_fast = await asyncio.wait_for(
+                bench_fast.run_full_benchmark(),
+                timeout=300.0  # 5 minutes max
+            )
             results.append(result_fast)
+        except asyncio.TimeoutError:
+            print(f"\n❌ FastMQ benchmark timed out after 5 minutes!")
+        except Exception as e:
+            print(f"\n❌ FastMQ benchmark failed: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             await bench_fast.teardown()
     else:
