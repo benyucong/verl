@@ -109,6 +109,11 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        # ROCm/AMD: clear HIP_VISIBLE_DEVICES inherited from launcher so Ray's
+        # AMDGPUAcceleratorManager does not raise on inconsistent HIP/CUDA
+        # values inside spawned vLLM engine-core multiprocessing children.
+        if get_visible_devices_keyword() == "CUDA_VISIBLE_DEVICES":
+            os.environ.pop("HIP_VISIBLE_DEVICES", None)
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
         # Forward the Ray job id into the vLLM worker subprocess so the
         # colocated weight-transfer IPC socket path is unique per Ray job.
@@ -540,14 +545,9 @@ class vLLMHttpServer:
                 log_probs=None,
                 routed_experts=None,
                 stop_reason="aborted",
+                extra_fields={"global_steps": self.global_steps, "finish_reason": "abort"},
             )
 
-        extra_fields = {"global_steps": self.global_steps}
-        extract_prompt_logprobs(
-            output=final_res,
-            num_prompt_logprobs=sampling_params.prompt_logprobs,
-            result_dict=extra_fields,
-        )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
@@ -559,6 +559,12 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
+        extra_fields = {"global_steps": self.global_steps, "finish_reason": finish_reason}
+        extract_prompt_logprobs(
+            output=final_res,
+            num_prompt_logprobs=sampling_params.prompt_logprobs,
+            result_dict=extra_fields,
+        )
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):

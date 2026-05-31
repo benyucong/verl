@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -457,8 +459,21 @@ class CheckpointEngineManager:
             ray.get(self.trainer.update_weights(global_steps=global_steps, mode=self.backend))
             return
 
+        sync_start = time.time()
+        print(
+            f"[CheckpointEngineManager] update_weights start global_steps={global_steps} "
+            f"backend={self.backend} replicas={len(self.replicas)}",
+            flush=True,
+        )
+
         # 1. abort and save all unfinished requests for partial rollout
+        phase_start = time.time()
         await self.abort_replicas()
+        print(
+            f"[CheckpointEngineManager] abort_replicas done "
+            f"elapsed={time.time() - phase_start:.2f}s",
+            flush=True,
+        )
 
         # 2. create a temporay worker group for all replicas
         workers = []
@@ -468,28 +483,91 @@ class CheckpointEngineManager:
         trainer = self.trainer
 
         # 3. release kv_cache before weight sync (weights stay in place)
+        phase_start = time.time()
         await self.release_kv_cache_replicas()
+        print(
+            f"[CheckpointEngineManager] release_kv_cache_replicas done "
+            f"elapsed={time.time() - phase_start:.2f}s",
+            flush=True,
+        )
 
         # 4. build process group
+        phase_start = time.time()
         self.build_process_group(rollout)
+        print(
+            f"[CheckpointEngineManager] build_process_group done "
+            f"elapsed={time.time() - phase_start:.2f}s",
+            flush=True,
+        )
 
         # 5. update weights of all workers
+        phase_start = time.time()
         ray.get(
             trainer.update_weights(global_steps=global_steps, mode=self.backend)
             + rollout.update_weights(global_steps=global_steps)
         )
+        print(
+            f"[CheckpointEngineManager] worker update_weights done "
+            f"elapsed={time.time() - phase_start:.2f}s",
+            flush=True,
+        )
 
         # 6. finalize all workers
+        phase_start = time.time()
         ray.get(
             trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
+        print(
+            f"[CheckpointEngineManager] finalize done "
+            f"elapsed={time.time() - phase_start:.2f}s",
+            flush=True,
+        )
 
         # 7. restore kv_cache after weight sync
+        phase_start = time.time()
         await self.resume_kv_cache_replicas()
+        print(
+            f"[CheckpointEngineManager] resume_kv_cache_replicas done "
+            f"elapsed={time.time() - phase_start:.2f}s",
+            flush=True,
+        )
 
         # 8. resume all unfinished requests for partial rollout
-        await self.resume_generation_replicas()
+        phase_start = time.time()
+        try:
+            resume_timeout = max(0.0, float(os.environ.get("OPD_CHECKPOINT_RESUME_TIMEOUT_S", "0") or 0))
+        except ValueError:
+            resume_timeout = 0.0
+        if resume_timeout > 0:
+            resume_task = asyncio.create_task(self.resume_generation_replicas())
+            done, _pending = await asyncio.wait({resume_task}, timeout=resume_timeout)
+            if resume_task not in done:
+                def _log_resume_task_result(task):
+                    try:
+                        task.result()
+                    except Exception as exc:
+                        print(
+                            "[CheckpointEngineManager] background resume_generation_replicas "
+                            f"failed: {exc!r}",
+                            flush=True,
+                        )
+
+                resume_task.add_done_callback(_log_resume_task_result)
+                print(
+                    f"[CheckpointEngineManager] resume_generation_replicas timed out "
+                    f"after {resume_timeout:.1f}s; continuing after weights were synced",
+                    flush=True,
+                )
+            else:
+                await resume_task
+        else:
+            await self.resume_generation_replicas()
+        print(
+            f"[CheckpointEngineManager] resume_generation_replicas phase done "
+            f"elapsed={time.time() - phase_start:.2f}s total={time.time() - sync_start:.2f}s",
+            flush=True,
+        )
 
 
 async def split_weight_chunks(

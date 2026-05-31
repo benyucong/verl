@@ -388,6 +388,7 @@ class AgentLoopWorker:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.chunk_message_queue_client = None
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
@@ -437,6 +438,10 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+
+    def set_chunk_message_queue_client(self, message_queue_client) -> None:
+        """Install a trainer queue publisher for streaming chunk payloads."""
+        self.chunk_message_queue_client = message_queue_client
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
         """Return multimodal processor kwargs with audio sampling-rate defaults."""
@@ -573,10 +578,193 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            run_kwargs = dict(kwargs)
+            if self._should_stream_chunks(agent_name=agent_name, validate=trajectory["validate"]):
+                run_kwargs["_chunk_callback"] = self._make_chunk_callback(
+                    sample_kwargs=kwargs,
+                    validate=trajectory["validate"],
+                )
+
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
+            for key in ("xiaoshuai_sample_id", "xiaoshuai_parent_sample_id", "xiaoshuai_epoch"):
+                if key in kwargs:
+                    output.extra_fields[key] = self._to_python_scalar(kwargs[key])
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
-    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+    def _should_stream_chunks(self, *, agent_name: str, validate: bool) -> bool:
+        """Return True when this worker can publish trainer-visible chunks during generation."""
+        if validate or self.chunk_message_queue_client is None or agent_name != "single_turn_agent":
+            return False
+        if not self.distillation_enabled:
+            return False
+        distillation_loss = self.config.distillation.get("distillation_loss", {})
+        use_task_rewards = distillation_loss.get("use_task_rewards", False)
+        if isinstance(use_task_rewards, str):
+            use_task_rewards = use_task_rewards.strip().lower() in {"1", "true", "yes", "on"}
+        if bool(use_task_rewards):
+            return False
+
+        from verl.experimental.fully_async_policy.detach_utils import get_chunk_token_size
+
+        return get_chunk_token_size(self.config) > 0
+
+    def _make_chunk_callback(self, *, sample_kwargs: dict[str, Any], validate: bool):
+        async def _chunk_callback(
+            output: AgentLoopOutput,
+            *,
+            chunk_idx: int,
+            token_offset: int,
+            n_tokens: int,
+            is_final: bool,
+        ) -> bool:
+            return await self._publish_streaming_chunk(
+                output,
+                sample_kwargs=sample_kwargs,
+                validate=validate,
+                chunk_idx=chunk_idx,
+                token_offset=token_offset,
+                n_tokens=n_tokens,
+                is_final=is_final,
+            )
+
+        return _chunk_callback
+
+    @staticmethod
+    def _to_python_scalar(value):
+        if isinstance(value, np.ndarray):
+            if value.shape == ():
+                return value.item()
+            if len(value) == 1:
+                return AgentLoopWorker._to_python_scalar(value[0])
+            return value.tolist()
+        if hasattr(value, "item"):
+            return value.item()
+        return value
+
+    @staticmethod
+    def _single_item_non_tensor_batch(sample_kwargs: dict[str, Any]) -> dict[str, np.ndarray]:
+        non_tensor_batch = {}
+        for key, value in sample_kwargs.items():
+            arr = np.empty(1, dtype=object)
+            arr[0] = AgentLoopWorker._to_python_scalar(value)
+            non_tensor_batch[key] = arr
+        return non_tensor_batch
+
+    @staticmethod
+    def _first_non_tensor_value(batch: DataProto, key: str, default=None):
+        values = batch.non_tensor_batch.get(key)
+        if values is None or len(values) == 0:
+            return default
+        return AgentLoopWorker._to_python_scalar(values[0])
+
+    async def _publish_streaming_chunk(
+        self,
+        output: AgentLoopOutput,
+        *,
+        sample_kwargs: dict[str, Any],
+        validate: bool,
+        chunk_idx: int,
+        token_offset: int,
+        n_tokens: int,
+        is_final: bool,
+    ) -> bool:
+        """Postprocess and publish a single in-flight chunk as a ChunkSample."""
+        if self.chunk_message_queue_client is None or n_tokens <= 0:
+            return False
+
+        sample_id = self._to_python_scalar(sample_kwargs.get("xiaoshuai_sample_id"))
+        if not sample_id:
+            logger.warning("Streaming chunk requested but xiaoshuai_sample_id is missing; skipping chunk publish")
+            return False
+        parent_sample_id = self._to_python_scalar(sample_kwargs.get("xiaoshuai_parent_sample_id", sample_id))
+        epoch = self._to_python_scalar(sample_kwargs.get("xiaoshuai_epoch", -1))
+
+        from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
+        from verl.experimental.fully_async_policy.opd_stage0_trace import trace_chunk_event
+
+        try:
+            output.reward_score = 0.0
+            internal = await self._agent_loop_postprocess(
+                output,
+                validate,
+                compute_score=False,
+                compute_teacher_logprobs=True,
+                **sample_kwargs,
+            )
+            chunk_batch = self._postprocess(
+                [internal],
+                input_non_tensor_batch=self._single_item_non_tensor_batch(sample_kwargs),
+                validate=validate,
+            )
+
+            batch_size = len(chunk_batch)
+            chunk_batch.non_tensor_batch["uid"] = np.array([f"uid_{parent_sample_id}"] * batch_size, dtype=object)
+            chunk_batch.non_tensor_batch["chunk_sample_id"] = np.array([sample_id] * batch_size, dtype=object)
+            chunk_batch.non_tensor_batch["chunk_parent_sample_id"] = np.array(
+                [parent_sample_id] * batch_size, dtype=object
+            )
+            chunk_batch.non_tensor_batch["chunk_idx"] = np.array([chunk_idx] * batch_size, dtype=np.int32)
+            chunk_batch.non_tensor_batch["chunk_token_offset"] = np.array([token_offset] * batch_size, dtype=np.int32)
+            chunk_batch.non_tensor_batch["chunk_n_tokens"] = np.array([n_tokens] * batch_size, dtype=np.int32)
+            chunk_batch.non_tensor_batch["chunk_is_final"] = np.array([is_final] * batch_size, dtype=bool)
+
+            min_global_steps = self._first_non_tensor_value(chunk_batch, "min_global_steps")
+            max_global_steps = self._first_non_tensor_value(chunk_batch, "max_global_steps")
+            policy_version = min_global_steps if min_global_steps is not None else max_global_steps
+            policy_version = int(policy_version or 0)
+            chunk_batch.non_tensor_batch["chunk_policy_version"] = np.array(
+                [policy_version] * batch_size, dtype=np.int32
+            )
+
+            chunk = ChunkSample(
+                sample_id=str(sample_id),
+                chunk_idx=int(chunk_idx),
+                token_offset=int(token_offset),
+                n_tokens=int(n_tokens),
+                tokens=list(output.response_ids[token_offset : token_offset + n_tokens]),
+                is_final=bool(is_final),
+                policy_version=policy_version,
+                parent_payload=chunk_batch,
+                meta={
+                    "epoch": epoch,
+                    "parent_sample_id": parent_sample_id,
+                    "row_id": sample_id,
+                    "chunk_id": f"{sample_id}:{chunk_idx}",
+                    "source": "streaming",
+                    "response_end": token_offset + n_tokens,
+                    "response_width": self.rollout_config.response_length,
+                },
+            )
+            success = await self.chunk_message_queue_client.put_sample(ray.cloudpickle.dumps(chunk))
+            trace_chunk_event(
+                "chunk_emit",
+                sample_id=chunk.sample_id,
+                chunk_idx=chunk.chunk_idx,
+                role="rollouter",
+                n_tokens=chunk.n_tokens,
+                token_offset=chunk.token_offset,
+                policy_version=chunk.policy_version,
+                is_final=chunk.is_final,
+                row_id=chunk.sample_id,
+                source="streaming",
+                streaming=True,
+                success=bool(success),
+                parent_sample_id=parent_sample_id,
+                finish_reason=output.extra_fields.get("finish_reason"),
+            )
+            return bool(success)
+        except Exception:
+            logger.exception("Failed to publish streaming chunk sample_id=%s chunk_idx=%s", sample_id, chunk_idx)
+            return False
+
+    async def _agent_loop_postprocess(
+        self,
+        output,
+        validate,
+        compute_score: bool = True,
+        compute_teacher_logprobs: bool = True,
+        **kwargs,
+    ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -682,14 +870,16 @@ class AgentLoopWorker:
                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
             ),
         )
-        await self._compute_score([output], kwargs=kwargs)
-        await self._compute_teacher_logprobs(
-            output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
-        )
+        if compute_score:
+            await self._compute_score([output], kwargs=kwargs)
+        if compute_teacher_logprobs:
+            await self._compute_teacher_logprobs(
+                output,
+                prompt_ids=output.prompt_ids,
+                response_ids=output.response_ids,
+                validate=validate,
+                sample_kwargs=kwargs,
+            )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
@@ -1064,6 +1254,13 @@ class AgentLoopManager:
                     self.reward_loop_worker_handles,
                 )
             )
+
+    @auto_await
+    async def set_chunk_message_queue_client(self, message_queue_client) -> None:
+        """Forward the fully-async chunk queue client to all agent loop workers."""
+        await asyncio.gather(
+            *(worker.set_chunk_message_queue_client.remote(message_queue_client) for worker in self.agent_loop_workers)
+        )
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:

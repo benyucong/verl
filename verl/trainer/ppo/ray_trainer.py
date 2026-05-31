@@ -1221,6 +1221,9 @@ class RayPPOTrainer:
         )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        chunk_actor_mini_batch_size = batch.meta_info.get("fully_async/chunk_batch/actor_mini_batch_size")
+        if chunk_actor_mini_batch_size is not None:
+            ppo_mini_batch_size = int(chunk_actor_mini_batch_size)
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle

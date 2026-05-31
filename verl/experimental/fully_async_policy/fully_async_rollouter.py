@@ -27,10 +27,17 @@ from omegaconf import DictConfig
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
+    create_chunk_samples_from_rollout_sample,
+    get_chunk_token_size,
+    is_chunk_data_path_enabled,
     prepare_single_generation_data,
     safe_create_task,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.opd_stage0_trace import (
+    trace_chunk_event as _stage0_trace_chunk,
+    trace_event as _stage0_trace,
+)
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, ResourcePoolManager
@@ -46,6 +53,14 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _partial_rollout_abort_retry_delay_s() -> float:
+    value = os.environ.get("OPD_PARTIAL_ROLLOUT_ABORT_RETRY_DELAY_S", "1").strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return 1.0
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
@@ -124,6 +139,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
+            final_output.extra_fields.update(output.extra_fields or {})
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
@@ -142,7 +158,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
                 break
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(_partial_rollout_abort_retry_delay_s())
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
@@ -491,8 +507,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Statistics
         self.total_generated_samples = 0
+        self.total_generated_chunks = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
+        self.dropped_stale_chunks = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
@@ -523,6 +541,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Set message queue client"""
         async with self.lock:
             self.message_queue_client = message_queue_client
+        if self.async_rollout_manager is not None and is_chunk_data_path_enabled(self.config):
+            await self.async_rollout_manager.set_chunk_message_queue_client(message_queue_client)
 
     async def set_max_required_samples(self):
         async with self.lock:
@@ -539,6 +559,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
+            chunk_tokens = get_chunk_token_size(self.config)
+            if chunk_tokens > 0:
+                response_length = int(self.config.actor_rollout_ref.rollout.response_length)
+                chunk_multiplier = max(1, (response_length + chunk_tokens - 1) // chunk_tokens)
+                self.max_queue_size *= chunk_multiplier
+                max_queue_size_env = os.environ.get("OPD_STAGE1_MAX_QUEUE_SIZE", "").strip()
+                if max_queue_size_env:
+                    try:
+                        self.max_queue_size = max(self.max_queue_size, int(max_queue_size_env))
+                    except ValueError:
+                        logger.warning("Ignoring invalid OPD_STAGE1_MAX_QUEUE_SIZE=%r", max_queue_size_env)
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -564,13 +595,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Reset staleness samples after parameter update.
         Returns timing_raw dictionary for metrics.
         """
+        reset_start = time.time()
         async with self.lock:
             self.paused = False
             # Wake the drain loop in _processor_worker so it can exit early and resume submitting
             # new samples to idle replicas instead of waiting for long-tail in-flight tasks.
             self._resume_event.set()
+            active_task_count = len(self.active_tasks)
+
+        # Avoid holding the rollouter state lock across RPC.  The processor
+        # also needs this lock to make forward progress after a param sync.
+        queue_size = await self.message_queue_client.get_queue_size()
+
+        async with self.lock:
             # every time param change, reset staleness_samples
-            self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
+            self.staleness_samples = active_task_count + queue_size
             timing_raw = {}
             rollout_version_time = max(time.time() - self.step_start_time, 1e-6)
             if self.idle_start_time > self.step_start_time:
@@ -586,7 +625,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             print(
                 f"[FullyAsyncRollouter][Public][reset_staleness] "
                 f"reset staleness_samples to: {self.staleness_samples} "
-                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
+                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f} "
+                f"elapsed={time.time() - reset_start:.2f}s"
             )
             self.step_start_time = time.time()
 
@@ -800,6 +840,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
+        if self.message_queue_client is not None and is_chunk_data_path_enabled(self.config):
+            await self.async_rollout_manager.set_chunk_message_queue_client(self.message_queue_client)
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
@@ -810,6 +852,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
             sample_id = f"sample_{epoch}_{self.global_steps}"
+            row_sample_ids = np.array([f"{sample_id}_r{i}" for i in range(len(full_batch))], dtype=object)
+            full_batch.non_tensor_batch["xiaoshuai_sample_id"] = row_sample_ids
+            full_batch.non_tensor_batch["xiaoshuai_parent_sample_id"] = np.array(
+                [sample_id] * len(full_batch), dtype=object
+            )
+            full_batch.non_tensor_batch["xiaoshuai_epoch"] = np.array([epoch] * len(full_batch), dtype=np.int32)
 
             rollout_sample = RolloutSample(
                 full_batch=full_batch,
@@ -863,7 +911,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             async with self.lock:
                                 for task in actual_done:
                                     self.active_tasks.discard(task)
-                                    await task
+                            for task in actual_done:
+                                await task
                         if resume_future in done:
                             print(
                                 "[FullyAsyncRollouter][Processor] "
@@ -891,24 +940,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
                 )
                 while self.active_tasks:
+                    wait_set = set(self.active_tasks)
+                    done_tasks, _pending_tasks = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
                     async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                            for task in done_tasks:
-                                await task
+                        for task in done_tasks:
+                            self.active_tasks.discard(task)
+                    for task in done_tasks:
+                        await task
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
+                wait_set = set(self.active_tasks)
+                done_tasks, _pending_tasks = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
                 async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        for task in done_tasks:
-                            await task
+                    for task in done_tasks:
+                        self.active_tasks.discard(task)
+                for task in done_tasks:
+                    await task
 
             # Submit single sample processing
             if self.paused:
@@ -922,22 +971,260 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
+        # Stage-0 profiling: mark when generation starts for this sample.
+        _gen_start_ts = time.time()
+        _stage0_trace("gen_start", rollout_sample.sample_id, role="rollouter")
+        _row_sample_ids = rollout_sample.full_batch.non_tensor_batch.get("xiaoshuai_sample_id")
+        if _row_sample_ids is not None and is_chunk_data_path_enabled(self.config):
+            for _row_sample_id in _row_sample_ids:
+                _stage0_trace(
+                    "gen_start",
+                    str(_row_sample_id),
+                    role="rollouter",
+                    parent_sample_id=rollout_sample.sample_id,
+                )
         # Calling asynchronous generation methods
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        # Stage-0 profiling: mark generation end with response length.
+        # Try several common DataProto keys; fall back to shape.
+        _gen_end_ts = time.time()
+        _l_i = None
+        try:
+            _batch = getattr(ret, "batch", None)
+            if _batch is not None:
+                if "response_mask" in _batch:
+                    _l_i = int(_batch["response_mask"].sum().item())
+                elif "responses" in _batch:
+                    _l_i = int(_batch["responses"].shape[-1])
+            _stage0_trace(
+                "gen_end",
+                rollout_sample.sample_id,
+                role="rollouter",
+                L_i=_l_i,
+                sample_finish_ts=_gen_end_ts,
+                _trace_ts=_gen_end_ts,
+            )
+            if _row_sample_ids is not None and is_chunk_data_path_enabled(self.config):
+                _row_lengths = None
+                if _batch is not None and "response_mask" in _batch:
+                    _row_lengths = _batch["response_mask"].sum(dim=1).detach().cpu().tolist()
+                elif _batch is not None and "responses" in _batch:
+                    _row_lengths = [_batch["responses"].shape[-1]] * len(_row_sample_ids)
+                for _row_sample_id, _row_len in zip(_row_sample_ids, _row_lengths or [], strict=False):
+                    _stage0_trace(
+                        "gen_end",
+                        str(_row_sample_id),
+                        role="rollouter",
+                        L_i=int(_row_len),
+                        parent_sample_id=rollout_sample.sample_id,
+                        sample_finish_ts=_gen_end_ts,
+                        _trace_ts=_gen_end_ts,
+                    )
+        except Exception:
+            _stage0_trace("gen_end", rollout_sample.sample_id, role="rollouter")
+
+        if not is_chunk_data_path_enabled(self.config):
+            # Stage-1: synthetic chunk emission for A/B against Stage-0 baseline.
+            # When OPD_STAGE1_CHUNK_TOKENS > 0, we *retrospectively* emit one
+            # chunk_emit event per c-token slice, dating each event at the
+            # moment that slice would have completed under a linear-rate decoding
+            # model (interpolating between gen_start and gen_end). Trainer/teacher
+            # data path is unchanged; this only populates the chunk_* event
+            # stream so analyze_stage0.py can compare realized vs predicted
+            # recoverable fractions before we flip the actual data path.
+            self._emit_synthetic_chunks(
+                sample_id=rollout_sample.sample_id,
+                l_i=_l_i,
+                gen_start_ts=_gen_start_ts,
+                gen_end_ts=_gen_end_ts,
+            )
+
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
 
+        if is_chunk_data_path_enabled(self.config):
+            emitted_chunks = self._count_streaming_chunks(ret)
+            if emitted_chunks > 0:
+                self._record_streaming_chunk_publication(
+                    ret=ret,
+                    rollout_sample=rollout_sample,
+                    emitted_chunks=emitted_chunks,
+                )
+                return
+            await self._publish_chunk_samples(rollout_sample)
+            return
+
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
+        )
+        _stage0_trace(
+            "put",
+            rollout_sample.sample_id,
+            role="rollouter",
+            success=bool(success),
         )
         if success:
             self.total_generated_samples += 1
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+    def _count_streaming_chunks(self, output: DataProto) -> int:
+        values = output.non_tensor_batch.get("streaming_chunks_emitted")
+        if values is None:
+            return 0
+        total = 0
+        for value in values:
+            if value is None:
+                continue
+            if hasattr(value, "item"):
+                value = value.item()
+            try:
+                total += int(value)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    def _record_streaming_chunk_publication(
+        self,
+        *,
+        ret: DataProto,
+        rollout_sample: RolloutSample,
+        emitted_chunks: int,
+    ) -> None:
+        """Update rollouter counters for chunks already emitted by AgentLoopWorkers."""
+        sample_ids = ret.non_tensor_batch.get("xiaoshuai_sample_id")
+        chunk_counts = ret.non_tensor_batch.get("streaming_chunks_emitted")
+        successful_rows = 0
+        if sample_ids is not None and chunk_counts is not None:
+            for sample_id, count in zip(sample_ids, chunk_counts, strict=False):
+                try:
+                    count = int(count.item() if hasattr(count, "item") else count or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                if count <= 0:
+                    continue
+                successful_rows += 1
+                _stage0_trace(
+                    "put",
+                    str(sample_id),
+                    role="rollouter",
+                    success=True,
+                    chunks=count,
+                    parent_sample_id=rollout_sample.sample_id,
+                    streaming=True,
+                )
+
+        if successful_rows == 0:
+            successful_rows = 1
+            _stage0_trace(
+                "put",
+                rollout_sample.sample_id,
+                role="rollouter",
+                success=True,
+                chunks=emitted_chunks,
+                streaming=True,
+            )
+
+        self.total_generated_chunks += emitted_chunks
+        self.total_generated_samples += successful_rows
+        self.processed_sample_count += successful_rows
+
+    async def _publish_chunk_samples(self, rollout_sample: RolloutSample) -> None:
+        """Publish real chunk payloads for trainer-side chunk consumption."""
+        chunk_tokens = get_chunk_token_size(self.config)
+        chunk_samples = create_chunk_samples_from_rollout_sample(
+            rollout_sample=rollout_sample,
+            chunk_tokens=chunk_tokens,
+        )
+        emitted_chunks = 0
+        for chunk in chunk_samples:
+            success = await self.message_queue_client.put_sample(sample=ray.cloudpickle.dumps(chunk))
+            _stage0_trace_chunk(
+                "chunk_emit",
+                sample_id=chunk.sample_id,
+                chunk_idx=chunk.chunk_idx,
+                role="rollouter",
+                n_tokens=chunk.n_tokens,
+                token_offset=chunk.token_offset,
+                policy_version=chunk.policy_version,
+                is_final=chunk.is_final,
+                row_id=chunk.meta.get("row_id", chunk.sample_id),
+                source=chunk.meta.get("source", "fallback"),
+                streaming=False,
+                parent_sample_id=chunk.meta.get("parent_sample_id", rollout_sample.sample_id),
+                success=bool(success),
+            )
+            if success:
+                emitted_chunks += 1
+                self.total_generated_chunks += 1
+            else:
+                self.dropped_stale_chunks += 1
+
+        sample_success = emitted_chunks > 0
+        _stage0_trace(
+            "put",
+            rollout_sample.sample_id,
+            role="rollouter",
+            success=sample_success,
+            chunks=emitted_chunks,
+        )
+        if sample_success:
+            self.total_generated_samples += 1
+        else:
+            self.dropped_stale_samples += 1
+        self.processed_sample_count += 1
+
+    def _emit_synthetic_chunks(
+        self,
+        sample_id: str,
+        l_i: int | None,
+        gen_start_ts: float,
+        gen_end_ts: float,
+    ) -> None:
+        """Emit Stage-1 chunk_emit trace events under a linear-rate model.
+
+        Opt-in via env var OPD_STAGE1_CHUNK_TOKENS (int, default 0 = disabled).
+        Each event is back-dated to the timestamp the chunk would have been
+        ready had the rollouter actually streamed it out. No on-wire data
+        path change here; this only feeds the analyzer.
+        """
+        try:
+            c = int(os.environ.get("OPD_STAGE1_CHUNK_TOKENS", "0"))
+        except ValueError:
+            c = 0
+        if c <= 0 or not l_i or l_i <= 0:
+            return
+        gen_dur = max(gen_end_ts - gen_start_ts, 1e-9)
+        # Inclusive chunk boundaries: chunks of size c, last one may be short.
+        n_chunks = (l_i + c - 1) // c
+        policy_version = int(getattr(self, "global_steps", 0))
+        for idx in range(n_chunks):
+            tok_start = idx * c
+            tok_end = min(tok_start + c, l_i)
+            n_tok = tok_end - tok_start
+            # Linear-rate ready time: chunk ready when its last token decoded.
+            ready_frac = tok_end / float(l_i)
+            ready_ts = gen_start_ts + ready_frac * gen_dur
+            # Inject a synthetic timestamp via a dedicated extra field so the
+            # analyzer can prefer it over the wall-clock ts of the trace_event
+            # call (which would all collapse near gen_end).
+            _stage0_trace_chunk(
+                "chunk_emit",
+                sample_id=sample_id,
+                chunk_idx=idx,
+                role="rollouter",
+                n_tokens=n_tok,
+                token_offset=tok_start,
+                policy_version=policy_version,
+                is_final=(idx == n_chunks - 1),
+                source="synthetic",
+                streaming=False,
+                synthetic_ready_ts=ready_ts,
+            )
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -1098,8 +1385,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # counting stats
             "count/total_generated_samples": self.total_generated_samples,
+            "count/total_generated_chunks": self.total_generated_chunks,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
+            "count/dropped_stale_chunks": self.dropped_stale_chunks,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,

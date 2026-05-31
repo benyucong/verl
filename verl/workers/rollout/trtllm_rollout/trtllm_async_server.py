@@ -377,9 +377,13 @@ class TRTLLMHttpServer:
                 token_ids=token_ids,
                 log_probs=log_probs,
                 stop_reason="aborted",
-                extra_fields={"global_steps": self.global_steps},
+                extra_fields={"global_steps": self.global_steps, "finish_reason": "cancelled"},
             )
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs, extra_fields={"global_steps": self.global_steps})
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=log_probs,
+            extra_fields={"global_steps": self.global_steps, "finish_reason": outputs.outputs[0].finish_reason},
+        )
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""

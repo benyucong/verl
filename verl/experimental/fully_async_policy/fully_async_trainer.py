@@ -27,9 +27,24 @@ from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
+    assemble_batch_from_chunk_samples,
     assemble_batch_from_rollout_samples,
+    choose_chunk_actor_mini_batch_size,
+    get_chunk_batch_memory_limits_from_env,
+    get_chunk_row_count,
+    get_chunk_staleness_threshold,
+    get_chunk_token_budget,
+    get_chunk_token_size,
+    is_chunk_data_path_enabled,
+    select_chunk_samples_for_train_batch,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.opd_stage0_trace import (
+    is_enabled as _stage0_is_enabled,
+    trace_chunk_event as _stage0_trace_chunk,
+    trace_event as _stage0_trace,
+)
+from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
@@ -136,7 +151,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Statistics
         self.local_trigger_step = 1
         self.processed_samples = 0
+        self.processed_chunks = 0
         self.stale_trajectory_processed = 0
+        self.stale_chunks_dropped = 0
+        self._pending_chunk_samples: list[ChunkSample] = []
+        self._chunk_queue_terminated = False
         self.current_param_version = 0
         self.total_train_steps = None
         self.progress_bar = None
@@ -278,6 +297,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Returns:
             tuple: (epoch, batch_dict, gen_batch_output)
         """
+        if is_chunk_data_path_enabled(self.config):
+            return await self._get_chunks_from_queue()
+
         print(
             f"[FullyAsyncTrainer] Requesting {self.required_samples} samples from queue",
             flush=True,
@@ -297,6 +319,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
+
+            # Stage-0 profiling: record per-sample arrival time at trainer.
+            # Peek the sample_id by unpickling only when tracing is enabled.
+            if _stage0_is_enabled():
+                try:
+                    _peeked = ray.cloudpickle.loads(sample)
+                    _sid = getattr(_peeked, "sample_id", "unknown")
+                    _stage0_trace(
+                        "get",
+                        _sid,
+                        role="trainer",
+                        queue_len=int(queue_len) if queue_len is not None else -1,
+                    )
+                except Exception:
+                    pass
 
             queue_samples.append(sample)
 
@@ -327,6 +364,276 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+        return 0, batch
+
+    def _get_chunk_batch_divisor(self) -> int:
+        """Return the row-count divisor required by trainer-side batch balancing."""
+        if not self.config.trainer.balance_batch:
+            return 1
+        try:
+            return max(1, int(self._get_dp_size(self.actor_rollout_wg, "actor")))
+        except Exception as exc:
+            fallback = max(1, int(self.config.trainer.nnodes) * int(self.config.trainer.n_gpus_per_node))
+            print(
+                "[FullyAsyncTrainer] Could not query actor DP size for chunk batching; "
+                f"falling back to trainer GPU count {fallback}. Error: {exc}",
+                flush=True,
+            )
+            return fallback
+
+    def _trace_chunk_get_event(self, chunk: ChunkSample, queue_len: int | None, accepted: bool, drop_reason=None):
+        meta = chunk.meta if isinstance(chunk.meta, dict) else {}
+        source = meta.get("source", "unknown")
+        row_id = meta.get("row_id", chunk.sample_id)
+        chunk_get_ts = meta.get("_trainer_chunk_get_ts")
+        if chunk_get_ts is None:
+            chunk_get_ts = time.time()
+            meta["_trainer_chunk_get_ts"] = chunk_get_ts
+        policy_version_lag = self.current_param_version - int(chunk.policy_version)
+        _stage0_trace_chunk(
+            "chunk_get",
+            chunk.sample_id,
+            chunk.chunk_idx,
+            role="trainer",
+            n_tokens=chunk.n_tokens,
+            token_offset=chunk.token_offset,
+            policy_version=chunk.policy_version,
+            is_final=chunk.is_final,
+            row_id=row_id,
+            source=source,
+            parent_sample_id=meta.get("parent_sample_id", chunk.sample_id),
+            trainer_policy_version=self.current_param_version,
+            policy_version_lag=policy_version_lag,
+            accepted=accepted,
+            drop_reason=drop_reason,
+            queue_len=int(queue_len) if queue_len is not None else -1,
+            chunk_get_ts=float(chunk_get_ts),
+        )
+        if accepted and chunk.is_final:
+            _stage0_trace(
+                "get",
+                chunk.sample_id,
+                role="trainer",
+                queue_len=int(queue_len) if queue_len is not None else -1,
+            )
+
+    def _drop_stale_chunk(self, chunk: ChunkSample, sigma: float, queue_len: int | None):
+        meta = chunk.meta if isinstance(chunk.meta, dict) else {}
+        source = meta.get("source", "unknown")
+        row_id = meta.get("row_id", chunk.sample_id)
+        policy_version_lag = self.current_param_version - int(chunk.policy_version)
+        self.stale_chunks_dropped += 1
+        self._trace_chunk_get_event(chunk, queue_len=queue_len, accepted=False, drop_reason="stale")
+        _stage0_trace_chunk(
+            "chunk_drop_stale",
+            chunk.sample_id,
+            chunk.chunk_idx,
+            role="trainer",
+            n_tokens=chunk.n_tokens,
+            token_offset=chunk.token_offset,
+            policy_version=chunk.policy_version,
+            is_final=chunk.is_final,
+            row_id=row_id,
+            source=source,
+            parent_sample_id=meta.get("parent_sample_id", chunk.sample_id),
+            trainer_policy_version=self.current_param_version,
+            current_version=self.current_param_version,
+            policy_version_lag=policy_version_lag,
+            accepted=False,
+            drop_reason="stale",
+            sigma=sigma,
+        )
+
+    def _min_train_chunks_for_divisor(self, batch_divisor: int) -> int:
+        divisor = max(1, int(batch_divisor))
+        return ((int(self.required_samples) + divisor - 1) // divisor) * divisor
+
+    async def _get_chunks_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
+        """Collect trainer-visible chunks by token budget and assemble a batch."""
+        chunk_tokens = get_chunk_token_size(self.config)
+        token_budget = get_chunk_token_budget(self.config, chunk_tokens=chunk_tokens)
+        sigma = get_chunk_staleness_threshold(self.config)
+        batch_divisor = self._get_chunk_batch_divisor()
+        configured_actor_mini_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
+            self.config.actor_rollout_ref.rollout.get("n", 1)
+        )
+        train_row_divisor = batch_divisor
+        min_train_chunks = self._min_train_chunks_for_divisor(batch_divisor)
+        memory_limits = get_chunk_batch_memory_limits_from_env()
+        has_memory_budget = any(value is not None for value in memory_limits.values())
+        selection_min_rows = batch_divisor if has_memory_budget else min_train_chunks
+        print(
+            f"[FullyAsyncTrainer] Requesting chunks from queue "
+            f"(token_budget={token_budget}, min_chunks={min_train_chunks}, "
+            f"batch_divisor={batch_divisor}, train_row_divisor={train_row_divisor}, sigma={sigma}, "
+            f"max_chunk_rows={memory_limits['max_chunk_rows']}, "
+            f"max_train_tokens={memory_limits['max_train_tokens']}, "
+            f"max_effective_seq_len={memory_limits['max_effective_seq_len']})",
+            flush=True,
+        )
+
+        consumer_start = time.time()
+        queue_chunks: list[ChunkSample] = []
+        queue_len = 0
+        token_count = 0
+        row_count = 0
+        pending_chunks_before = len(self._pending_chunk_samples)
+        pending_rows_before = sum(get_chunk_row_count(chunk) for chunk in self._pending_chunk_samples)
+        if self._pending_chunk_samples:
+            print(
+                f"[FullyAsyncTrainer] Reusing {len(self._pending_chunk_samples)} deferred chunks "
+                "from the previous batch",
+                flush=True,
+            )
+        pending_chunks = self._pending_chunk_samples
+        self._pending_chunk_samples = []
+        for chunk in pending_chunks:
+            queue_len = int(chunk.meta.get("_trainer_queue_len", -1)) if isinstance(chunk.meta, dict) else -1
+            if chunk.is_stale(current_version=self.current_param_version, sigma=sigma):
+                self._drop_stale_chunk(chunk, sigma=sigma, queue_len=queue_len)
+                continue
+            queue_chunks.append(chunk)
+            token_count += int(chunk.n_tokens)
+            row_count += get_chunk_row_count(chunk)
+
+        terminated = self._chunk_queue_terminated
+        while not self._chunk_queue_terminated and (token_count < token_budget or row_count < min_train_chunks):
+            result = await self.message_queue_client.get_sample()
+            if result is None:
+                payload, queue_len = None, 0
+            else:
+                payload, queue_len = result
+
+            if payload is None:
+                terminated = True
+                self._chunk_queue_terminated = True
+                print(
+                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping chunk collection. "
+                    f"Collected {len(queue_chunks)} chunks / {token_count} tokens"
+                )
+                break
+
+            chunk = ray.cloudpickle.loads(payload)
+            if not isinstance(chunk, ChunkSample):
+                raise TypeError(
+                    "Chunk data path expected ChunkSample queue payloads, "
+                    f"got {type(chunk).__name__}"
+                )
+
+            if isinstance(chunk.meta, dict):
+                chunk.meta.setdefault("_trainer_chunk_get_ts", time.time())
+                chunk.meta["_trainer_queue_len"] = int(queue_len) if queue_len is not None else -1
+            is_stale = chunk.is_stale(current_version=self.current_param_version, sigma=sigma)
+            if is_stale:
+                self._drop_stale_chunk(chunk, sigma=sigma, queue_len=queue_len)
+                continue
+
+            queue_chunks.append(chunk)
+            token_count += int(chunk.n_tokens)
+            row_count += get_chunk_row_count(chunk)
+
+            if len(queue_chunks) % 64 == 0:
+                print(
+                    f"[FullyAsyncTrainer] Collected {len(queue_chunks)} chunks / {row_count} rows / "
+                    f"{token_count} chunk tokens. "
+                    f"mq_len: {queue_len}"
+                )
+
+        consumer_end = time.time()
+
+        if not queue_chunks or row_count < selection_min_rows:
+            print(
+                "[FullyAsyncTrainer] not enough chunks collected after loop "
+                f"(rows={row_count}, min_rows={selection_min_rows}, terminated={terminated})"
+            )
+            return None, None
+        total_wait_time = consumer_end - consumer_start
+        selection = select_chunk_samples_for_train_batch(
+            queue_chunks,
+            batch_divisor=batch_divisor,
+            min_rows=selection_min_rows,
+            train_row_divisor=train_row_divisor,
+            **memory_limits,
+        )
+        train_chunks = selection.train_chunks
+        deferred_chunks = selection.deferred_chunks
+        if deferred_chunks:
+            self._pending_chunk_samples.extend(deferred_chunks)
+        train_token_count = sum(int(chunk.n_tokens) for chunk in train_chunks)
+        pending_chunks_after = len(self._pending_chunk_samples)
+        pending_rows_after = sum(get_chunk_row_count(chunk) for chunk in self._pending_chunk_samples)
+        actor_mini_batch_size = choose_chunk_actor_mini_batch_size(
+            selection.usable_rows,
+            selection.world_size,
+            configured_actor_mini_batch_size,
+        )
+        batch_selection_metrics = {
+            **selection.as_metrics(),
+            "collected_chunks": len(queue_chunks),
+            "usable_chunks": len(train_chunks),
+            "deferred_chunks": len(deferred_chunks),
+            "train_chunk_tokens": train_token_count,
+            "selection_min_rows": selection_min_rows,
+            "has_memory_budget": has_memory_budget,
+            "configured_actor_mini_batch_size": configured_actor_mini_batch_size,
+            "actor_mini_batch_size": actor_mini_batch_size,
+            "pending_buffer_chunks_before": pending_chunks_before,
+            "pending_buffer_rows_before": pending_rows_before,
+            "pending_buffer_chunks_after": pending_chunks_after,
+            "pending_buffer_rows_after": pending_rows_after,
+        }
+        _stage0_trace("chunk_batch_select", "chunk_batch", role="trainer", **batch_selection_metrics)
+        if not train_chunks or selection.usable_rows < selection_min_rows:
+            print(
+                "[FullyAsyncTrainer] not enough DP-divisible chunks collected after loop "
+                f"(collected_chunks={len(queue_chunks)}, collected_rows={selection.collected_rows}, "
+                f"usable_chunks={len(train_chunks)}, usable_rows={selection.usable_rows}, "
+                f"min_rows={selection_min_rows}, deferred_rows={selection.deferred_rows}, "
+                f"trimmed_by_dp={selection.trimmed_by_dp_divisibility}, "
+                f"trimmed_by_budget={selection.trimmed_by_memory_budget}, terminated={terminated})"
+            )
+            return None, None
+        self.processed_chunks += len(train_chunks)
+
+        for chunk in train_chunks:
+            q_len = int(chunk.meta.get("_trainer_queue_len", -1)) if isinstance(chunk.meta, dict) else -1
+            self._trace_chunk_get_event(chunk, queue_len=q_len, accepted=True, drop_reason=None)
+
+        print(
+            f"[FullyAsyncTrainer] Chunk collection completed: {len(train_chunks)} train chunks, "
+            f"{selection.usable_rows} train rows, {train_token_count} chunk tokens, "
+            f"estimated_train_tokens={selection.estimated_train_tokens}, "
+            f"max_effective_seq_len={selection.max_effective_seq_len}, "
+            f"deferred={len(deferred_chunks)} chunks/{selection.deferred_rows} rows, "
+            f"collected={len(queue_chunks)} chunks/{selection.collected_rows} rows, "
+            f"world_size={selection.world_size}, "
+            f"train_row_divisor={selection.train_row_divisor}, "
+            f"max_chunk_rows_budget={selection.max_chunk_rows_budget}, "
+            f"max_train_tokens_budget={selection.max_train_tokens_budget}, "
+            f"max_effective_seq_len_budget={selection.max_effective_seq_len_budget}, "
+            f"actor_mini_batch_size={actor_mini_batch_size}, "
+            f"trimmed_by_dp={selection.trimmed_by_dp_divisibility}, "
+            f"trimmed_by_budget={selection.trimmed_by_memory_budget}, "
+            f"pending_before={pending_chunks_before}/{pending_rows_before}, "
+            f"pending_after={pending_chunks_after}/{pending_rows_after}, "
+            f"total wait time: {total_wait_time:.2f} seconds. "
+            f"mq_len: {queue_len}"
+        )
+
+        if self.config.trainer.balance_batch:
+            batch = assemble_batch_from_chunk_samples(train_chunks, self.tokenizer, self.config, self._balance_batch)
+        else:
+            batch = assemble_batch_from_chunk_samples(train_chunks, self.tokenizer, self.config, None)
+
+        batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+        batch.meta_info["fully_async/count/dropped_stale_chunks"] = self.stale_chunks_dropped
+        batch.meta_info["fully_async/count/processed_chunks"] = self.processed_chunks
+        batch.meta_info["fully_async/chunk/deferred_chunks"] = len(deferred_chunks)
+        if actor_mini_batch_size != configured_actor_mini_batch_size:
+            batch.meta_info["fully_async/chunk_batch/actor_mini_batch_size"] = actor_mini_batch_size
+        for key, value in batch_selection_metrics.items():
+            if value is not None:
+                batch.meta_info[f"fully_async/chunk_batch/{key}"] = value
         return 0, batch
 
     def _create_actor_rollout_classes(self):
@@ -440,7 +747,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = self._fit_compute_critic(batch)
             batch = self._fit_compute_advantage(batch)
             batch = self._fit_update_critic(batch)
+            train_batch = batch
+            self._trace_chunk_train_events(train_batch, "chunk_train_start")
             batch = self._fit_update_actor(batch)
+            self._trace_chunk_train_events(train_batch, "chunk_train_end")
             self._fit_update_local_step()
             await self._fit_update_weights()
             self._fit_dump_data(batch)
@@ -461,6 +771,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._collect_metrics_from_samples(batch, metrics)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
+
+    def _trace_chunk_train_events(self, batch: DataProto, event: str):
+        """Trace chunk train start/end for Stage-1 analyzer compatibility."""
+        chunk_samples = batch.meta_info.get("chunk_samples") if hasattr(batch, "meta_info") else None
+        if not chunk_samples:
+            return
+        for chunk in chunk_samples:
+            policy_version = int(chunk["policy_version"])
+            policy_version_lag = self.current_param_version - policy_version
+            _stage0_trace_chunk(
+                event,
+                chunk["sample_id"],
+                chunk["chunk_idx"],
+                role="trainer",
+                n_tokens=chunk["n_tokens"],
+                token_offset=chunk["token_offset"],
+                policy_version=policy_version,
+                is_final=chunk["is_final"],
+                row_id=chunk.get("row_id", chunk["sample_id"]),
+                source=chunk.get("source", "unknown"),
+                parent_sample_id=chunk.get("parent_sample_id", chunk["sample_id"]),
+                trainer_policy_version=self.current_param_version,
+                policy_version_lag=policy_version_lag,
+                accepted=True,
+            )
 
     def _compute_old_log_prob(self, batch: DataProto):
         """

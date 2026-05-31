@@ -25,6 +25,17 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Stage-1 Xiaoshuai real chunk data path. 0 keeps the upstream full-sample
+  # queue behavior. Set to e.g. 256 to publish ChunkSample payloads.
+  chunk_tokens: 0
+
+  # Optional trainer-side chunk token budget. Null means
+  # ppo_mini_batch_size * require_batches * chunk_tokens.
+  chunk_token_budget: null
+
+  # Optional chunk staleness threshold. Null/fallback is staleness_threshold.
+  chunk_staleness_threshold: null
+
 # Rollout config
 rollout:
 
