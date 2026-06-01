@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import bisect
 import math
 import os
 import time
@@ -167,6 +168,20 @@ class ChunkBatchSelection:
         }
 
 
+@dataclass
+class ChunkCoalescingConfig:
+    enabled: bool
+    max_coalesced_chunks: int | None
+    max_coalesced_effective_seq_len: int | None
+    lookahead: int = 0
+
+
+@dataclass
+class ChunkCoalescingResult:
+    chunks: list[ChunkSample]
+    metrics: dict[str, int | float]
+
+
 def _positive_int_env(name: str) -> int | None:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -178,6 +193,79 @@ def _positive_int_env(name: str) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _env_flag(name: str) -> bool | None:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return None
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def get_chunk_coalescing_config(config) -> ChunkCoalescingConfig:
+    """Resolve optional same-parent contiguous chunk coalescing knobs."""
+    enabled = bool(config.async_training.get("coalesce_contiguous_chunks", False))
+    env_enabled = _env_flag("OPD_STAGE1_COALESCE_CONTIGUOUS")
+    if env_enabled is not None:
+        enabled = env_enabled
+
+    max_chunks = config.async_training.get("max_coalesced_chunks", None)
+    env_max_chunks = _positive_int_env("OPD_STAGE1_MAX_COALESCED_CHUNKS")
+    if env_max_chunks is not None:
+        max_chunks = env_max_chunks
+    max_chunks = int(max_chunks) if max_chunks is not None and int(max_chunks) > 0 else None
+
+    max_seq_len = config.async_training.get("max_coalesced_effective_seq_len", None)
+    env_max_seq_len = _positive_int_env("OPD_STAGE1_MAX_COALESCED_EFFECTIVE_SEQ_LEN")
+    if env_max_seq_len is not None:
+        max_seq_len = env_max_seq_len
+    max_seq_len = int(max_seq_len) if max_seq_len is not None and int(max_seq_len) > 0 else None
+
+    lookahead = config.async_training.get("coalesce_lookahead", 0)
+    env_lookahead = os.environ.get("OPD_STAGE1_COALESCE_LOOKAHEAD", "").strip()
+    if env_lookahead:
+        try:
+            lookahead = int(env_lookahead)
+        except ValueError:
+            pass
+    lookahead = int(lookahead) if lookahead is not None and int(lookahead) > 0 else 0
+
+    return ChunkCoalescingConfig(
+        enabled=enabled,
+        max_coalesced_chunks=max_chunks,
+        max_coalesced_effective_seq_len=max_seq_len,
+        lookahead=lookahead,
+    )
+
+
+def get_chunk_coalescing_drain_multiplier(config) -> float:
+    """Resolve how far past the train token budget the trainer may opportunistically
+    drain *already-available* queued chunks before coalescing.
+
+    A value of 1.0 (default) reproduces the legacy behavior: stop collecting as soon
+    as the train token budget is met. Values > 1.0 let the collection loop pull up to
+    ``multiplier * token_budget`` worth of chunks that are *already sitting* in the
+    message queue (it never blocks waiting for new arrivals), giving the same-parent
+    coalescer a larger pool of sibling chunks. Leftover rows beyond the train budget
+    are deferred to the next batch via the existing pending-chunk buffer, so this only
+    changes how many ready chunks are *visible* to coalescing, not the train batch size.
+    """
+    multiplier = config.async_training.get("coalesce_drain_multiplier", 1.0)
+    env_multiplier = os.environ.get("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", "").strip()
+    if env_multiplier:
+        try:
+            multiplier = float(env_multiplier)
+        except ValueError:
+            pass
+    try:
+        multiplier = float(multiplier)
+    except (TypeError, ValueError):
+        multiplier = 1.0
+    return multiplier if multiplier > 1.0 else 1.0
+
+
 def get_chunk_batch_memory_limits_from_env() -> dict[str, int | None]:
     """Return optional Xiaoshuai trainer batch memory limits from env knobs."""
     return {
@@ -185,6 +273,26 @@ def get_chunk_batch_memory_limits_from_env() -> dict[str, int | None]:
         "max_train_tokens": _positive_int_env("OPD_STAGE1_MAX_TRAIN_TOKENS"),
         "max_effective_seq_len": _positive_int_env("OPD_STAGE1_MAX_EFFECTIVE_SEQ_LEN"),
     }
+
+
+def iter_chunk_constituents(chunk: ChunkSample) -> list[ChunkSample]:
+    """Return original chunks represented by a possibly coalesced training row."""
+    meta = chunk.meta if isinstance(chunk.meta, dict) else {}
+    originals = meta.get("_merged_original_chunks")
+    if isinstance(originals, list) and originals:
+        return originals
+    return [chunk]
+
+
+def flatten_chunk_constituents(chunks: list[ChunkSample]) -> list[ChunkSample]:
+    originals: list[ChunkSample] = []
+    for chunk in chunks:
+        originals.extend(iter_chunk_constituents(chunk))
+    return originals
+
+
+def get_original_chunk_count(chunk: ChunkSample) -> int:
+    return len(iter_chunk_constituents(chunk))
 
 
 def get_chunk_row_count(chunk: ChunkSample) -> int:
@@ -250,6 +358,641 @@ def estimate_chunk_effective_seq_len(chunk: ChunkSample) -> int:
             return max(1, int(input_ids.shape[1]))
 
     return max(1, int(chunk.token_offset) + int(chunk.n_tokens))
+
+
+def _first_non_tensor_value_from_payload(chunk: ChunkSample, key: str):
+    payload = getattr(chunk, "parent_payload", None)
+    non_tensor_batch = getattr(payload, "non_tensor_batch", None)
+    if non_tensor_batch is None or key not in non_tensor_batch:
+        return None
+    values = non_tensor_batch.get(key)
+    if values is None or len(values) == 0:
+        return None
+    value = values[0]
+    if hasattr(value, "item"):
+        value = value.item()
+    return value
+
+
+def _chunk_parent_key(chunk: ChunkSample) -> tuple[str, str, str | None]:
+    meta = chunk.meta if isinstance(chunk.meta, dict) else {}
+    row_id = str(meta.get("row_id", chunk.sample_id))
+    parent_sample_id = str(meta.get("parent_sample_id", chunk.sample_id))
+    uid = _first_non_tensor_value_from_payload(chunk, "uid")
+    return row_id, parent_sample_id, str(uid) if uid is not None else None
+
+
+def _chunk_response_span(chunk: ChunkSample) -> tuple[int, int]:
+    start = int(chunk.token_offset)
+    meta = chunk.meta if isinstance(chunk.meta, dict) else {}
+    end = meta.get("response_end")
+    if end is None:
+        end = start + int(chunk.n_tokens)
+    return start, int(end)
+
+
+def _has_teacher_payload(chunk: ChunkSample) -> bool:
+    payload = getattr(chunk, "parent_payload", None)
+    batch = getattr(payload, "batch", None)
+    return batch is not None and "teacher_ids" in batch and "teacher_logprobs" in batch
+
+
+def _can_start_coalesced_group(chunk: ChunkSample) -> bool:
+    meta = chunk.meta if isinstance(chunk.meta, dict) else {}
+    # Keep completed-sample fallback behavior unchanged in this first version.
+    if meta.get("source") != "streaming":
+        return False
+    return _has_teacher_payload(chunk)
+
+
+def _can_extend_coalesced_group(previous: ChunkSample, candidate: ChunkSample) -> bool:
+    if not _can_start_coalesced_group(candidate):
+        return False
+    if _chunk_parent_key(previous) != _chunk_parent_key(candidate):
+        return False
+    if int(previous.policy_version) != int(candidate.policy_version):
+        return False
+    previous_start, previous_end = _chunk_response_span(previous)
+    candidate_start, candidate_end = _chunk_response_span(candidate)
+    if previous_end != candidate_start or candidate_end <= candidate_start:
+        return False
+    return int(previous.chunk_idx) + 1 == int(candidate.chunk_idx)
+
+
+# Reasons a same-parent successor candidate is rejected for merging. Used for
+# bounded-lookahead coalescing diagnostics so we can tell whether the coalescer
+# is failing to activate and why.
+MERGE_REJECT_REASONS = (
+    "different_parent",
+    "noncontiguous_span",
+    "policy_version",
+    "effective_len_cap",
+    "missing_teacher_payload",
+    "fallback",
+    "outside_lookahead",
+)
+
+
+def _extend_rejection_reason(
+    previous: ChunkSample,
+    candidate: ChunkSample,
+    effective_cap: int | None,
+) -> str | None:
+    """Classify why ``candidate`` cannot extend the group ending at ``previous``.
+
+    The caller has already established that ``candidate`` is the earliest
+    same-parent forward chunk with ``chunk_idx == previous.chunk_idx + 1`` and
+    that it lies inside the lookahead window.  Returns ``None`` when the merge
+    is allowed, otherwise one of ``MERGE_REJECT_REASONS``.
+    """
+    meta = candidate.meta if isinstance(candidate.meta, dict) else {}
+    if meta.get("source") != "streaming":
+        return "fallback"
+    if not _has_teacher_payload(candidate):
+        return "missing_teacher_payload"
+    if _chunk_parent_key(previous) != _chunk_parent_key(candidate):
+        return "different_parent"
+    if int(previous.policy_version) != int(candidate.policy_version):
+        return "policy_version"
+    previous_start, previous_end = _chunk_response_span(previous)
+    candidate_start, candidate_end = _chunk_response_span(candidate)
+    if previous_end != candidate_start or candidate_end <= candidate_start:
+        return "noncontiguous_span"
+    if int(previous.chunk_idx) + 1 != int(candidate.chunk_idx):
+        return "noncontiguous_span"
+    if effective_cap is not None and estimate_chunk_effective_seq_len(candidate) > int(effective_cap):
+        return "effective_len_cap"
+    return None
+
+
+def _clone_dataproto(data: DataProto) -> DataProto:
+    return DataProto(
+        batch=data.batch.clone(),
+        non_tensor_batch=_clone_numpy_dict(data.non_tensor_batch),
+        meta_info=dict(data.meta_info),
+    )
+
+
+def _overlay_response_tensor(target: torch.Tensor, source: torch.Tensor, start: int, end: int) -> None:
+    if target.dim() < 2 or source.dim() < 2:
+        return
+    src_end = min(end, int(source.shape[1]))
+    dst_end = min(end, int(target.shape[1]))
+    if start >= src_end or start >= dst_end:
+        return
+    width = min(src_end - start, dst_end - start)
+    target[:, start : start + width].copy_(source[:, start : start + width])
+
+
+def _overlay_sequence_tensor(
+    target: torch.Tensor,
+    source: torch.Tensor,
+    target_prompt_width: int,
+    source_prompt_width: int,
+    start: int,
+    end: int,
+) -> None:
+    if target.dim() < 2 or source.dim() < 2:
+        return
+    source_start = source_prompt_width + start
+    target_start = target_prompt_width + start
+    src_end = min(source_prompt_width + end, int(source.shape[1]))
+    dst_end = min(target_prompt_width + end, int(target.shape[1]))
+    if source_start >= src_end or target_start >= dst_end:
+        return
+    width = min(src_end - source_start, dst_end - target_start)
+    target[:, target_start : target_start + width].copy_(source[:, source_start : source_start + width])
+
+
+def _concat_chunk_tokens(chunks: list[ChunkSample]):
+    values = [chunk.tokens for chunk in chunks]
+    if all(isinstance(value, torch.Tensor) for value in values):
+        first = values[0]
+        dim = 1 if first.dim() >= 2 else 0
+        try:
+            return torch.cat(values, dim=dim)
+        except Exception:
+            return values[-1]
+    if all(isinstance(value, list) for value in values):
+        out = []
+        for value in values:
+            out.extend(value)
+        return out
+    return values[-1]
+
+
+def _merge_contiguous_chunk_group(chunks: list[ChunkSample]) -> ChunkSample:
+    if len(chunks) == 1:
+        return chunks[0]
+
+    base = chunks[-1]
+    merged_payload = _clone_dataproto(base.parent_payload)
+    target_batch = merged_payload.batch
+    prompt_width = int(target_batch["prompts"].shape[1])
+
+    response_aligned_keys = {
+        "response_mask",
+        "rollout_log_probs",
+        "rm_scores",
+        "token_level_scores",
+        "advantages",
+        "old_log_probs",
+    }
+    for key in response_aligned_keys:
+        if key in target_batch and target_batch[key].dim() >= 2:
+            target_batch[key].zero_()
+
+    sequence_aligned_keys = {"teacher_ids", "teacher_logprobs"}
+    for chunk in chunks:
+        start, end = _chunk_response_span(chunk)
+        source_batch = chunk.parent_payload.batch
+        source_prompt_width = int(source_batch["prompts"].shape[1])
+        for key in response_aligned_keys:
+            if key in target_batch and key in source_batch:
+                _overlay_response_tensor(target_batch[key], source_batch[key], start, end)
+        for key in sequence_aligned_keys:
+            if key in target_batch and key in source_batch:
+                _overlay_sequence_tensor(
+                    target_batch[key],
+                    source_batch[key],
+                    prompt_width,
+                    source_prompt_width,
+                    start,
+                    end,
+                )
+
+    first = chunks[0]
+    _, response_end = _chunk_response_span(base)
+    total_tokens = sum(int(chunk.n_tokens) for chunk in chunks)
+    merged_ids = [
+        (chunk.meta if isinstance(chunk.meta, dict) else {}).get("chunk_id", f"{chunk.sample_id}:{chunk.chunk_idx}")
+        for chunk in chunks
+    ]
+    merged_indices = [int(chunk.chunk_idx) for chunk in chunks]
+    merged_offsets = [int(chunk.token_offset) for chunk in chunks]
+    merged_ends = [_chunk_response_span(chunk)[1] for chunk in chunks]
+
+    batch_size = len(merged_payload)
+    merged_payload.non_tensor_batch["chunk_idx"] = np.array([first.chunk_idx] * batch_size, dtype=np.int32)
+    merged_payload.non_tensor_batch["chunk_token_offset"] = np.array([first.token_offset] * batch_size, dtype=np.int32)
+    merged_payload.non_tensor_batch["chunk_n_tokens"] = np.array([total_tokens] * batch_size, dtype=np.int32)
+    merged_payload.non_tensor_batch["chunk_is_final"] = np.array([base.is_final] * batch_size, dtype=bool)
+    merged_payload.non_tensor_batch["chunk_policy_version"] = np.array(
+        [first.policy_version] * batch_size, dtype=np.int32
+    )
+
+    meta = dict(first.meta if isinstance(first.meta, dict) else {})
+    meta.update(
+        {
+            "coalesced": True,
+            "merged_chunk_count": len(chunks),
+            "merged_chunk_ids": merged_ids,
+            "merged_chunk_indices": merged_indices,
+            "merged_chunk_offsets": merged_offsets,
+            "merged_chunk_ends": merged_ends,
+            "response_end": response_end,
+            "_merged_original_chunks": chunks,
+        }
+    )
+    return ChunkSample(
+        sample_id=first.sample_id,
+        chunk_idx=int(first.chunk_idx),
+        token_offset=int(first.token_offset),
+        n_tokens=int(total_tokens),
+        tokens=_concat_chunk_tokens(chunks),
+        is_final=bool(base.is_final),
+        policy_version=int(first.policy_version),
+        parent_payload=merged_payload,
+        meta=meta,
+    )
+
+
+def _coalescing_metrics(
+    before_chunks: list[ChunkSample],
+    after_chunks: list[ChunkSample],
+    enabled: bool,
+    *,
+    lookahead: int = 0,
+    rejections: dict[str, int] | None = None,
+    opportunities: int = 0,
+) -> dict[str, int | float]:
+    before_prefix_tokens = sum(get_chunk_row_count(chunk) * estimate_chunk_effective_seq_len(chunk) for chunk in before_chunks)
+    after_prefix_tokens = sum(get_chunk_row_count(chunk) * estimate_chunk_effective_seq_len(chunk) for chunk in after_chunks)
+    chunks_per_row = [get_original_chunk_count(chunk) for chunk in after_chunks] or [0]
+    merged_group_sizes = [count for count in chunks_per_row if count > 1]
+    chunks_merged_total = sum(merged_group_sizes)
+    reduction = max(0, before_prefix_tokens - after_prefix_tokens)
+    rows_before = sum(get_chunk_row_count(chunk) for chunk in before_chunks)
+    rows_after = sum(get_chunk_row_count(chunk) for chunk in after_chunks)
+    rejections = rejections or {}
+    metrics: dict[str, int | float] = {
+        "enabled": int(enabled),
+        "coalesce_lookahead": int(lookahead),
+        "pending_chunks_before_coalesce": len(before_chunks),
+        "pending_rows_before_coalesce": rows_before,
+        "rows_before_coalesce": rows_before,
+        "coalescible_chunks": chunks_merged_total,
+        "coalescing_opportunities_visible_in_window": int(opportunities),
+        "coalesced_groups": len(merged_group_sizes),
+        "chunks_merged": chunks_merged_total,
+        "chunks_merged_total": chunks_merged_total,
+        "rows_after_coalesce": rows_after,
+        "chunks_per_merged_row_median": float(np.median(chunks_per_row)),
+        "chunks_per_merged_row_p95": float(np.percentile(chunks_per_row, 95)),
+        "chunks_per_merged_row_max": int(max(chunks_per_row)),
+        "estimated_prefix_tokens_before_coalesce": int(before_prefix_tokens),
+        "estimated_prefix_tokens_after_coalesce": int(after_prefix_tokens),
+        "estimated_prefix_recompute_reduction": int(reduction),
+        "estimated_prefix_recompute_reduction_fraction": float(reduction / before_prefix_tokens)
+        if before_prefix_tokens
+        else 0.0,
+    }
+    for reason in MERGE_REJECT_REASONS:
+        metrics[f"merge_reject_{reason}"] = int(rejections.get(reason, 0))
+    return metrics
+
+
+def coalesce_contiguous_chunk_samples(
+    chunk_samples: list[ChunkSample],
+    config: ChunkCoalescingConfig,
+    max_effective_seq_len: int | None = None,
+) -> ChunkCoalescingResult:
+    """Bounded-lookahead FIFO coalescing of same-parent streaming chunks.
+
+    The function inspects a sliding window of already-pending chunks.  Starting
+    from the earliest FIFO chunk it merges that chunk's same-parent contiguous
+    successors that fall within ``config.lookahead`` pending positions ahead of
+    the current frontier.  The merged row is placed at the FIFO slot of its
+    earliest constituent; remaining chunks keep their relative order.
+
+    When ``config.lookahead`` is ``0`` the window collapses to ``1`` and the
+    behavior matches the original adjacent-only coalescer (a successor must be
+    the immediately next pending chunk).
+
+    The function never waits for future chunks, never reorders beyond placing a
+    merged row at its earliest constituent position, and never drops chunks.
+    Original chunks are carried in the merged row's metadata for accounting and
+    staleness rechecks.
+    """
+    rejections: dict[str, int] = {reason: 0 for reason in MERGE_REJECT_REASONS}
+    if not config.enabled or not chunk_samples:
+        return ChunkCoalescingResult(
+            chunks=chunk_samples,
+            metrics=_coalescing_metrics(
+                chunk_samples,
+                chunk_samples,
+                enabled=config.enabled,
+                lookahead=config.lookahead,
+                rejections=rejections,
+                opportunities=0,
+            ),
+        )
+
+    max_group_size = config.max_coalesced_chunks
+    effective_cap = config.max_coalesced_effective_seq_len
+    if max_effective_seq_len is not None:
+        effective_cap = min(effective_cap, max_effective_seq_len) if effective_cap is not None else max_effective_seq_len
+
+    window = config.lookahead if config.lookahead > 0 else 1
+    n = len(chunk_samples)
+
+    use_index = n >= _coalesce_index_threshold()
+    if use_index:
+        coalesced, opportunities = _coalesce_indexed(
+            chunk_samples,
+            window=window,
+            max_group_size=max_group_size,
+            effective_cap=effective_cap,
+            rejections=rejections,
+        )
+    else:
+        coalesced, opportunities = _coalesce_scan(
+            chunk_samples,
+            window=window,
+            max_group_size=max_group_size,
+            effective_cap=effective_cap,
+            rejections=rejections,
+        )
+
+    return ChunkCoalescingResult(
+        chunks=coalesced,
+        metrics=_coalescing_metrics(
+            chunk_samples,
+            coalesced,
+            enabled=config.enabled,
+            lookahead=config.lookahead,
+            rejections=rejections,
+            opportunities=opportunities,
+        ),
+    )
+
+
+def _coalesce_scan(
+    chunk_samples: list[ChunkSample],
+    *,
+    window: int,
+    max_group_size: int | None,
+    effective_cap: int | None,
+    rejections: dict[str, int],
+) -> tuple[list[ChunkSample], int]:
+    """Reference O(n^2) bounded-lookahead coalescer used for small pools.
+
+    Returns the coalesced chunk list and the static opportunity count. This is
+    the original, simplest implementation; the indexed variant must reproduce
+    its output exactly.
+    """
+    n = len(chunk_samples)
+    consumed = [False] * n
+
+    opportunities = _count_coalescing_opportunities(chunk_samples, window)
+
+    coalesced: list[ChunkSample] = []
+    for i in range(n):
+        if consumed[i]:
+            continue
+        head = chunk_samples[i]
+        consumed[i] = True
+        if not _can_start_coalesced_group(head):
+            coalesced.append(head)
+            continue
+
+        parent_key = _chunk_parent_key(head)
+        group = [head]
+        prev_pos = i
+        while max_group_size is None or len(group) < int(max_group_size):
+            prev = group[-1]
+            best_j = None
+            best_rank = 0
+            rank = 0
+            for j in range(prev_pos + 1, n):
+                if consumed[j]:
+                    continue
+                rank += 1
+                candidate = chunk_samples[j]
+                if _chunk_parent_key(candidate) == parent_key and int(candidate.chunk_idx) > int(prev.chunk_idx):
+                    best_j = j
+                    best_rank = rank
+                    break
+            if best_j is None:
+                rejections["different_parent"] += 1
+                break
+            candidate = chunk_samples[best_j]
+            if int(candidate.chunk_idx) != int(prev.chunk_idx) + 1:
+                rejections["noncontiguous_span"] += 1
+                break
+            if best_rank > window:
+                rejections["outside_lookahead"] += 1
+                break
+            reason = _extend_rejection_reason(prev, candidate, effective_cap)
+            if reason is not None:
+                rejections[reason] += 1
+                break
+            consumed[best_j] = True
+            group.append(candidate)
+            prev_pos = best_j
+
+        coalesced.append(_merge_contiguous_chunk_group(group))
+
+    return coalesced, opportunities
+
+
+class _FenwickTree:
+    """Minimal Fenwick (binary-indexed) tree over unconsumed-position flags.
+
+    Supports O(log n) point updates and prefix sums so the indexed coalescer can
+    compute the lookahead ``rank`` (number of still-unconsumed positions between
+    the current frontier and a candidate) without re-scanning the pool.
+    """
+
+    __slots__ = ("_n", "_tree")
+
+    def __init__(self, n: int):
+        self._n = n
+        self._tree = [0] * (n + 1)
+
+    def add(self, index: int, delta: int) -> None:
+        i = index + 1
+        while i <= self._n:
+            self._tree[i] += delta
+            i += i & (-i)
+
+    def prefix_sum(self, index: int) -> int:
+        """Sum of flags over positions [0, index] inclusive."""
+        i = index + 1
+        total = 0
+        while i > 0:
+            total += self._tree[i]
+            i -= i & (-i)
+        return total
+
+
+def _coalesce_indexed(
+    chunk_samples: list[ChunkSample],
+    *,
+    window: int,
+    max_group_size: int | None,
+    effective_cap: int | None,
+    rejections: dict[str, int],
+) -> tuple[list[ChunkSample], int]:
+    """Hash-index + Fenwick fast path for large pools.
+
+    Builds a per-parent index of pool positions so a same-parent successor is
+    found by scanning only same-parent entries (not the whole pool), and uses a
+    Fenwick tree of unconsumed positions to evaluate the lookahead ``rank`` in
+    O(log n). Produces output identical to :func:`_coalesce_scan`.
+    """
+    n = len(chunk_samples)
+    consumed = [False] * n
+
+    # Per-parent ascending pool positions for constant-ish successor lookup.
+    parent_positions: dict[Any, list[int]] = defaultdict(list)
+    for pos, chunk in enumerate(chunk_samples):
+        parent_positions[_chunk_parent_key(chunk)].append(pos)
+
+    fenwick = _FenwickTree(n)
+    for pos in range(n):
+        fenwick.add(pos, 1)
+
+    def _consume(pos: int) -> None:
+        consumed[pos] = True
+        fenwick.add(pos, -1)
+
+    def _next_same_parent(parent_key: Any, prev_pos: int, prev_chunk_idx: int) -> int | None:
+        positions = parent_positions.get(parent_key)
+        if not positions:
+            return None
+        start = bisect.bisect_right(positions, prev_pos)
+        for k in range(start, len(positions)):
+            pos = positions[k]
+            if consumed[pos]:
+                continue
+            if int(chunk_samples[pos].chunk_idx) > prev_chunk_idx:
+                return pos
+        return None
+
+    opportunities = _count_coalescing_opportunities_indexed(chunk_samples, window, parent_positions)
+
+    coalesced: list[ChunkSample] = []
+    for i in range(n):
+        if consumed[i]:
+            continue
+        head = chunk_samples[i]
+        _consume(i)
+        if not _can_start_coalesced_group(head):
+            coalesced.append(head)
+            continue
+
+        parent_key = _chunk_parent_key(head)
+        group = [head]
+        prev_pos = i
+        while max_group_size is None or len(group) < int(max_group_size):
+            prev = group[-1]
+            best_j = _next_same_parent(parent_key, prev_pos, int(prev.chunk_idx))
+            if best_j is None:
+                rejections["different_parent"] += 1
+                break
+            candidate = chunk_samples[best_j]
+            if int(candidate.chunk_idx) != int(prev.chunk_idx) + 1:
+                rejections["noncontiguous_span"] += 1
+                break
+            best_rank = fenwick.prefix_sum(best_j) - fenwick.prefix_sum(prev_pos)
+            if best_rank > window:
+                rejections["outside_lookahead"] += 1
+                break
+            reason = _extend_rejection_reason(prev, candidate, effective_cap)
+            if reason is not None:
+                rejections[reason] += 1
+                break
+            _consume(best_j)
+            group.append(candidate)
+            prev_pos = best_j
+
+        coalesced.append(_merge_contiguous_chunk_group(group))
+
+    return coalesced, opportunities
+
+
+def _coalesce_index_threshold() -> int:
+    """Pool size at/above which the hash-indexed coalescer fast path is used.
+
+    Defaults to 256 so small pools keep the allocation-free reference scan and
+    only large drained pools pay for the index. Overridable via
+    ``OPD_STAGE1_COALESCE_INDEX_THRESHOLD`` (values <= 1 disable the fast path).
+    """
+    raw = os.environ.get("OPD_STAGE1_COALESCE_INDEX_THRESHOLD", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 256
+        if parsed <= 1:
+            return 1 << 62
+        return parsed
+    return 256
+
+
+def _count_coalescing_opportunities(chunk_samples: list[ChunkSample], window: int) -> int:
+    """Count same-parent contiguous successor pairs visible within ``window``.
+
+    This is a static property of the input pending buffer (independent of the
+    merge order) used to gauge how much coalescing the queue interleaving
+    permits at the configured lookahead.
+    """
+    n = len(chunk_samples)
+    opportunities = 0
+    for p in range(n):
+        head = chunk_samples[p]
+        if not _can_start_coalesced_group(head):
+            continue
+        parent_key = _chunk_parent_key(head)
+        rank = 0
+        for q in range(p + 1, n):
+            rank += 1
+            candidate = chunk_samples[q]
+            if _chunk_parent_key(candidate) == parent_key and int(candidate.chunk_idx) > int(head.chunk_idx):
+                if (
+                    int(candidate.chunk_idx) == int(head.chunk_idx) + 1
+                    and rank <= window
+                    and _can_extend_coalesced_group(head, candidate)
+                ):
+                    opportunities += 1
+                break
+    return opportunities
+
+
+def _count_coalescing_opportunities_indexed(
+    chunk_samples: list[ChunkSample],
+    window: int,
+    parent_positions: dict[Any, list[int]],
+) -> int:
+    """Index-accelerated equivalent of :func:`_count_coalescing_opportunities`.
+
+    Uses the per-parent position index so each head inspects only same-parent
+    entries. Since this is a static pass (nothing consumed) the lookahead rank
+    of a successor at pool position ``q`` for a head at ``p`` is exactly
+    ``q - p``. Produces the same count as the linear-scan version.
+    """
+    opportunities = 0
+    for p, head in enumerate(chunk_samples):
+        if not _can_start_coalesced_group(head):
+            continue
+        parent_key = _chunk_parent_key(head)
+        positions = parent_positions.get(parent_key)
+        if not positions:
+            continue
+        head_chunk_idx = int(head.chunk_idx)
+        start = bisect.bisect_right(positions, p)
+        for k in range(start, len(positions)):
+            q = positions[k]
+            if int(chunk_samples[q].chunk_idx) > head_chunk_idx:
+                if (
+                    int(chunk_samples[q].chunk_idx) == head_chunk_idx + 1
+                    and (q - p) <= window
+                    and _can_extend_coalesced_group(head, chunk_samples[q])
+                ):
+                    opportunities += 1
+                break
+    return opportunities
 
 
 def select_chunk_samples_for_train_batch(
@@ -644,6 +1387,8 @@ def assemble_batch_from_chunk_samples(
         }
     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
 
+    original_chunks = flatten_chunk_constituents(chunk_samples)
+
     param_version_start = _as_int_list(final_batch.non_tensor_batch.get("min_global_steps", []))
     param_version_end = _as_int_list(final_batch.non_tensor_batch.get("max_global_steps", []))
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
@@ -664,13 +1409,16 @@ def assemble_batch_from_chunk_samples(
     trajectory_param_versions = np.array(param_version_end, dtype=np.int32)
     rollout_status = chunk_samples[0].meta.get("rollout_status", {})
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
-    chunk_token_counts = [chunk.n_tokens for chunk in chunk_samples]
+    chunk_token_counts = [chunk.n_tokens for chunk in original_chunks]
+    coalesced_rows = sum(1 for chunk in chunk_samples if get_original_chunk_count(chunk) > 1)
     chunk_stats = {
         "fully_async/chunk/enabled": 1,
-        "fully_async/chunk/count": len(chunk_samples),
+        "fully_async/chunk/count": len(original_chunks),
         "fully_async/chunk/total_tokens": int(sum(chunk_token_counts)),
         "fully_async/chunk/avg_tokens": float(np.mean(chunk_token_counts)),
         "fully_async/chunk/max_response_width": int(max_response_width),
+        "fully_async/chunk/coalesced_rows": coalesced_rows,
+        "fully_async/chunk/train_rows": len(chunk_samples),
     }
 
     final_batch.meta_info.update(
@@ -683,6 +1431,7 @@ def assemble_batch_from_chunk_samples(
                     "parent_sample_id": chunk.meta.get("parent_sample_id", chunk.sample_id),
                     "row_id": chunk.meta.get("row_id", chunk.sample_id),
                     "chunk_id": chunk.meta.get("chunk_id", f"{chunk.sample_id}:{chunk.chunk_idx}"),
+                    "merged_chunk_ids": chunk.meta.get("merged_chunk_ids"),
                     "source": chunk.meta.get("source", "unknown"),
                     "chunk_idx": chunk.chunk_idx,
                     "n_tokens": chunk.n_tokens,
@@ -690,7 +1439,7 @@ def assemble_batch_from_chunk_samples(
                     "policy_version": chunk.policy_version,
                     "is_final": chunk.is_final,
                 }
-                for chunk in chunk_samples
+                for chunk in original_chunks
             ],
             **processing_time_stats,
             **rollout_status,

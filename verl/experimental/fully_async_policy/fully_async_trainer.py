@@ -30,11 +30,16 @@ from verl.experimental.fully_async_policy.detach_utils import (
     assemble_batch_from_chunk_samples,
     assemble_batch_from_rollout_samples,
     choose_chunk_actor_mini_batch_size,
+    coalesce_contiguous_chunk_samples,
+    flatten_chunk_constituents,
+    get_chunk_coalescing_config,
+    get_chunk_coalescing_drain_multiplier,
     get_chunk_batch_memory_limits_from_env,
     get_chunk_row_count,
     get_chunk_staleness_threshold,
     get_chunk_token_budget,
     get_chunk_token_size,
+    iter_chunk_constituents,
     is_chunk_data_path_enabled,
     select_chunk_samples_for_train_batch,
 )
@@ -460,6 +465,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         train_row_divisor = batch_divisor
         min_train_chunks = self._min_train_chunks_for_divisor(batch_divisor)
         memory_limits = get_chunk_batch_memory_limits_from_env()
+        coalescing_config = get_chunk_coalescing_config(self.config)
+        drain_multiplier = get_chunk_coalescing_drain_multiplier(self.config)
+        # Pool-level coalescing: when coalescing is on and a drain multiplier > 1 is
+        # configured, keep pulling chunks that are *already sitting* in the queue past
+        # the train token budget (never blocking on new arrivals) so the same-parent
+        # coalescer sees more sibling chunks. Rows beyond the train budget are deferred.
+        drain_token_budget = (
+            int(token_budget * drain_multiplier)
+            if coalescing_config.enabled and drain_multiplier > 1.0
+            else token_budget
+        )
         has_memory_budget = any(value is not None for value in memory_limits.values())
         selection_min_rows = batch_divisor if has_memory_budget else min_train_chunks
         print(
@@ -468,7 +484,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"batch_divisor={batch_divisor}, train_row_divisor={train_row_divisor}, sigma={sigma}, "
             f"max_chunk_rows={memory_limits['max_chunk_rows']}, "
             f"max_train_tokens={memory_limits['max_train_tokens']}, "
-            f"max_effective_seq_len={memory_limits['max_effective_seq_len']})",
+            f"max_effective_seq_len={memory_limits['max_effective_seq_len']}, "
+            f"coalesce_contiguous={coalescing_config.enabled}, "
+            f"max_coalesced_chunks={coalescing_config.max_coalesced_chunks}, "
+            f"max_coalesced_effective_seq_len={coalescing_config.max_coalesced_effective_seq_len}, "
+            f"coalesce_lookahead={coalescing_config.lookahead}, "
+            f"drain_multiplier={drain_multiplier}, drain_token_budget={drain_token_budget})",
             flush=True,
         )
 
@@ -497,7 +518,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             row_count += get_chunk_row_count(chunk)
 
         terminated = self._chunk_queue_terminated
-        while not self._chunk_queue_terminated and (token_count < token_budget or row_count < min_train_chunks):
+        # ``observed_queue_len`` tracks the residual queue depth reported by the most
+        # recent pop (or an explicit size probe). It is only used to gate the optional
+        # post-budget drain phase so we never block waiting for new chunks to arrive.
+        observed_queue_len: int | None = None
+        pool_at_minimum: int | None = None
+        while not self._chunk_queue_terminated:
+            minimum_met = token_count >= token_budget and row_count >= min_train_chunks
+            if minimum_met:
+                if pool_at_minimum is None:
+                    pool_at_minimum = len(queue_chunks)
+                # Train batch minimum is satisfied. Stop unless a drain multiplier > 1
+                # lets us opportunistically pull already-queued residual chunks (so the
+                # coalescer sees more siblings). Never block on an empty queue.
+                if drain_token_budget <= token_budget or token_count >= drain_token_budget:
+                    break
+                if observed_queue_len is None:
+                    observed_queue_len = await self.message_queue_client.get_queue_size()
+                if observed_queue_len is None or observed_queue_len <= 0:
+                    break
+
             result = await self.message_queue_client.get_sample()
             if result is None:
                 payload, queue_len = None, 0
@@ -512,6 +552,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     f"Collected {len(queue_chunks)} chunks / {token_count} tokens"
                 )
                 break
+
+            observed_queue_len = int(queue_len) if queue_len is not None else 0
 
             chunk = ray.cloudpickle.loads(payload)
             if not isinstance(chunk, ChunkSample):
@@ -548,8 +590,39 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
             return None, None
         total_wait_time = consumer_end - consumer_start
-        selection = select_chunk_samples_for_train_batch(
+
+        coalescing_result = coalesce_contiguous_chunk_samples(
             queue_chunks,
+            coalescing_config,
+            max_effective_seq_len=memory_limits["max_effective_seq_len"],
+        )
+        candidate_chunks = coalescing_result.chunks
+        coalescing_metrics = coalescing_result.metrics
+        if coalescing_config.enabled:
+            print(
+                f"[FullyAsyncTrainer] Coalescing (lookahead={coalescing_config.lookahead}): "
+                f"rows {coalescing_metrics['rows_before_coalesce']} -> "
+                f"{coalescing_metrics['rows_after_coalesce']}, "
+                f"groups={coalescing_metrics['coalesced_groups']}, "
+                f"chunks_merged={coalescing_metrics['chunks_merged']}, "
+                f"opportunities={coalescing_metrics['coalescing_opportunities_visible_in_window']}, "
+                f"pool_coalesced={len(queue_chunks)}, "
+                f"pool_residual_in_queue={max(int(queue_len), 0)}, "
+                f"pool_drained_extra={max(len(queue_chunks) - pool_at_minimum, 0) if pool_at_minimum is not None else 0}, "
+                f"prefix_reduction_frac="
+                f"{coalescing_metrics['estimated_prefix_recompute_reduction_fraction']:.4f}, "
+                f"rejects={{'diff_parent': {coalescing_metrics['merge_reject_different_parent']}, "
+                f"'noncontig': {coalescing_metrics['merge_reject_noncontiguous_span']}, "
+                f"'policy': {coalescing_metrics['merge_reject_policy_version']}, "
+                f"'eff_len': {coalescing_metrics['merge_reject_effective_len_cap']}, "
+                f"'no_teacher': {coalescing_metrics['merge_reject_missing_teacher_payload']}, "
+                f"'fallback': {coalescing_metrics['merge_reject_fallback']}, "
+                f"'outside_window': {coalescing_metrics['merge_reject_outside_lookahead']}}}",
+                flush=True,
+            )
+
+        selection = select_chunk_samples_for_train_batch(
+            candidate_chunks,
             batch_divisor=batch_divisor,
             min_rows=selection_min_rows,
             train_row_divisor=train_row_divisor,
@@ -557,9 +630,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
         train_chunks = selection.train_chunks
         deferred_chunks = selection.deferred_chunks
+        train_original_chunks = flatten_chunk_constituents(train_chunks)
+        deferred_original_chunks = flatten_chunk_constituents(deferred_chunks)
         if deferred_chunks:
-            self._pending_chunk_samples.extend(deferred_chunks)
-        train_token_count = sum(int(chunk.n_tokens) for chunk in train_chunks)
+            self._pending_chunk_samples.extend(deferred_original_chunks)
+        train_original_chunk_count = len(train_original_chunks)
+        deferred_original_chunk_count = len(deferred_original_chunks)
+        train_token_count = sum(int(chunk.n_tokens) for chunk in train_original_chunks)
         pending_chunks_after = len(self._pending_chunk_samples)
         pending_rows_after = sum(get_chunk_row_count(chunk) for chunk in self._pending_chunk_samples)
         actor_mini_batch_size = choose_chunk_actor_mini_batch_size(
@@ -581,36 +658,65 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             "pending_buffer_rows_before": pending_rows_before,
             "pending_buffer_chunks_after": pending_chunks_after,
             "pending_buffer_rows_after": pending_rows_after,
+            "selected_rows_after_coalesce": selection.usable_rows,
+            "selected_original_chunks_after_coalesce": train_original_chunk_count,
+            "deferred_rows_after_coalesce": selection.deferred_rows,
+            "deferred_original_chunks_after_coalesce": deferred_original_chunk_count,
+            "memory_budget_trimmed": selection.trimmed_by_memory_budget,
+            "dp_divisibility_trimmed": selection.trimmed_by_dp_divisibility,
+            "dynamic_actor_mini_batch_size": actor_mini_batch_size,
+            # Pool-size diagnostic: quantify how much larger the coalescing pool
+            # could be if the token-budget cut were moved after coalescing.
+            # pool_size_coalesced is what the coalescer actually saw this round;
+            # pool_residual_in_queue_at_cut is the MQ depth still available when
+            # collection stopped (0 when the queue was drained / terminated).
+            "pool_size_coalesced": len(queue_chunks),
+            "pool_residual_in_queue_at_cut": max(int(queue_len), 0),
+            "pool_size_available_estimate": len(queue_chunks) + max(int(queue_len), 0),
+            # pool_drained_extra_chunks: residual chunks pulled past the train token
+            # budget by the optional pool-level drain (0 when drain disabled). Quantifies
+            # how many extra sibling chunks the coalescer got to consider this round.
+            "pool_drained_extra_chunks": (
+                max(len(queue_chunks) - pool_at_minimum, 0) if pool_at_minimum is not None else 0
+            ),
         }
-        _stage0_trace("chunk_batch_select", "chunk_batch", role="trainer", **batch_selection_metrics)
+        trace_metrics = {**batch_selection_metrics, **coalescing_metrics}
+        _stage0_trace("chunk_batch_select", "chunk_batch", role="trainer", **trace_metrics)
         if not train_chunks or selection.usable_rows < selection_min_rows:
             print(
                 "[FullyAsyncTrainer] not enough DP-divisible chunks collected after loop "
-                f"(collected_chunks={len(queue_chunks)}, collected_rows={selection.collected_rows}, "
-                f"usable_chunks={len(train_chunks)}, usable_rows={selection.usable_rows}, "
+                f"(collected_chunks={len(queue_chunks)}, candidate_rows={selection.collected_rows}, "
+                f"usable_rows={selection.usable_rows}, usable_original_chunks={train_original_chunk_count}, "
                 f"min_rows={selection_min_rows}, deferred_rows={selection.deferred_rows}, "
+                f"deferred_original_chunks={deferred_original_chunk_count}, "
                 f"trimmed_by_dp={selection.trimmed_by_dp_divisibility}, "
                 f"trimmed_by_budget={selection.trimmed_by_memory_budget}, terminated={terminated})"
             )
             return None, None
-        self.processed_chunks += len(train_chunks)
+        self.processed_chunks += train_original_chunk_count
 
         for chunk in train_chunks:
-            q_len = int(chunk.meta.get("_trainer_queue_len", -1)) if isinstance(chunk.meta, dict) else -1
-            self._trace_chunk_get_event(chunk, queue_len=q_len, accepted=True, drop_reason=None)
+            for original in iter_chunk_constituents(chunk):
+                q_len = int(original.meta.get("_trainer_queue_len", -1)) if isinstance(original.meta, dict) else -1
+                self._trace_chunk_get_event(original, queue_len=q_len, accepted=True, drop_reason=None)
 
         print(
-            f"[FullyAsyncTrainer] Chunk collection completed: {len(train_chunks)} train chunks, "
+            f"[FullyAsyncTrainer] Chunk collection completed: {train_original_chunk_count} train chunks, "
             f"{selection.usable_rows} train rows, {train_token_count} chunk tokens, "
             f"estimated_train_tokens={selection.estimated_train_tokens}, "
             f"max_effective_seq_len={selection.max_effective_seq_len}, "
-            f"deferred={len(deferred_chunks)} chunks/{selection.deferred_rows} rows, "
-            f"collected={len(queue_chunks)} chunks/{selection.collected_rows} rows, "
+            f"deferred={deferred_original_chunk_count} chunks/{selection.deferred_rows} rows, "
+            f"collected={len(queue_chunks)} chunks/{selection.collected_rows} candidate rows, "
             f"world_size={selection.world_size}, "
             f"train_row_divisor={selection.train_row_divisor}, "
             f"max_chunk_rows_budget={selection.max_chunk_rows_budget}, "
             f"max_train_tokens_budget={selection.max_train_tokens_budget}, "
             f"max_effective_seq_len_budget={selection.max_effective_seq_len_budget}, "
+            f"coalesced_groups={coalescing_metrics['coalesced_groups']}, "
+            f"chunks_merged_total={coalescing_metrics['chunks_merged_total']}, "
+            f"rows_after_coalesce={coalescing_metrics['rows_after_coalesce']}, "
+            f"estimated_prefix_recompute_reduction="
+            f"{coalescing_metrics['estimated_prefix_recompute_reduction']}, "
             f"actor_mini_batch_size={actor_mini_batch_size}, "
             f"trimmed_by_dp={selection.trimmed_by_dp_divisibility}, "
             f"trimmed_by_budget={selection.trimmed_by_memory_budget}, "
@@ -628,12 +734,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         batch.meta_info["fully_async/count/dropped_stale_chunks"] = self.stale_chunks_dropped
         batch.meta_info["fully_async/count/processed_chunks"] = self.processed_chunks
-        batch.meta_info["fully_async/chunk/deferred_chunks"] = len(deferred_chunks)
+        batch.meta_info["fully_async/chunk/deferred_chunks"] = deferred_original_chunk_count
         if actor_mini_batch_size != configured_actor_mini_batch_size:
             batch.meta_info["fully_async/chunk_batch/actor_mini_batch_size"] = actor_mini_batch_size
         for key, value in batch_selection_metrics.items():
             if value is not None:
                 batch.meta_info[f"fully_async/chunk_batch/{key}"] = value
+        for key, value in coalescing_metrics.items():
+            if value is not None:
+                batch.meta_info[f"fully_async/chunk_coalesce/{key}"] = value
         return 0, batch
 
     def _create_actor_rollout_classes(self):

@@ -36,6 +36,12 @@ async_training:
   # Optional chunk staleness threshold. Null/fallback is staleness_threshold.
   chunk_staleness_threshold: null
 
+  # Optional Xiaoshuai FIFO coalescing. Disabled by default to preserve the
+  # existing one-chunk-per-row behavior unless explicitly enabled.
+  coalesce_contiguous_chunks: false
+  max_coalesced_chunks: null
+  max_coalesced_effective_seq_len: null
+
 # Rollout config
 rollout:
 

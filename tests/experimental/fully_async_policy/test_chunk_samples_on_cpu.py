@@ -14,14 +14,21 @@ from tensordict import TensorDict
 from verl.experimental.agent_loop.single_turn_agent_loop import _should_continue_chunked_generation
 from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
 from verl.experimental.fully_async_policy.detach_utils import (
+    ChunkCoalescingConfig,
     RolloutSample,
     assemble_batch_from_chunk_samples,
     choose_chunk_actor_mini_batch_size,
+    coalesce_contiguous_chunk_samples,
     create_chunk_samples_from_rollout_sample,
     estimate_chunk_effective_seq_len,
+    flatten_chunk_constituents,
+    get_original_chunk_count,
     get_chunk_token_budget,
     select_chunk_samples_for_train_batch,
     split_chunk_samples_for_balanced_batch,
+)
+from verl.experimental.fully_async_policy.detach_utils import (
+    get_chunk_coalescing_drain_multiplier,
 )
 from verl.protocol import DataProto
 from verl.workers.rollout.replica import TokenOutput
@@ -126,6 +133,79 @@ def _chunk_with_effective_len(idx: int, effective_len: int, row_count: int = 1) 
         policy_version=0,
         parent_payload=payload,
         meta={"row_id": f"s{idx}", "response_end": (idx + 1) * 256},
+    )
+
+
+def _streaming_chunk(
+    parent: str,
+    idx: int,
+    start: int,
+    end: int,
+    *,
+    policy_version: int = 0,
+    source: str = "streaming",
+) -> ChunkSample:
+    prompt_width = 2
+    topk = 2
+    responses = torch.arange(100, 100 + end, dtype=torch.long).view(1, end)
+    response_mask = torch.zeros(1, end, dtype=torch.long)
+    response_mask[:, start:end] = 1
+    prompts = torch.tensor([[11, 12]], dtype=torch.long)
+    input_ids = torch.cat([prompts, responses], dim=1)
+    attention_mask = torch.ones(1, prompt_width + end, dtype=torch.long)
+    position_ids = torch.arange(prompt_width + end, dtype=torch.long).view(1, prompt_width + end)
+    teacher_ids = torch.full((1, prompt_width + end, topk), idx, dtype=torch.int32)
+    teacher_logprobs = torch.full((1, prompt_width + end, topk), float(idx), dtype=torch.float32)
+    rollout_log_probs = torch.full((1, end), float(idx), dtype=torch.float32)
+    payload = DataProto(
+        batch=TensorDict(
+            {
+                "prompts": prompts,
+                "responses": responses,
+                "response_mask": response_mask,
+                "attention_mask": attention_mask,
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "rollout_log_probs": rollout_log_probs,
+                "teacher_ids": teacher_ids,
+                "teacher_logprobs": teacher_logprobs,
+            },
+            batch_size=1,
+        ),
+        non_tensor_batch={
+            "uid": np.array([f"uid_{parent}"], dtype=object),
+            "min_global_steps": np.array([policy_version], dtype=object),
+            "max_global_steps": np.array([policy_version], dtype=object),
+            "extras": np.array([None], dtype=object),
+            "turn_scores": np.array([[]], dtype=object),
+            "tool_rewards": np.array([[]], dtype=object),
+            "chunk_sample_id": np.array([parent], dtype=object),
+            "chunk_parent_sample_id": np.array([parent], dtype=object),
+            "chunk_idx": np.array([idx], dtype=np.int32),
+            "chunk_token_offset": np.array([start], dtype=np.int32),
+            "chunk_n_tokens": np.array([end - start], dtype=np.int32),
+            "chunk_is_final": np.array([False], dtype=bool),
+            "chunk_policy_version": np.array([policy_version], dtype=np.int32),
+        },
+        meta_info={"metrics": [{"generate_sequences": 1.0, "tool_calls": 0.0}]},
+    )
+    return ChunkSample(
+        sample_id=parent,
+        chunk_idx=idx,
+        token_offset=start,
+        n_tokens=end - start,
+        tokens=list(range(start, end)),
+        is_final=False,
+        policy_version=policy_version,
+        parent_payload=payload,
+        meta={
+            "row_id": parent,
+            "parent_sample_id": parent,
+            "chunk_id": f"{parent}:{idx}",
+            "source": source,
+            "response_end": end,
+            "response_width": 16,
+        },
     )
 
 
@@ -323,6 +403,319 @@ def test_select_chunk_samples_for_train_batch_defers_without_dropping_or_reorder
     assert estimate_chunk_effective_seq_len(chunks[-1]) == 300
 
 
+def test_coalesce_contiguous_streaming_chunks_unions_masks_and_preserves_fifo():
+    chunks = [
+        _streaming_chunk("parent", 0, 0, 3),
+        _streaming_chunk("parent", 1, 3, 6),
+        _streaming_chunk("parent", 2, 6, 9),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=2,
+            max_coalesced_effective_seq_len=32,
+        ),
+    )
+
+    assert len(result.chunks) == 2
+    merged, tail = result.chunks
+    assert get_original_chunk_count(merged) == 2
+    assert tail is chunks[2]
+    assert merged.chunk_idx == 0
+    assert merged.n_tokens == 6
+    assert merged.meta["merged_chunk_ids"] == ["parent:0", "parent:1"]
+    assert int(merged.parent_payload.batch["response_mask"].sum().item()) == 6
+    assert merged.parent_payload.batch["response_mask"].tolist() == [[1, 1, 1, 1, 1, 1]]
+    assert result.metrics["coalesced_groups"] == 1
+    assert result.metrics["chunks_merged_total"] == 2
+    assert result.metrics["rows_after_coalesce"] == 2
+    assert result.metrics["estimated_prefix_recompute_reduction"] > 0
+
+    batch = assemble_batch_from_chunk_samples(result.chunks, _Tokenizer(), _config(), balance_batch=None)
+    assert batch.meta_info["fully_async/chunk/count"] == 3
+    assert batch.meta_info["fully_async/chunk/train_rows"] == 2
+    assert len(batch.meta_info["chunk_samples"]) == 3
+    assert int(batch.batch["response_mask"].sum().item()) == 9
+
+
+def test_coalesce_contiguous_streaming_chunks_does_not_cross_interleaved_fifo_parent():
+    chunks = [
+        _streaming_chunk("a", 0, 0, 3),
+        _streaming_chunk("b", 0, 0, 3),
+        _streaming_chunk("a", 1, 3, 6),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(enabled=True, max_coalesced_chunks=4, max_coalesced_effective_seq_len=32),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+
+
+def test_coalesce_contiguous_streaming_chunks_requires_matching_policy_version():
+    chunks = [
+        _streaming_chunk("parent", 0, 0, 3, policy_version=1),
+        _streaming_chunk("parent", 1, 3, 6, policy_version=2),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(enabled=True, max_coalesced_chunks=4, max_coalesced_effective_seq_len=32),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+
+
+def test_coalesce_contiguous_streaming_chunks_respects_effective_length_cap():
+    chunks = [
+        _streaming_chunk("parent", 0, 0, 3),
+        _streaming_chunk("parent", 1, 3, 6),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(enabled=True, max_coalesced_chunks=4, max_coalesced_effective_seq_len=5),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+
+
+def test_coalesce_contiguous_streaming_chunks_leaves_fallback_unchanged():
+    chunks = [
+        _streaming_chunk("parent", 0, 0, 3, source="fallback"),
+        _streaming_chunk("parent", 1, 3, 6, source="fallback"),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(enabled=True, max_coalesced_chunks=4, max_coalesced_effective_seq_len=32),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+
+
+def _interleaved_three_parent_queue():
+    # Globally interleaved FIFO order across three concurrent rollouts. Same-parent
+    # contiguous chunks are never directly adjacent in the queue.
+    return [
+        _streaming_chunk("a", 0, 0, 3),  # 0
+        _streaming_chunk("b", 0, 0, 3),  # 1
+        _streaming_chunk("c", 0, 0, 3),  # 2
+        _streaming_chunk("a", 1, 3, 6),  # 3
+        _streaming_chunk("b", 1, 3, 6),  # 4
+        _streaming_chunk("a", 2, 6, 9),  # 5
+    ]
+
+
+def test_lookahead_coalesces_interleaved_same_parent_and_preserves_fifo():
+    chunks = _interleaved_three_parent_queue()
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+
+    merged = result.chunks
+    assert len(merged) == 3
+    # Merged A occupies the earliest FIFO slot, then B, then C.
+    assert get_original_chunk_count(merged[0]) == 3
+    assert merged[0].meta["merged_chunk_ids"] == ["a:0", "a:1", "a:2"]
+    assert get_original_chunk_count(merged[1]) == 2
+    assert merged[1].meta["merged_chunk_ids"] == ["b:0", "b:1"]
+    assert merged[2] is chunks[2]  # C:c0 unchanged
+
+    assert result.metrics["coalesced_groups"] == 2
+    assert result.metrics["chunks_merged"] == 5
+    assert result.metrics["rows_before_coalesce"] == 6
+    assert result.metrics["rows_after_coalesce"] == 3
+    assert result.metrics["coalescing_opportunities_visible_in_window"] == 3
+    assert result.metrics["estimated_prefix_recompute_reduction"] > 0
+    assert result.metrics["coalesce_lookahead"] == 128
+
+    # Merged A response mask covers all three chunk spans exactly once.
+    assert int(merged[0].parent_payload.batch["response_mask"].sum().item()) == 9
+
+
+def test_lookahead_too_small_does_not_merge_interleaved_parents():
+    chunks = _interleaved_three_parent_queue()
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=1,
+        ),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+    assert result.metrics["chunks_merged"] == 0
+    # The same-parent successors exist but are outside the 1-chunk window.
+    assert result.metrics["merge_reject_outside_lookahead"] > 0
+
+
+def test_lookahead_preserves_every_original_chunk_exactly_once():
+    chunks = _interleaved_three_parent_queue()
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+
+    originals = flatten_chunk_constituents(result.chunks)
+    assert {id(chunk) for chunk in originals} == {id(chunk) for chunk in chunks}
+    assert len(originals) == len(chunks)
+
+
+def test_lookahead_does_not_merge_different_policy_versions():
+    chunks = [
+        _streaming_chunk("a", 0, 0, 3, policy_version=1),
+        _streaming_chunk("b", 0, 0, 3, policy_version=1),
+        _streaming_chunk("a", 1, 3, 6, policy_version=2),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+    assert result.metrics["merge_reject_policy_version"] == 1
+
+
+def test_lookahead_respects_effective_length_cap():
+    chunks = [
+        _streaming_chunk("a", 0, 0, 3),
+        _streaming_chunk("b", 0, 0, 3),
+        _streaming_chunk("a", 1, 3, 6),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=5,
+            lookahead=128,
+        ),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+    assert result.metrics["merge_reject_effective_len_cap"] == 1
+
+
+def test_lookahead_respects_max_coalesced_chunks():
+    chunks = _interleaved_three_parent_queue()
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=2,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+
+    # A merges only its first two chunks; A:c2 stays separate.
+    assert get_original_chunk_count(result.chunks[0]) == 2
+    assert result.chunks[0].meta["merged_chunk_ids"] == ["a:0", "a:1"]
+    originals = flatten_chunk_constituents(result.chunks)
+    assert len(originals) == len(chunks)
+
+
+def test_lookahead_leaves_fallback_chunks_unmerged():
+    chunks = [
+        _streaming_chunk("a", 0, 0, 3, source="fallback"),
+        _streaming_chunk("b", 0, 0, 3),
+        _streaming_chunk("a", 1, 3, 6, source="fallback"),
+    ]
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+
+    assert result.chunks == chunks
+    assert result.metrics["coalesced_groups"] == 0
+
+
+def test_lookahead_disabled_preserves_input_and_reports_metrics():
+    chunks = _interleaved_three_parent_queue()
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=False,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+
+    assert result.chunks is chunks
+    assert result.metrics["coalesced_groups"] == 0
+    assert result.metrics["rows_after_coalesce"] == 6
+
+
+def test_lookahead_merged_rows_obey_token_budget_and_defer_original_chunks():
+    chunks = _interleaved_three_parent_queue()
+
+    result = coalesce_contiguous_chunk_samples(
+        chunks,
+        ChunkCoalescingConfig(
+            enabled=True,
+            max_coalesced_chunks=4,
+            max_coalesced_effective_seq_len=64,
+            lookahead=128,
+        ),
+    )
+    # Merged rows still flow through the memory-safe FIFO selector without
+    # reordering or dropping, and any deferred suffix flattens to original chunks.
+    selection = select_chunk_samples_for_train_batch(
+        result.chunks,
+        batch_divisor=2,
+        min_rows=2,
+        max_chunk_rows=2,
+    )
+    kept_and_deferred = flatten_chunk_constituents(selection.train_chunks) + flatten_chunk_constituents(
+        selection.deferred_chunks
+    )
+    assert len(kept_and_deferred) == len(chunks)
+    assert {id(chunk) for chunk in kept_and_deferred} == {id(chunk) for chunk in chunks}
+
+
 def test_chunked_single_turn_resumes_only_on_length_finish_reason():
     length_output = TokenOutput(
         token_ids=[1, 2, 3],
@@ -347,3 +740,126 @@ def test_chunked_single_turn_resumes_only_on_length_finish_reason():
         total_response_tokens=3,
         response_length=9,
     )
+
+
+def _drain_config(multiplier=None):
+    async_training = {}
+    if multiplier is not None:
+        async_training["coalesce_drain_multiplier"] = multiplier
+    return OmegaConf.create({"async_training": async_training})
+
+
+def test_get_chunk_coalescing_drain_multiplier_defaults_to_one(monkeypatch):
+    monkeypatch.delenv("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", raising=False)
+    assert get_chunk_coalescing_drain_multiplier(_drain_config()) == 1.0
+
+
+def test_get_chunk_coalescing_drain_multiplier_reads_config(monkeypatch):
+    monkeypatch.delenv("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", raising=False)
+    assert get_chunk_coalescing_drain_multiplier(_drain_config(2.5)) == 2.5
+
+
+def test_get_chunk_coalescing_drain_multiplier_env_overrides_config(monkeypatch):
+    monkeypatch.setenv("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", "3")
+    assert get_chunk_coalescing_drain_multiplier(_drain_config(2.0)) == 3.0
+
+
+def test_get_chunk_coalescing_drain_multiplier_floors_below_one(monkeypatch):
+    # Values <= 1 (or invalid) must collapse to 1.0 so the legacy cut-at-budget
+    # behavior is preserved and the drain phase stays disabled.
+    monkeypatch.setenv("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", "0.5")
+    assert get_chunk_coalescing_drain_multiplier(_drain_config(2.0)) == 1.0
+    monkeypatch.setenv("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", "not-a-number")
+    assert get_chunk_coalescing_drain_multiplier(_drain_config(2.0)) == 2.0
+    monkeypatch.delenv("OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER", raising=False)
+    assert get_chunk_coalescing_drain_multiplier(_drain_config(0.25)) == 1.0
+
+
+def _build_interleaved_pool(seed: int, num_parents: int, chunks_per_parent: int):
+    import random
+
+    rng = random.Random(seed)
+    # Build each parent's chunks in contiguous chunk_idx order, then interleave
+    # the per-parent streams while preserving each parent's relative order (the
+    # realistic FIFO arrival pattern under async rollout).
+    streams = []
+    for p in range(num_parents):
+        parent = f"p{p}"
+        length = rng.randint(1, chunks_per_parent)
+        streams.append(
+            [_streaming_chunk(parent, idx, idx * 3, (idx + 1) * 3) for idx in range(length)]
+        )
+    pool = []
+    cursors = [0] * num_parents
+    remaining = sum(len(s) for s in streams)
+    while remaining:
+        p = rng.randrange(num_parents)
+        if cursors[p] < len(streams[p]):
+            pool.append(streams[p][cursors[p]])
+            cursors[p] += 1
+            remaining -= 1
+    return pool
+
+
+def _coalesced_signature(result):
+    chunks_sig = [
+        (
+            chunk.sample_id,
+            int(chunk.chunk_idx),
+            int(chunk.n_tokens),
+            get_original_chunk_count(chunk),
+            tuple((chunk.meta or {}).get("merged_chunk_ids", ())),
+        )
+        for chunk in result.chunks
+    ]
+    metric_keys = [
+        "coalesced_groups",
+        "chunks_merged_total",
+        "rows_after_coalesce",
+        "coalescing_opportunities_visible_in_window",
+        "estimated_prefix_recompute_reduction",
+        "merge_reject_different_parent",
+        "merge_reject_noncontiguous_span",
+        "merge_reject_policy_version",
+        "merge_reject_effective_len_cap",
+        "merge_reject_missing_teacher_payload",
+        "merge_reject_fallback",
+        "merge_reject_outside_lookahead",
+    ]
+    metrics_sig = {key: result.metrics[key] for key in metric_keys}
+    return chunks_sig, metrics_sig
+
+
+def test_indexed_coalescer_matches_scan_path_on_large_pools(monkeypatch):
+    # The hash-indexed fast path (used at/above the pool-size threshold) must
+    # produce byte-identical merges, ordering, and metrics as the reference
+    # linear scan across a range of lookahead/group/cap settings.
+    for seed in range(12):
+        pool = _build_interleaved_pool(seed, num_parents=6, chunks_per_parent=5)
+        for lookahead, max_chunks, cap in [
+            (0, 4, 10_000),
+            (2, 3, 10_000),
+            (8, 4, 10_000),
+            (4, 2, 8),
+            (16, None, 10_000),
+        ]:
+            config = ChunkCoalescingConfig(
+                enabled=True,
+                max_coalesced_chunks=max_chunks,
+                max_coalesced_effective_seq_len=cap,
+                lookahead=lookahead,
+            )
+
+            # Force the reference scan path.
+            monkeypatch.setenv("OPD_STAGE1_COALESCE_INDEX_THRESHOLD", "1000000")
+            scan_result = coalesce_contiguous_chunk_samples(list(pool), config)
+
+            # Force the indexed fast path (threshold below the pool size).
+            monkeypatch.setenv("OPD_STAGE1_COALESCE_INDEX_THRESHOLD", "2")
+            indexed_result = coalesce_contiguous_chunk_samples(list(pool), config)
+
+            assert _coalesced_signature(scan_result) == _coalesced_signature(indexed_result), (
+                f"mismatch at seed={seed}, lookahead={lookahead}, max_chunks={max_chunks}, cap={cap}"
+            )
+
+

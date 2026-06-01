@@ -36,6 +36,22 @@ async_training:
   # Optional chunk staleness threshold. Null/fallback is staleness_threshold.
   chunk_staleness_threshold: null
 
+  # Optional Xiaoshuai FIFO coalescing. Disabled by default to preserve the
+  # existing one-chunk-per-row behavior unless explicitly enabled.
+  coalesce_contiguous_chunks: false
+  max_coalesced_chunks: null
+  max_coalesced_effective_seq_len: null
+  # Bounded FIFO lookahead window (in pending chunks) for merging same-parent
+  # contiguous successors that are interleaved with other rollouts. 0 keeps the
+  # original adjacent-only behavior (immediate next pending chunk only).
+  coalesce_lookahead: 0
+  # Pool-level drain multiplier. When coalescing is enabled and this is > 1.0,
+  # the trainer keeps draining already-queued chunks past the train-token budget
+  # (up to budget * multiplier) so the same-parent coalescer sees a larger pool
+  # of sibling chunks before the cut. 1.0 disables draining (cut at budget).
+  # Never blocks on new arrivals. Env override: OPD_STAGE1_COALESCE_DRAIN_MULTIPLIER.
+  coalesce_drain_multiplier: 1.0
+
 # Rollout config
 rollout:
 
