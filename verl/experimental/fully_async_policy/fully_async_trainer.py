@@ -946,8 +946,29 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return
 
+        _sync_start_ts = time.time()
+        _stage0_trace(
+            "param_sync_start",
+            f"sync_{self.current_param_version}",
+            role="trainer",
+            param_version=int(self.current_param_version),
+            global_steps=int(self.global_steps),
+            param_sync_start_ts=_sync_start_ts,
+            _trace_ts=_sync_start_ts,
+        )
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+        _sync_end_ts = time.time()
+        _stage0_trace(
+            "param_sync_end",
+            f"sync_{self.current_param_version}",
+            role="trainer",
+            param_version=int(self.current_param_version),
+            global_steps=int(self.global_steps),
+            param_sync_end_ts=_sync_end_ts,
+            param_sync_latency_s=float(self.timing_raw.get("timing_s/param_sync", _sync_end_ts - _sync_start_ts)),
+            _trace_ts=_sync_end_ts,
+        )
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "

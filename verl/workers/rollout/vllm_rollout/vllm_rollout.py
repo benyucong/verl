@@ -193,6 +193,24 @@ class ServerAdapter(BaseRollout):
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+            try:
+                from verl.experimental.fully_async_policy.opd_stage0_trace import (
+                    trace_event as _opd_trace,
+                )
+
+                _apply_end_ts = time.time()
+                _opd_trace(
+                    "engine_weight_apply",
+                    f"apply_{global_steps}",
+                    role="rollouter",
+                    global_steps=int(global_steps) if global_steps is not None else None,
+                    weight_apply_start_ts=float(start_time),
+                    weight_apply_end_ts=_apply_end_ts,
+                    weight_apply_latency_s=float(_apply_end_ts - start_time),
+                    _trace_ts=_apply_end_ts,
+                )
+            except Exception:
+                pass
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_')."""

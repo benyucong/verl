@@ -158,7 +158,23 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
                 break
 
+            _abort_ts = time.time()
             await asyncio.sleep(_partial_rollout_abort_retry_delay_s())
+            _resume_ts = time.time()
+            try:
+                _stage0_trace(
+                    "partial_rollout_resume",
+                    str(request_id),
+                    role="rollouter",
+                    global_steps=int(global_steps) if global_steps is not None else None,
+                    tokens_so_far=int(len(final_output.token_ids)),
+                    abort_ts=_abort_ts,
+                    resume_ts=_resume_ts,
+                    resume_delay_s=float(_resume_ts - _abort_ts),
+                    _trace_ts=_resume_ts,
+                )
+            except Exception:
+                pass
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
