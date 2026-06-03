@@ -193,6 +193,10 @@ class ServerAdapter(BaseRollout):
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+        # Per-replica weight-apply trace (Q3): emit from EVERY replica's local leader,
+        # not just replica 0, so the analyzer can detect per-replica refresh lag /
+        # heterogeneity instead of seeing only replica 0's timeline.
+        if self.rollout_rank == 0:
             try:
                 from verl.experimental.fully_async_policy.opd_stage0_trace import (
                     trace_event as _opd_trace,
@@ -201,9 +205,11 @@ class ServerAdapter(BaseRollout):
                 _apply_end_ts = time.time()
                 _opd_trace(
                     "engine_weight_apply",
-                    f"apply_{global_steps}",
+                    f"apply_{global_steps}_r{self.replica_rank}",
                     role="rollouter",
                     global_steps=int(global_steps) if global_steps is not None else None,
+                    replica_rank=int(self.replica_rank),
+                    node_rank=int(self.node_rank) if getattr(self, "node_rank", None) is not None else None,
                     weight_apply_start_ts=float(start_time),
                     weight_apply_end_ts=_apply_end_ts,
                     weight_apply_latency_s=float(_apply_end_ts - start_time),

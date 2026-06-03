@@ -751,6 +751,8 @@ class AgentLoopWorker:
                 success=bool(success),
                 parent_sample_id=parent_sample_id,
                 finish_reason=output.extra_fields.get("finish_reason"),
+                # Q3 per-replica attribution: which engine replica decoded this slice.
+                replica_rank=output.extra_fields.get("replica_rank"),
             )
             return bool(success)
         except Exception:

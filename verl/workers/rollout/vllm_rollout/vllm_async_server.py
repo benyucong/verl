@@ -545,7 +545,13 @@ class vLLMHttpServer:
                 log_probs=None,
                 routed_experts=None,
                 stop_reason="aborted",
-                extra_fields={"global_steps": self.global_steps, "finish_reason": "abort"},
+                extra_fields={
+                    "global_steps": self.global_steps,
+                    "finish_reason": "abort",
+                    # Stamp the serving replica so chunk-level traces can attribute
+                    # each slice to the engine that decoded it (Q3 per-replica refresh).
+                    "replica_rank": self.replica_rank,
+                },
             )
 
         token_ids = final_res.outputs[0].token_ids
@@ -559,7 +565,13 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
-        extra_fields = {"global_steps": self.global_steps, "finish_reason": finish_reason}
+        extra_fields = {
+            "global_steps": self.global_steps,
+            "finish_reason": finish_reason,
+            # Stamp the serving replica so chunk-level traces can attribute each
+            # slice to the engine that decoded it (Q3 per-replica refresh).
+            "replica_rank": self.replica_rank,
+        }
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,

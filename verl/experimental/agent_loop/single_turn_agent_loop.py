@@ -47,6 +47,24 @@ def _resolve_streaming_chunk_tokens(config) -> int:
     return max(0, chunk_tokens)
 
 
+def _rollout_lease_max_tokens() -> int:
+    """Rollout-lease refresh knob (prototype for the Q3 'pinned suffix' problem).
+
+    Max response tokens a streaming request may decode under one sticky engine session
+    before its request_id is rotated. 0 disables (default — no behavior change).
+
+    When a request crosses the lease, the next slice gets a fresh request_id, which
+    forces it to re-establish a session (re-prefill prompt + response-so-far) instead
+    of riding a stale engine snapshot to completion. Each slice is still stamped with
+    the engine version that actually decoded it, so chunk provenance/labels are
+    unchanged; the lease only affects WHICH serving path decodes the suffix.
+    """
+    try:
+        return max(0, int(os.environ.get("OPD_ROLLOUT_LEASE_MAX_TOKENS", "0")))
+    except ValueError:
+        return 0
+
+
 def _finish_reason(output: TokenOutput) -> str | None:
     finish_reason = output.extra_fields.get("finish_reason") if output.extra_fields else None
     if finish_reason is not None:
@@ -219,11 +237,44 @@ class SingleTurnAgentLoop(AgentLoopBase):
         chunk_idx = 0
         chunk_emit_tasks = []
 
+        # Rollout-lease refresh state (no-op when lease_tokens == 0).
+        lease_tokens = _rollout_lease_max_tokens()
+        lease_anchor = 0
+        lease_refreshes = 0
+
         while len(response_ids) < self.response_length:
             token_offset = len(response_ids)
             chunk_limit = min(chunk_tokens, self.response_length - token_offset)
             if chunk_limit <= 0:
                 break
+
+            # Rollout-lease refresh: if this request has decoded >= lease_tokens since
+            # the last refresh, rotate request_id so the next slice re-establishes its
+            # session under the engine's CURRENT weights rather than continuing on a
+            # stale snapshot. Provenance is preserved (the slice is stamped by whatever
+            # engine version decodes it).
+            if lease_tokens and token_offset - lease_anchor >= lease_tokens:
+                _prev_version = last_extra_fields.get("global_steps")
+                _prev_replica = last_extra_fields.get("replica_rank")
+                request_id = uuid4().hex
+                lease_anchor = token_offset
+                lease_refreshes += 1
+                try:
+                    from verl.experimental.fully_async_policy.opd_stage0_trace import trace_event as _opd_trace
+
+                    _opd_trace(
+                        "rollout_lease_refresh",
+                        request_id,
+                        role="rollouter",
+                        token_offset=int(token_offset),
+                        chunk_idx=int(chunk_idx),
+                        lease_tokens=int(lease_tokens),
+                        refresh_seq=int(lease_refreshes),
+                        prev_global_steps=int(_prev_version) if _prev_version is not None else None,
+                        prev_replica_rank=int(_prev_replica) if _prev_replica is not None else None,
+                    )
+                except Exception:
+                    pass
 
             chunk_sampling_params = dict(sampling_params)
             limit_key = "max_new_tokens" if "max_new_tokens" in chunk_sampling_params else "max_tokens"
