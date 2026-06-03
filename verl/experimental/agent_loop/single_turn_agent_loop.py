@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -63,6 +64,22 @@ def _rollout_lease_max_tokens() -> int:
         return max(0, int(os.environ.get("OPD_ROLLOUT_LEASE_MAX_TOKENS", "0")))
     except ValueError:
         return 0
+
+
+def _rollout_lease_force_reprefill() -> bool:
+    """Experimental forced-re-prefill refresh (default off).
+
+    When OPD_ROLLOUT_LEASE_FORCE_REPREFILL=1 AND a lease is set, lease expiry does NOT
+    merely rotate request_id (validated ineffective: vLLM reuses old-weight prefix KV by
+    token content). Instead it invalidates the serving replica's prefix cache
+    (reset_prefix_cache) so the next slice RE-PREFILLS the accumulated prompt+response
+    under the engine's currently-loaded weights, then continues suffix decoding. Chunks
+    are still stamped with the actual decode-time version (no relabeling); only WHICH
+    weights decode the suffix changes. NOTE: reset_prefix_cache is engine-WIDE on the
+    replica, so this also forces concurrent requests on that replica to re-prefill -- the
+    cost this flag exists to measure.
+    """
+    return os.environ.get("OPD_ROLLOUT_LEASE_FORCE_REPREFILL", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _finish_reason(output: TokenOutput) -> str | None:
@@ -239,6 +256,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # Rollout-lease refresh state (no-op when lease_tokens == 0).
         lease_tokens = _rollout_lease_max_tokens()
+        force_reprefill = _rollout_lease_force_reprefill()
         lease_anchor = 0
         lease_refreshes = 0
 
@@ -248,33 +266,51 @@ class SingleTurnAgentLoop(AgentLoopBase):
             if chunk_limit <= 0:
                 break
 
-            # Rollout-lease refresh: if this request has decoded >= lease_tokens since
-            # the last refresh, rotate request_id so the next slice re-establishes its
-            # session under the engine's CURRENT weights rather than continuing on a
-            # stale snapshot. Provenance is preserved (the slice is stamped by whatever
-            # engine version decodes it).
+            # Rollout-lease refresh. No-op unless lease_tokens > 0. Two modes:
+            #   - default (cheap): rotate request_id only. Validated INEFFECTIVE (vLLM
+            #     reuses old-weight prefix KV by token content); kept for A/B.
+            #   - force_reprefill: invalidate the serving replica's prefix cache so the
+            #     next slice RE-PREFILLS the accumulated prefix under current weights.
+            #     reset_prefix_cache is engine-WIDE on that replica, so concurrent
+            #     requests also re-prefill (the cost being measured). Provenance is
+            #     preserved: each slice is stamped by whatever version decodes it.
+            pending_refresh = None
             if lease_tokens and token_offset - lease_anchor >= lease_tokens:
                 _prev_version = last_extra_fields.get("global_steps")
                 _prev_replica = last_extra_fields.get("replica_rank")
+                _refresh_start = time.time()
+                _kv_invalidated = False
+                _reset_latency = 0.0
+                if force_reprefill:
+                    try:
+                        server_id, server = await self.server_manager._acquire_server(request_id)
+                        try:
+                            _t0 = time.time()
+                            await server.clear_kv_cache.remote()
+                            _reset_latency = time.time() - _t0
+                            _kv_invalidated = True
+                        finally:
+                            self.server_manager._release_server(server_id)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"[rollout-lease] forced re-prefill cache reset failed: {e}")
+                old_request_id = request_id
                 request_id = uuid4().hex
                 lease_anchor = token_offset
                 lease_refreshes += 1
-                try:
-                    from verl.experimental.fully_async_policy.opd_stage0_trace import trace_event as _opd_trace
-
-                    _opd_trace(
-                        "rollout_lease_refresh",
-                        request_id,
-                        role="rollouter",
-                        token_offset=int(token_offset),
-                        chunk_idx=int(chunk_idx),
-                        lease_tokens=int(lease_tokens),
-                        refresh_seq=int(lease_refreshes),
-                        prev_global_steps=int(_prev_version) if _prev_version is not None else None,
-                        prev_replica_rank=int(_prev_replica) if _prev_replica is not None else None,
-                    )
-                except Exception:
-                    pass
+                pending_refresh = {
+                    "old_request_id": old_request_id,
+                    "new_request_id": request_id,
+                    "token_offset": int(token_offset),
+                    "chunk_idx": int(chunk_idx),
+                    "lease_tokens": int(lease_tokens),
+                    "refresh_seq": int(lease_refreshes),
+                    "old_chunk_version": int(_prev_version) if _prev_version is not None else None,
+                    "prev_replica_rank": int(_prev_replica) if _prev_replica is not None else None,
+                    "refresh_start_ts": _refresh_start,
+                    "kv_cache_invalidated": _kv_invalidated,
+                    "reset_prefix_cache_latency_s": float(_reset_latency),
+                    "prefix_tokens_replayed": int(token_offset),
+                }
 
             chunk_sampling_params = dict(sampling_params)
             limit_key = "max_new_tokens" if "max_new_tokens" in chunk_sampling_params else "max_tokens"
@@ -293,6 +329,32 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 )
 
             total_generate_time += float(chunk_metrics.get("generate_sequences", 0.0))
+
+            # Forced-re-prefill: the slice we just ran re-prefilled the accumulated prefix
+            # under current weights. Trace cost + whether the suffix adopted a fresher
+            # version (first_post_refresh_chunk_version > old_chunk_version == it worked).
+            if pending_refresh is not None:
+                try:
+                    from verl.experimental.fully_async_policy.opd_stage0_trace import trace_event as _opd_trace
+
+                    _post_ver = chunk_output.extra_fields.get("global_steps") if chunk_output.extra_fields else None
+                    _post_rep = chunk_output.extra_fields.get("replica_rank") if chunk_output.extra_fields else None
+                    _now = time.time()
+                    _opd_trace(
+                        "rollout_lease_force_reprefill" if pending_refresh["kv_cache_invalidated"] else "rollout_lease_refresh",
+                        pending_refresh["new_request_id"],
+                        role="rollouter",
+                        prefix_replay_start_ts=pending_refresh["refresh_start_ts"],
+                        prefix_replay_end_ts=_now,
+                        prefix_replay_latency_s=float(chunk_metrics.get("generate_sequences", 0.0)),
+                        suffix_resume_ts=_now,
+                        first_post_refresh_chunk_version=int(_post_ver) if _post_ver is not None else None,
+                        first_post_refresh_replica_rank=int(_post_rep) if _post_rep is not None else None,
+                        **pending_refresh,
+                    )
+                except Exception:
+                    pass
+
             new_token_ids = list(chunk_output.token_ids or [])
             if not new_token_ids:
                 last_extra_fields = dict(chunk_output.extra_fields or {})
