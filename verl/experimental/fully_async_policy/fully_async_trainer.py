@@ -39,8 +39,10 @@ from verl.experimental.fully_async_policy.detach_utils import (
     get_chunk_staleness_threshold,
     get_chunk_token_budget,
     get_chunk_token_size,
+    get_optimizer_step_token_budget,
     iter_chunk_constituents,
     is_chunk_data_path_enabled,
+    pad_chunk_dataproto_to_response_width,
     select_chunk_samples_for_train_batch,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
@@ -166,6 +168,37 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.progress_bar = None
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
         self.last_ckpt_version = 0
+
+        # ---- Control-plane decoupling: upstream-like token budget per optimizer step ----
+        # When > 0, accumulate streamed-chunk supervision across multiple memory-safe
+        # fit_steps until the accumulated train-token count reaches this budget, then do
+        # ONE optimizer.step() + version increment + weight sync. Default 0 == OFF
+        # (exact current per-fit-step behavior). See get_optimizer_step_token_budget().
+        self._optimizer_step_token_budget = get_optimizer_step_token_budget(config)
+        self._accumulated_train_batches: list[DataProto] = []
+        self._accumulated_train_tokens = 0
+        # In budget mode every (budget-gated) optimizer step is a sync boundary, so the
+        # version bumps + reset_staleness fire once per accumulated step. We use a
+        # trainer-LOCAL sync cadence and deliberately leave the rollouter-visible
+        # config.async_training.trigger_parameter_sync_step untouched (it sizes the
+        # queue / staleness budget -- a data-plane concern).
+        self._sync_every = 1 if self._optimizer_step_token_budget > 0 else self.trigger_parameter_sync_step
+        if self._optimizer_step_token_budget > 0:
+            _ppo_epochs = int(config.actor_rollout_ref.actor.get("ppo_epochs", 1))
+            if _ppo_epochs != 1:
+                print(
+                    "[FullyAsyncTrainer][OptStepBudget] WARNING: ppo_epochs="
+                    f"{_ppo_epochs} != 1 with optimizer_step_token_budget > 0. Each accumulated "
+                    "mini-batch will run ppo_epochs optimizer steps, partially defeating the "
+                    "one-step-per-budget intent. Set ppo_epochs=1 for the intended cadence.",
+                    flush=True,
+                )
+            print(
+                "[FullyAsyncTrainer][OptStepBudget] ENABLED: one optimizer step + version "
+                f"bump + weight sync per {self._optimizer_step_token_budget} accumulated train "
+                "tokens (data plane / chunk streaming unchanged).",
+                flush=True,
+            )
         self.train_role = Role.ActorRollout if config.async_training.use_trainer_do_validate else Role.Actor
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
@@ -821,6 +854,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 print("[FullyAsyncTrainer] Training stopped by queue termination signal")
                 break
 
+        # Flush any trailing accumulated supervision (optimizer-step-budget mode) so the
+        # last partial budget still trains before shutdown.
+        if self._optimizer_step_token_budget > 0 and self._accumulated_train_batches:
+            merged = self._concat_accumulated_batches()
+            self._accumulated_train_batches = []
+            self._accumulated_train_tokens = 0
+            print(
+                f"[FullyAsyncTrainer][OptStepBudget] shutdown flush: final optimizer step "
+                f"over {len(merged)} rows",
+                flush=True,
+            )
+            self._fit_update_actor(merged)
+            self._fit_update_local_step()
+            await self._fit_update_weights()
+
         self.progress_bar.close()
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
@@ -848,6 +896,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self._fit_start_profile()
 
+        did_step = True
         with marked_timer("step", self.timing_raw):
             batch = await self._fit_generate(None)
             batch = self._fit_compute_reward(batch)
@@ -858,17 +907,97 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = self._fit_update_critic(batch)
             train_batch = batch
             self._trace_chunk_train_events(train_batch, "chunk_train_start")
-            batch = self._fit_update_actor(batch)
-            self._trace_chunk_train_events(train_batch, "chunk_train_end")
-            self._fit_update_local_step()
-            await self._fit_update_weights()
-            self._fit_dump_data(batch)
+            if self._optimizer_step_token_budget <= 0:
+                # Control plane OFF (default): one optimizer step + version bump + sync
+                # per fit_step, exactly as before.
+                batch = self._fit_update_actor(batch)
+                self._trace_chunk_train_events(train_batch, "chunk_train_end")
+                self._fit_update_local_step()
+                await self._fit_update_weights()
+                self._fit_dump_data(batch)
+            else:
+                # Control plane decoupled: accumulate streamed-chunk supervision and do
+                # ONE optimizer step + version bump + sync per upstream-like token budget.
+                # The data plane above (generate/score/logprob/advantage) still ran this
+                # fit_step, so chunks keep arriving early and the queue is not backpressured.
+                did_step, step_batch = self._maybe_flush_optimizer_step(train_batch)
+                self._trace_chunk_train_events(train_batch, "chunk_train_end")
+                if did_step:
+                    self._fit_update_local_step()
+                    await self._fit_update_weights()
+                    self._fit_dump_data(step_batch)
+                    batch = step_batch
 
-        await self._fit_validate()
-        self._fit_save_checkpoint()
+        # Validation / checkpointing align with an actual optimizer step + version bump
+        # (every fit_step when OFF; only on a flush when the budget mode is active).
+        if did_step:
+            await self._fit_validate()
+            self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
+
+    @staticmethod
+    def _count_train_tokens(batch: DataProto) -> int:
+        """Trainable response tokens in an assembled chunk batch (the optimizer-step budget unit)."""
+        try:
+            if batch.batch is not None and "response_mask" in batch.batch:
+                return int(batch.batch["response_mask"].sum().item())
+        except Exception:
+            pass
+        return 0
+
+    def _concat_accumulated_batches(self) -> DataProto:
+        """Pad accumulated per-fit-step chunk batches to a common width and concat into ONE
+        mini-batch, so a single optimizer step spans the whole accumulated token budget.
+        Token-mean loss normalization is computed at update time over the merged batch, so
+        this is upstream-equivalent (no loss/teacher/mask semantic change)."""
+        batches = self._accumulated_train_batches
+        if len(batches) == 1:
+            merged = batches[0]
+        else:
+            max_w = max(int(b.batch["responses"].shape[1]) for b in batches)
+            pad_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
+            padded = [pad_chunk_dataproto_to_response_width(b, max_w, pad_id) for b in batches]
+            merged = DataProto.concat(padded)
+
+        total_rows = len(merged)
+        world_size = int(batches[0].meta_info.get("fully_async/chunk_batch/world_size", 0) or 0)
+        configured_mb = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
+            self.config.actor_rollout_ref.rollout.get("n", 1)
+        )
+        # Force ONE optimizer step over the whole accumulated batch when DP-divisible
+        # (it is, since each accumulated sub-batch was selected DP-divisible). Fall back to
+        # the largest DP-valid mini-batch otherwise (a few steps, still far fewer than per-fit-step).
+        if world_size > 0 and total_rows % world_size == 0:
+            mini_batch = total_rows
+        else:
+            mini_batch = choose_chunk_actor_mini_batch_size(total_rows, max(1, world_size), configured_mb)
+        merged.meta_info["fully_async/chunk_batch/actor_mini_batch_size"] = int(mini_batch)
+        return merged
+
+    def _maybe_flush_optimizer_step(self, train_batch: DataProto):
+        """Budget mode: accumulate `train_batch`; when accumulated trainable tokens reach
+        `self._optimizer_step_token_budget`, do ONE optimizer step over the merged batch.
+        Returns (did_step, step_metrics_batch_or_None). Accumulation defers only the optimizer
+        step -- the queue was already drained for this batch, so the rollouter is not backpressured."""
+        self._accumulated_train_batches.append(train_batch)
+        self._accumulated_train_tokens += self._count_train_tokens(train_batch)
+        if self._accumulated_train_tokens < self._optimizer_step_token_budget:
+            return False, None
+        merged = self._concat_accumulated_batches()
+        n_batches = len(self._accumulated_train_batches)
+        acc_tokens = self._accumulated_train_tokens
+        self._accumulated_train_batches = []
+        self._accumulated_train_tokens = 0
+        print(
+            f"[FullyAsyncTrainer][OptStepBudget] flushing optimizer step over {n_batches} "
+            f"accumulated chunk batches ({acc_tokens} train tokens, {len(merged)} rows, "
+            f"budget={self._optimizer_step_token_budget})",
+            flush=True,
+        )
+        step_batch = self._fit_update_actor(merged)
+        return True, step_batch
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
@@ -933,10 +1062,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print(
             f"[FullyAsyncTrainer] global_steps: {self.global_steps} "
             f"local_trigger_step: {self.local_trigger_step} "
+            f"sync_every: {self._sync_every} "
             f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
             f"{time_str}"
         )
-        if self.local_trigger_step < self.trigger_parameter_sync_step:
+        # In optimizer-step-budget mode self._sync_every == 1, so each (budget-gated)
+        # optimizer step bumps the version + triggers one weight sync. Otherwise this is
+        # the unchanged per-fit-step cadence keyed on trigger_parameter_sync_step.
+        if self.local_trigger_step < self._sync_every:
             self.local_trigger_step += 1
         else:
             self.current_param_version += 1

@@ -122,6 +122,51 @@ def get_chunk_token_budget(config, chunk_tokens: int | None = None) -> int:
     return max(1, required_units * max(1, rollout_n) * max(1, int(chunk_tokens)))
 
 
+def get_optimizer_step_token_budget(config) -> int:
+    """Resolve the per-optimizer-step token budget for the chunk trainer.
+
+    When > 0, the trainer accumulates streamed-chunk supervision across multiple
+    memory-safe ``fit_step``s until the accumulated train-token count reaches this
+    budget, then performs ONE ``optimizer.step()`` + policy-version increment +
+    weight sync. This decouples the control plane (how often the student changes)
+    from the data plane (how early chunks arrive), so fewer policy versions elapse
+    during a long decode -- WITHOUT the cosmetic effect of merely raising
+    ``trigger_parameter_sync_step`` (which keeps the student stepping every chunk
+    batch and only lets the rollouter lag more).
+
+    Returns ``0`` to DISABLE (default -> exact current per-fit-step behavior).
+
+    Resolution precedence (first match wins), then floored at one chunk batch:
+      1. env  ``OPD_OPTIMIZER_STEP_TOKEN_BUDGET``  (absolute tokens)
+      2. cfg  ``async_training.optimizer_step_token_budget``  (absolute tokens)
+      3. env  ``OPD_OPTIMIZER_STEP_BUDGET_MULT``   (multiplier of get_chunk_token_budget)
+    The "moderate" setting is mult == trigger_parameter_sync_step, i.e. one optimizer
+    step per ``trigger_parameter_sync_step`` worth of chunk-token supervision. A
+    resolved value is floored to ``max(value, get_chunk_token_budget(config))`` so one
+    optimizer step always covers at least one memory-safe chunk batch.
+    """
+    chunk_budget = get_chunk_token_budget(config)
+
+    abs_env = _positive_int_env("OPD_OPTIMIZER_STEP_TOKEN_BUDGET")
+    if abs_env is not None:
+        return max(abs_env, chunk_budget)
+
+    cfg_val = config.async_training.get("optimizer_step_token_budget", None)
+    if cfg_val is not None and int(cfg_val) > 0:
+        return max(int(cfg_val), chunk_budget)
+
+    mult_raw = os.environ.get("OPD_OPTIMIZER_STEP_BUDGET_MULT", "").strip()
+    if mult_raw:
+        try:
+            mult = float(mult_raw)
+        except ValueError:
+            mult = 0.0
+        if mult > 0:
+            return max(int(round(mult * chunk_budget)), chunk_budget)
+
+    return 0
+
+
 def get_chunk_staleness_threshold(config) -> float:
     """Resolve the trainer-side staleness threshold for chunk payloads."""
     sigma = config.async_training.get("chunk_staleness_threshold", None)

@@ -33,6 +33,13 @@ async_training:
   # ppo_mini_batch_size * require_batches * chunk_tokens.
   chunk_token_budget: null
 
+  # Optional per-optimizer-step token budget (control-plane decoupling). Null/0 keeps the
+  # current per-fit-step cadence. When > 0, accumulate streamed-chunk supervision across
+  # fit_steps until this many trainable tokens, then ONE optimizer step + version bump +
+  # sync. Env override OPD_OPTIMIZER_STEP_TOKEN_BUDGET / OPD_OPTIMIZER_STEP_BUDGET_MULT.
+  # Requires ppo_epochs=1.
+  optimizer_step_token_budget: null
+
   # Optional chunk staleness threshold. Null/fallback is staleness_threshold.
   chunk_staleness_threshold: null
 
