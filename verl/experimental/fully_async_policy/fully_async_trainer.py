@@ -953,16 +953,28 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Token-mean loss normalization is computed at update time over the merged batch, so
         this is upstream-equivalent (no loss/teacher/mask semantic change)."""
         batches = self._accumulated_train_batches
+        # Capture per-step metadata we need BEFORE clearing meta_info for the concat.
+        world_size = int(batches[0].meta_info.get("fully_async/chunk_batch/world_size", 0) or 0)
         if len(batches) == 1:
             merged = batches[0]
         else:
             max_w = max(int(b.batch["responses"].shape[1]) for b in batches)
             pad_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
             padded = [pad_chunk_dataproto_to_response_width(b, max_w, pad_id) for b in batches]
+            # DataProto.concat asserts identical meta_info across batches, but each
+            # per-fit-step chunk batch legitimately carries its own per-batch meta_info
+            # (global_token_num, per-step fully_async/* metrics, ...). Clear it on the
+            # padded copies, then restore the essentials on the merged batch -- this
+            # mirrors assemble_batch_from_chunk_samples, which sets global_token_num
+            # AFTER concat. _update_actor sets multi_turn/temperature itself and reads
+            # actor_mini_batch_size (set below), so no other meta_info is needed here.
+            for p in padded:
+                p.meta_info = {}
             merged = DataProto.concat(padded)
+            if "attention_mask" in merged.batch:
+                merged.meta_info["global_token_num"] = merged.batch["attention_mask"].sum(-1).tolist()
 
         total_rows = len(merged)
-        world_size = int(batches[0].meta_info.get("fully_async/chunk_batch/world_size", 0) or 0)
         configured_mb = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
             self.config.actor_rollout_ref.rollout.get("n", 1)
         )
