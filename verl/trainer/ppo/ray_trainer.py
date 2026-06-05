@@ -1237,6 +1237,11 @@ class RayPPOTrainer:
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
+            # Optimizer-step token-budget gradient accumulation (default-off; one
+            # memory-safe sub-batch per call). Defaults reproduce the normal single step.
+            acc_zero_grad=bool(batch.meta_info.get("acc_zero_grad", True)),
+            acc_do_step=bool(batch.meta_info.get("acc_do_step", True)),
+            acc_loss_scale=float(batch.meta_info.get("acc_loss_scale", 1.0)),
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")

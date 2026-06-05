@@ -857,15 +857,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Flush any trailing accumulated supervision (optimizer-step-budget mode) so the
         # last partial budget still trains before shutdown.
         if self._optimizer_step_token_budget > 0 and self._accumulated_train_batches:
-            merged = self._concat_accumulated_batches()
+            subs = self._accumulated_train_batches
             self._accumulated_train_batches = []
             self._accumulated_train_tokens = 0
             print(
                 f"[FullyAsyncTrainer][OptStepBudget] shutdown flush: final optimizer step "
-                f"over {len(merged)} rows",
+                f"over {len(subs)} accumulated sub-batches",
                 flush=True,
             )
-            self._fit_update_actor(merged)
+            self._run_accumulated_optimizer_step(subs)
             self._fit_update_local_step()
             await self._fit_update_weights()
 
@@ -947,68 +947,53 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             pass
         return 0
 
-    def _concat_accumulated_batches(self) -> DataProto:
-        """Pad accumulated per-fit-step chunk batches to a common width and concat into ONE
-        mini-batch, so a single optimizer step spans the whole accumulated token budget.
-        Token-mean loss normalization is computed at update time over the merged batch, so
-        this is upstream-equivalent (no loss/teacher/mask semantic change)."""
-        batches = self._accumulated_train_batches
-        # Capture per-step metadata we need BEFORE clearing meta_info for the concat.
-        world_size = int(batches[0].meta_info.get("fully_async/chunk_batch/world_size", 0) or 0)
-        if len(batches) == 1:
-            merged = batches[0]
-        else:
-            max_w = max(int(b.batch["responses"].shape[1]) for b in batches)
-            pad_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
-            padded = [pad_chunk_dataproto_to_response_width(b, max_w, pad_id) for b in batches]
-            # DataProto.concat asserts identical meta_info across batches, but each
-            # per-fit-step chunk batch legitimately carries its own per-batch meta_info
-            # (global_token_num, per-step fully_async/* metrics, ...). Clear it on the
-            # padded copies, then restore the essentials on the merged batch -- this
-            # mirrors assemble_batch_from_chunk_samples, which sets global_token_num
-            # AFTER concat. _update_actor sets multi_turn/temperature itself and reads
-            # actor_mini_batch_size (set below), so no other meta_info is needed here.
-            for p in padded:
-                p.meta_info = {}
-            merged = DataProto.concat(padded)
-            if "attention_mask" in merged.batch:
-                merged.meta_info["global_token_num"] = merged.batch["attention_mask"].sum(-1).tolist()
+    def _run_accumulated_optimizer_step(self, subs: list[DataProto]):
+        """Fork 2: perform ONE optimizer step over `subs` (memory-safe per-fit-step chunk
+        batches) via gradient accumulation, keeping peak memory at a single sub-batch.
 
-        total_rows = len(merged)
-        configured_mb = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
-            self.config.actor_rollout_ref.rollout.get("n", 1)
-        )
-        # Force ONE optimizer step over the whole accumulated batch when DP-divisible
-        # (it is, since each accumulated sub-batch was selected DP-divisible). Fall back to
-        # the largest DP-valid mini-batch otherwise (a few steps, still far fewer than per-fit-step).
-        if world_size > 0 and total_rows % world_size == 0:
-            mini_batch = total_rows
-        else:
-            mini_batch = choose_chunk_actor_mini_batch_size(total_rows, max(1, world_size), configured_mb)
-        merged.meta_info["fully_async/chunk_batch/actor_mini_batch_size"] = int(mini_batch)
-        return merged
+        Each sub-batch is forwarded/backwarded in its own update_actor call (peak = one
+        sub-batch, exactly the proven memory-safe size). We zero-grad only on the first
+        sub-batch and optimizer.step() only on the last, accumulating grads in between.
+        Each sub-batch's loss is scaled by its token share (N_i / N_total): the engine
+        normalizes each sub-batch's loss by its own token count (token-mean), so the scale
+        cancels that and the summed gradient equals the global token-mean over all
+        sub-batches -- upstream-equivalent, no loss/teacher/mask semantic change. Each
+        sub-batch is run as ONE mini-batch (actor_mini_batch_size = its row count) so the
+        zero/step gating is per-call rather than split across internal mini-batches."""
+        n = len(subs)
+        token_counts = [max(1, self._count_train_tokens(b)) for b in subs]
+        total_tokens = max(1, sum(token_counts))
+        step_batch = None
+        for i, b in enumerate(subs):
+            b.meta_info["acc_zero_grad"] = i == 0
+            b.meta_info["acc_do_step"] = i == n - 1
+            b.meta_info["acc_loss_scale"] = float(token_counts[i] / total_tokens)
+            # One mini-batch per sub-batch (its rows are DP-divisible by construction) so
+            # train_mini_batch issues exactly one engine.train_batch call for it.
+            b.meta_info["fully_async/chunk_batch/actor_mini_batch_size"] = int(len(b))
+            step_batch = self._fit_update_actor(b)
+        return step_batch
 
     def _maybe_flush_optimizer_step(self, train_batch: DataProto):
         """Budget mode: accumulate `train_batch`; when accumulated trainable tokens reach
-        `self._optimizer_step_token_budget`, do ONE optimizer step over the merged batch.
-        Returns (did_step, step_metrics_batch_or_None). Accumulation defers only the optimizer
-        step -- the queue was already drained for this batch, so the rollouter is not backpressured."""
+        `self._optimizer_step_token_budget`, do ONE optimizer step over the accumulated
+        sub-batches via gradient accumulation (memory-safe). Returns (did_step,
+        step_metrics_batch_or_None). Accumulation defers only the optimizer step -- the
+        queue was already drained for these batches, so the rollouter is not backpressured."""
         self._accumulated_train_batches.append(train_batch)
         self._accumulated_train_tokens += self._count_train_tokens(train_batch)
         if self._accumulated_train_tokens < self._optimizer_step_token_budget:
             return False, None
-        merged = self._concat_accumulated_batches()
-        n_batches = len(self._accumulated_train_batches)
+        subs = self._accumulated_train_batches
         acc_tokens = self._accumulated_train_tokens
         self._accumulated_train_batches = []
         self._accumulated_train_tokens = 0
         print(
-            f"[FullyAsyncTrainer][OptStepBudget] flushing optimizer step over {n_batches} "
-            f"accumulated chunk batches ({acc_tokens} train tokens, {len(merged)} rows, "
-            f"budget={self._optimizer_step_token_budget})",
+            f"[FullyAsyncTrainer][OptStepBudget] gradient-accumulating ONE optimizer step over "
+            f"{len(subs)} sub-batches ({acc_tokens} train tokens, budget={self._optimizer_step_token_budget})",
             flush=True,
         )
-        step_batch = self._fit_update_actor(merged)
+        step_batch = self._run_accumulated_optimizer_step(subs)
         return True, step_batch
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:

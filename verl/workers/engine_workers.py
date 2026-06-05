@@ -348,18 +348,58 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        # Optimizer-step token-budget gradient accumulation (default-off): when these
+        # flags are at their defaults the path below is byte-identical to the original
+        # `self.engine.train_batch(...)`. When set (one memory-safe sub-batch per call),
+        # we zero-grad only on the first sub-batch, scale the loss by this sub-batch's
+        # token share so the summed grad equals the global token-mean, and step the
+        # optimizer only on the last sub-batch -- peak memory stays at one sub-batch.
+        acc_zero_grad = bool(tu.get(data, key="acc_zero_grad", default=True))
+        acc_do_step = bool(tu.get(data, key="acc_do_step", default=True))
+        acc_loss_scale = float(tu.get(data, key="acc_loss_scale", default=1.0))
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
-            # containing loss, model_output and metrics
-            # for training, we only care about loss and metrics
+            if acc_zero_grad and acc_do_step and acc_loss_scale == 1.0:
+                output = self.engine.train_batch(data, loss_function=self.loss_fn)
+                # containing loss, model_output and metrics
+                # for training, we only care about loss and metrics
+            else:
+                maybe_fix_3d_position_ids(data)
+                if acc_loss_scale == 1.0:
+                    _acc_loss_fn = self.loss_fn
+                else:
+                    _base_loss_fn = self.loss_fn
+
+                    def _acc_loss_fn(*a, **k):
+                        # loss_fn is dual-purpose: as logits_processor_func it is called with
+                        # `student_logits=` and returns a dict (pass through untouched); as the
+                        # loss function it is called with `model_output=` and returns
+                        # (loss, metrics) -- scale only the backward loss in that case.
+                        out = _base_loss_fn(*a, **k)
+                        if "model_output" in k:
+                            _loss, _m = out
+                            # Report the TRUE (unscaled) loss in the metrics so logged
+                            # actor/loss stays comparable across arms; the token-share
+                            # scale applies only to the backward gradient.
+                            if isinstance(_m, dict):
+                                _m = {**_m, "loss": _loss.detach()}
+                            return _loss * acc_loss_scale, _m
+                        return out
+
+                if acc_zero_grad:
+                    self.engine.optimizer_zero_grad()
+                output = self.engine.forward_backward_batch(data, loss_function=_acc_loss_fn, forward_only=False)
+                if acc_do_step:
+                    grad_norm = self.engine.optimizer_step()
+                    if self.engine.is_mp_src_rank_with_outputs():
+                        output["metrics"]["grad_norm"] = grad_norm
         delta_time = timer.last
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
-        # update lr scheduler
-        if update_lr_scheduler:
+        # update lr scheduler (only on a call that actually steps the optimizer)
+        if update_lr_scheduler and acc_do_step:
             lr = self.engine.lr_scheduler_step()
         else:
             lr = None
