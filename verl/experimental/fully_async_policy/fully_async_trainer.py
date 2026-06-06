@@ -46,6 +46,12 @@ from verl.experimental.fully_async_policy.detach_utils import (
     select_chunk_samples_for_train_batch,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.starvation import (
+    get_optimizer_step_max_fit_steps,
+    get_starvation_escape_enabled,
+    get_validate_every_flush,
+    starvation_escape_decision,
+)
 from verl.experimental.fully_async_policy.opd_stage0_trace import (
     is_enabled as _stage0_is_enabled,
     trace_chunk_event as _stage0_trace_chunk,
@@ -67,6 +73,16 @@ logger = logging.getLogger(__name__)
 
 class TrainingStopException(Exception):
     """Exception raised to signal training should stop"""
+
+    pass
+
+
+class _StarvationFlush(Exception):
+    """Internal signal raised ONLY in optimizer-step-token-budget mode when the rollouter
+    is fully stalled (paused, nothing in flight, queue drained) while the trainer holds
+    accumulated optimizer-step supervision. Caught in fit_step to force an early flush that
+    bumps the policy version + resets staleness, breaking the budget-flush <-> staleness-
+    pause deadlock. Never raised on the control path (budget<=0)."""
 
     pass
 
@@ -183,6 +199,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # config.async_training.trigger_parameter_sync_step untouched (it sizes the
         # queue / staleness budget -- a data-plane concern).
         self._sync_every = 1 if self._optimizer_step_token_budget > 0 else self.trigger_parameter_sync_step
+        # Budget-mode deadlock-breaker + opt-in cadence knobs. All inert when budget<=0
+        # (control arm); the starvation escape is additionally inert outside the exact
+        # stall fingerprint, so validated healthy-m12 behavior is preserved. See starvation.py.
+        self._starvation_escape_enabled = get_starvation_escape_enabled(config)
+        self._max_fit_steps_per_flush = get_optimizer_step_max_fit_steps(config)
+        self._validate_every_flush = get_validate_every_flush(config)
         if self._optimizer_step_token_budget > 0:
             _ppo_epochs = int(config.actor_rollout_ref.actor.get("ppo_epochs", 1))
             if _ppo_epochs != 1:
@@ -571,6 +593,46 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 if observed_queue_len is None or observed_queue_len <= 0:
                     break
 
+            # Starvation escape (budget mode): if we are about to block for a new chunk but
+            # the rollouter is fully stalled and we already hold accumulated supervision,
+            # unwind so fit_step can flush it early -> version bump + reset_staleness ->
+            # rollouter resumes (breaks the budget-flush <-> staleness-pause deadlock). Cheap
+            # gates first (no RPC); the authoritative queue/rollouter probes run only when we
+            # are actually about to block. A (rare) false positive only yields a safe,
+            # slightly-early flush of real accumulated data. Fully inert when budget<=0.
+            if (
+                self._starvation_escape_enabled
+                and self._optimizer_step_token_budget > 0
+                and not minimum_met
+                and bool(self._accumulated_train_batches)
+                and observed_queue_len is not None
+                and observed_queue_len <= 0
+            ):
+                confirmed_qsize = await self.message_queue_client.get_queue_size()
+                rollouter_paused, rollouter_active = await self._rollouter_pause_state()
+                if starvation_escape_decision(
+                    budget_enabled=self._optimizer_step_token_budget > 0,
+                    escape_enabled=self._starvation_escape_enabled,
+                    minimum_met=minimum_met,
+                    observed_queue_len=observed_queue_len,
+                    accumulated_nonempty=bool(self._accumulated_train_batches),
+                    confirmed_queue_size=confirmed_qsize,
+                    rollouter_paused=rollouter_paused,
+                    rollouter_active_tasks=rollouter_active,
+                ):
+                    # Preserve survivors (already passed the stale check) for the next round;
+                    # mirrors the deferred-chunk reuse path (originals, re-coalesced next call).
+                    if queue_chunks:
+                        self._pending_chunk_samples = list(queue_chunks) + self._pending_chunk_samples
+                    assert self._optimizer_step_token_budget > 0, "starvation flush only in budget mode"
+                    print(
+                        "[FullyAsyncTrainer][OptStepBudget] starvation detected (queue empty, "
+                        f"rollouter paused, active_tasks={rollouter_active}); escaping to flush "
+                        f"{len(self._accumulated_train_batches)} accumulated sub-batches early.",
+                        flush=True,
+                    )
+                    raise _StarvationFlush()
+
             result = await self.message_queue_client.get_sample()
             if result is None:
                 payload, queue_len = None, 0
@@ -897,36 +959,52 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_start_profile()
 
         did_step = True
+        starvation_flush = False
         with marked_timer("step", self.timing_raw):
-            batch = await self._fit_generate(None)
-            batch = self._fit_compute_reward(batch)
-            batch = self._fit_compute_log_prob(batch)
-            batch = self._fit_compute_ref_log_prob(batch)
-            batch = self._fit_compute_critic(batch)
-            batch = self._fit_compute_advantage(batch)
-            batch = self._fit_update_critic(batch)
-            train_batch = batch
-            self._trace_chunk_train_events(train_batch, "chunk_train_start")
-            if self._optimizer_step_token_budget <= 0:
-                # Control plane OFF (default): one optimizer step + version bump + sync
-                # per fit_step, exactly as before.
-                batch = self._fit_update_actor(batch)
-                self._trace_chunk_train_events(train_batch, "chunk_train_end")
+            try:
+                batch = await self._fit_generate(None)
+            except _StarvationFlush:
+                # Budget mode only (asserted at the raise site): the rollouter starved while
+                # accumulated supervision was pending. Skip the data plane for this step and
+                # flush the accumulation now so the version bumps + reset_staleness un-pauses
+                # the rollouter. The OFF/control path can never raise this -> unchanged.
+                starvation_flush = True
+            if starvation_flush:
+                step_batch = self._force_flush_accumulated()  # subs guaranteed non-empty
                 self._fit_update_local_step()
                 await self._fit_update_weights()
-                self._fit_dump_data(batch)
+                self._fit_dump_data(step_batch)
+                batch = step_batch
+                did_step = True
             else:
-                # Control plane decoupled: accumulate streamed-chunk supervision and do
-                # ONE optimizer step + version bump + sync per upstream-like token budget.
-                # The data plane above (generate/score/logprob/advantage) still ran this
-                # fit_step, so chunks keep arriving early and the queue is not backpressured.
-                did_step, step_batch = self._maybe_flush_optimizer_step(train_batch)
-                self._trace_chunk_train_events(train_batch, "chunk_train_end")
-                if did_step:
+                batch = self._fit_compute_reward(batch)
+                batch = self._fit_compute_log_prob(batch)
+                batch = self._fit_compute_ref_log_prob(batch)
+                batch = self._fit_compute_critic(batch)
+                batch = self._fit_compute_advantage(batch)
+                batch = self._fit_update_critic(batch)
+                train_batch = batch
+                self._trace_chunk_train_events(train_batch, "chunk_train_start")
+                if self._optimizer_step_token_budget <= 0:
+                    # Control plane OFF (default): one optimizer step + version bump + sync
+                    # per fit_step, exactly as before.
+                    batch = self._fit_update_actor(batch)
+                    self._trace_chunk_train_events(train_batch, "chunk_train_end")
                     self._fit_update_local_step()
                     await self._fit_update_weights()
-                    self._fit_dump_data(step_batch)
-                    batch = step_batch
+                    self._fit_dump_data(batch)
+                else:
+                    # Control plane decoupled: accumulate streamed-chunk supervision and do
+                    # ONE optimizer step + version bump + sync per upstream-like token budget.
+                    # The data plane above (generate/score/logprob/advantage) still ran this
+                    # fit_step, so chunks keep arriving early and the queue is not backpressured.
+                    did_step, step_batch = self._maybe_flush_optimizer_step(train_batch)
+                    self._trace_chunk_train_events(train_batch, "chunk_train_end")
+                    if did_step:
+                        self._fit_update_local_step()
+                        await self._fit_update_weights()
+                        self._fit_dump_data(step_batch)
+                        batch = step_batch
 
         # Validation / checkpointing align with an actual optimizer step + version bump
         # (every fit_step when OFF; only on a flush when the budget mode is active).
@@ -982,19 +1060,55 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue was already drained for these batches, so the rollouter is not backpressured."""
         self._accumulated_train_batches.append(train_batch)
         self._accumulated_train_tokens += self._count_train_tokens(train_batch)
-        if self._accumulated_train_tokens < self._optimizer_step_token_budget:
+        budget_met = self._accumulated_train_tokens >= self._optimizer_step_token_budget
+        # Opt-in safety cap (default 0 = OFF): bound version lag by forcing a flush after
+        # at most _max_fit_steps_per_flush accumulated chunk-batch fit_steps. Default leaves
+        # the validated pure-token-budget cadence untouched.
+        cap_met = (
+            self._max_fit_steps_per_flush > 0
+            and len(self._accumulated_train_batches) >= self._max_fit_steps_per_flush
+        )
+        if not budget_met and not cap_met:
             return False, None
         subs = self._accumulated_train_batches
         acc_tokens = self._accumulated_train_tokens
         self._accumulated_train_batches = []
         self._accumulated_train_tokens = 0
+        trigger = "budget" if budget_met else f"fit-step cap={self._max_fit_steps_per_flush}"
         print(
             f"[FullyAsyncTrainer][OptStepBudget] gradient-accumulating ONE optimizer step over "
-            f"{len(subs)} sub-batches ({acc_tokens} train tokens, budget={self._optimizer_step_token_budget})",
+            f"{len(subs)} sub-batches ({acc_tokens} train tokens, budget={self._optimizer_step_token_budget}, "
+            f"trigger={trigger})",
             flush=True,
         )
         step_batch = self._run_accumulated_optimizer_step(subs)
         return True, step_batch
+
+    async def _rollouter_pause_state(self) -> tuple[bool, int]:
+        """RPC: atomic (paused, in-flight active_tasks) snapshot from the rollouter for the
+        starvation-escape check. Read-only."""
+        state = await asyncio.wrap_future(self.rollouter.get_generation_state.remote().future())
+        return bool(state.get("paused")), int(state.get("active_tasks", 0))
+
+    def _force_flush_accumulated(self) -> DataProto:
+        """Starvation escape: run ONE optimizer step over the currently accumulated sub-
+        batches regardless of whether the token budget is met (it is not -- the rollouter
+        starved first). Caller guarantees a non-empty accumulation, so the returned step
+        batch is always a real DataProto (never None). Uses the same proven token-weighted,
+        memory-safe gradient accumulation as a normal budget flush, so it is numerically a
+        valid (smaller) optimizer step."""
+        assert self._accumulated_train_batches, "force-flush invoked with no accumulated batches"
+        subs = self._accumulated_train_batches
+        acc_tokens = self._accumulated_train_tokens
+        self._accumulated_train_batches = []
+        self._accumulated_train_tokens = 0
+        print(
+            f"[FullyAsyncTrainer][OptStepBudget] STARVATION FLUSH: early optimizer step over "
+            f"{len(subs)} sub-batches ({acc_tokens}/{self._optimizer_step_token_budget} train "
+            "tokens) -- rollouter starved; bumping version + reset_staleness to resume it.",
+            flush=True,
+        )
+        return self._run_accumulated_optimizer_step(subs)
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
@@ -1129,6 +1243,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             and self.current_param_version % self.config.trainer.test_freq == 0
             and self.current_param_version > 0
         )
+        # Opt-in (default OFF): in budget mode, validate on every version-bumping flush
+        # regardless of test_freq so budget arms produce dense val-vs-time/tokens curves.
+        # Default leaves the existing test_freq cadence untouched.
+        if (
+            self._validate_every_flush
+            and self._optimizer_step_token_budget > 0
+            and self.current_param_version > 0
+        ):
+            need_validate = True
         # Skip validation if not needed and not validation before training
         if not need_validate and not val_before_train:
             return

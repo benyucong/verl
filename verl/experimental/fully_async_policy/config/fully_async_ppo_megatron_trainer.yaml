@@ -40,6 +40,20 @@ async_training:
   # Requires ppo_epochs=1.
   optimizer_step_token_budget: null
 
+  # Starvation escape for the budget mode above (default ON; fixes the m12 budget-flush
+  # <-> staleness-pause deadlock). Early-flushes accumulated supervision when the rollouter
+  # is fully stalled so the version bumps + staleness resets and the rollouter resumes.
+  # Inert when optimizer_step_token_budget<=0. Env override OPD_STARVATION_ESCAPE.
+  starvation_escape: true
+
+  # Optional safety cap (0 = OFF): force a budget-mode flush after at most this many
+  # accumulated chunk-batch fit_steps, bounding version lag. Env OPD_OPTIMIZER_STEP_MAX_FIT_STEPS.
+  optimizer_step_max_fit_steps: 0
+
+  # When true (budget mode only), validate on every version-bumping flush regardless of
+  # trainer.test_freq -> dense val curves. Default false. Env OPD_VALIDATE_EVERY_FLUSH.
+  validate_every_flush: false
+
   # Optional chunk staleness threshold. Null/fallback is staleness_threshold.
   chunk_staleness_threshold: null
 

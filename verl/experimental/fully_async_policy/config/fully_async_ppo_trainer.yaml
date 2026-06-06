@@ -42,6 +42,25 @@ async_training:
   # "moderate" setting is mult == trigger_parameter_sync_step). Requires ppo_epochs=1.
   optimizer_step_token_budget: null
 
+  # Starvation escape for the budget mode above (default ON; fixes the m12 budget-flush
+  # <-> staleness-pause deadlock). When the rollouter is fully stalled (paused, nothing in
+  # flight, queue drained) while accumulated supervision is pending, the trainer flushes it
+  # early to bump the version + reset staleness and resume the rollouter. Inert when
+  # optimizer_step_token_budget<=0 and outside the stall fingerprint. Env override
+  # OPD_STARVATION_ESCAPE. Set false to reproduce the old (deadlocking) behavior.
+  starvation_escape: true
+
+  # Optional safety cap (0 = OFF): force a budget-mode optimizer-step flush after at most
+  # this many accumulated chunk-batch fit_steps even if optimizer_step_token_budget is not
+  # met, bounding version lag. 0 keeps the pure-token-budget cadence. Env override
+  # OPD_OPTIMIZER_STEP_MAX_FIT_STEPS.
+  optimizer_step_max_fit_steps: 0
+
+  # When true (budget mode only), validate on every version-bumping flush regardless of
+  # trainer.test_freq -> dense val curves for budget arms. Default false. Env override
+  # OPD_VALIDATE_EVERY_FLUSH.
+  validate_every_flush: false
+
   # Optional chunk staleness threshold. Null/fallback is staleness_threshold.
   chunk_staleness_threshold: null
 

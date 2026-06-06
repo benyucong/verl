@@ -648,6 +648,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         return timing_raw
 
+    async def get_generation_state(self):
+        """Atomic snapshot of generation state for the trainer's starvation-escape check.
+
+        Returns ``paused`` and the in-flight ``active_tasks`` count under ``self.lock`` so
+        the pair is mutually consistent. The trainer combines this with its own fresh
+        message-queue depth probe to decide whether the rollouter is fully stalled (paused
+        + nothing in flight + queue drained) and an early optimizer-step flush is needed to
+        break the budget-flush <-> staleness-pause deadlock. Read-only; never mutates state."""
+        async with self.lock:
+            return {"paused": bool(self.paused), "active_tasks": len(self.active_tasks)}
+
     def do_validate(self):
         """Run validation and return metrics"""
         timing_raw = {}
