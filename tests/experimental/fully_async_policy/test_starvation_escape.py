@@ -5,12 +5,21 @@
 # verl.experimental.fully_async_policy.starvation. The live actor behavior (RPC plumbing,
 # version bump + reset_staleness un-pausing the rollouter) requires the training stack and
 # is exercised by the debug run, not here.
-import importlib
+import importlib.util
+import os
 import types
 
 import pytest
 
-stv = importlib.import_module("verl.experimental.fully_async_policy.starvation")
+# Load the module by file path rather than `import verl.experimental...` so the test never
+# triggers verl/__init__.py (which imports torch/tensordict/etc.). starvation.py is
+# deliberately stdlib-only, so this exercises the real file on any CPU / bare container.
+_STARV_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "experimental", "fully_async_policy", "starvation.py")
+)
+_spec = importlib.util.spec_from_file_location("verl_starvation_under_test", _STARV_PATH)
+stv = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(stv)
 
 
 # --------------------------------------------------------------------------- helpers
