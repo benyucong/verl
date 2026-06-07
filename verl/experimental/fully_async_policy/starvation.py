@@ -101,39 +101,40 @@ def get_validate_every_flush(config=None) -> bool:
     return False
 
 
-def starvation_escape_decision(
+def get_max_starvation_resets(config=None) -> int:
+    """Cap on consecutive *direct* rollouter resumes (reset_staleness with NO version bump)
+    used to escape a starvation stall that has no accumulated supervision to flush. The
+    trainer's counter resets on any forward progress (a chunk batch assembled / any flush),
+    so this only bounds pathological non-recovery; on the cap it raises rather than spins.
+    Default 8. Resolution: env ``OPD_STARVATION_MAX_RESETS`` then
+    async_training.starvation_max_resets."""
+    env = _int_env("OPD_STARVATION_MAX_RESETS")
+    if env is not None and env > 0:
+        return env
+    if config is not None:
+        cfg = config.async_training.get("starvation_max_resets", 0)
+        if isinstance(cfg, bool) or not isinstance(cfg, int):
+            cfg = 0
+        if cfg > 0:
+            return cfg
+    return 8
+
+
+def starvation_stall_detected(
     *,
-    budget_enabled: bool,
-    escape_enabled: bool,
-    minimum_met: bool,
-    observed_queue_len: int | None,
-    accumulated_nonempty: bool,
     confirmed_queue_size: int | None,
     rollouter_paused: bool,
     rollouter_active_tasks: int,
 ) -> bool:
-    """Return True iff the trainer should raise _StarvationFlush to force an early
-    optimizer-step flush instead of blocking on the next chunk.
-
-    The predicate is intentionally conservative AND only ever *gated on real accumulated
-    work* (``accumulated_nonempty``), so the worst case of any cross-actor staleness in
-    the inputs is a safe, slightly-early flush of genuine data (never a no-op reset, never
-    data loss). Conditions:
-      - budget mode on and escape enabled;
-      - the current chunk batch is NOT already satisfiable (else just assemble it);
-      - we hold accumulated supervision to flush (so the flush bumps the version ->
-        guaranteed forward progress, no livelock);
-      - we are about to block: the last observed queue depth was empty;
-      - a fresh queue-size probe confirms the queue is still empty; and
-      - the rollouter is fully stalled: paused with zero in-flight tasks (so no chunk can
-        possibly arrive until we bump the version).
+    """Return True iff the rollouter is FULLY STALLED: the chunk queue is drained AND the
+    rollouter is paused AND nothing is in flight -> no chunk can possibly arrive until the
+    trainer acts. The caller (in budget mode, when about to block on an empty queue) then
+    either flushes accumulated supervision early (version bump + reset_staleness, which
+    resumes the rollouter) or, if nothing is accumulated yet, directly resumes the rollouter
+    (bounded). A false positive is safe: at worst a slightly-early flush of real data, or a
+    redundant resume. (Cheap pre-gates -- budget on, escape enabled, batch not yet
+    satisfiable, last observed queue empty -- are checked inline before the confirming RPCs.)
     """
-    if not budget_enabled or not escape_enabled:
-        return False
-    if minimum_met or not accumulated_nonempty:
-        return False
-    if observed_queue_len is None or observed_queue_len > 0:
-        return False
     if confirmed_queue_size is not None and confirmed_queue_size > 0:
         return False
     return bool(rollouter_paused) and int(rollouter_active_tasks) == 0

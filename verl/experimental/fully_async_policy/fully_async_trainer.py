@@ -47,10 +47,11 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.starvation import (
+    get_max_starvation_resets,
     get_optimizer_step_max_fit_steps,
     get_starvation_escape_enabled,
     get_validate_every_flush,
-    starvation_escape_decision,
+    starvation_stall_detected,
 )
 from verl.experimental.fully_async_policy.opd_stage0_trace import (
     is_enabled as _stage0_is_enabled,
@@ -205,6 +206,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._starvation_escape_enabled = get_starvation_escape_enabled(config)
         self._max_fit_steps_per_flush = get_optimizer_step_max_fit_steps(config)
         self._validate_every_flush = get_validate_every_flush(config)
+        # Bound for the empty-accumulation branch of the escape (direct rollouter resume
+        # with no version bump). Reset to 0 on any forward progress; raises on the cap.
+        self._max_starvation_resets = get_max_starvation_resets(config)
+        self._consecutive_starvation_resets = 0
         if self._optimizer_step_token_budget > 0:
             _ppo_epochs = int(config.actor_rollout_ref.actor.get("ppo_epochs", 1))
             if _ppo_epochs != 1:
@@ -604,34 +609,56 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self._starvation_escape_enabled
                 and self._optimizer_step_token_budget > 0
                 and not minimum_met
-                and bool(self._accumulated_train_batches)
                 and observed_queue_len is not None
                 and observed_queue_len <= 0
             ):
                 confirmed_qsize = await self.message_queue_client.get_queue_size()
                 rollouter_paused, rollouter_active = await self._rollouter_pause_state()
-                if starvation_escape_decision(
-                    budget_enabled=self._optimizer_step_token_budget > 0,
-                    escape_enabled=self._starvation_escape_enabled,
-                    minimum_met=minimum_met,
-                    observed_queue_len=observed_queue_len,
-                    accumulated_nonempty=bool(self._accumulated_train_batches),
+                if starvation_stall_detected(
                     confirmed_queue_size=confirmed_qsize,
                     rollouter_paused=rollouter_paused,
                     rollouter_active_tasks=rollouter_active,
                 ):
-                    # Preserve survivors (already passed the stale check) for the next round;
-                    # mirrors the deferred-chunk reuse path (originals, re-coalesced next call).
-                    if queue_chunks:
-                        self._pending_chunk_samples = list(queue_chunks) + self._pending_chunk_samples
-                    assert self._optimizer_step_token_budget > 0, "starvation flush only in budget mode"
+                    if self._accumulated_train_batches:
+                        # We hold accumulated supervision: flush it early. The version bump +
+                        # reset_staleness (in fit_step's handler) resumes the rollouter. Every
+                        # such escape bumps the version => guaranteed forward progress.
+                        # Preserve survivors (already passed the stale check) for the next
+                        # round; mirrors the deferred-chunk reuse path (originals, re-coalesced).
+                        if queue_chunks:
+                            self._pending_chunk_samples = list(queue_chunks) + self._pending_chunk_samples
+                        assert self._optimizer_step_token_budget > 0, "starvation flush only in budget mode"
+                        print(
+                            "[FullyAsyncTrainer][OptStepBudget] starvation detected (queue empty, "
+                            f"rollouter paused, active_tasks={rollouter_active}); escaping to flush "
+                            f"{len(self._accumulated_train_batches)} accumulated sub-batches early.",
+                            flush=True,
+                        )
+                        raise _StarvationFlush()
+                    # No accumulated supervision yet (e.g. mid-collection right after a flush,
+                    # when reset_staleness pinned staleness to a now-stale active+queue value
+                    # and the monitor won't self-resume). Nothing to train, so directly resume
+                    # the rollouter (no version bump) so it dispatches its pending samples and
+                    # chunks flow again. Bounded: the counter resets on any forward progress
+                    # (see _maybe_flush_optimizer_step / _force_flush_accumulated); on the cap
+                    # we raise rather than spin.
+                    if self._consecutive_starvation_resets >= self._max_starvation_resets:
+                        raise TrainingStopException(
+                            "[FullyAsyncTrainer][OptStepBudget] starvation: rollouter failed to "
+                            f"resume after {self._max_starvation_resets} direct resets with no "
+                            "accumulated supervision to flush"
+                        )
+                    self._consecutive_starvation_resets += 1
                     print(
-                        "[FullyAsyncTrainer][OptStepBudget] starvation detected (queue empty, "
-                        f"rollouter paused, active_tasks={rollouter_active}); escaping to flush "
-                        f"{len(self._accumulated_train_batches)} accumulated sub-batches early.",
+                        "[FullyAsyncTrainer][OptStepBudget] starvation with empty accumulation "
+                        f"(queue empty, rollouter paused, active_tasks={rollouter_active}); directly "
+                        f"resuming rollouter (reset {self._consecutive_starvation_resets}/"
+                        f"{self._max_starvation_resets}).",
                         flush=True,
                     )
-                    raise _StarvationFlush()
+                    await self._reset_rollouter_staleness()
+                    # Fall through to get_sample(): the rollouter is now dispatching, so a
+                    # chunk will arrive and unblock us.
 
             result = await self.message_queue_client.get_sample()
             if result is None:
@@ -1058,6 +1085,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         sub-batches via gradient accumulation (memory-safe). Returns (did_step,
         step_metrics_batch_or_None). Accumulation defers only the optimizer step -- the
         queue was already drained for these batches, so the rollouter is not backpressured."""
+        # A chunk batch was successfully assembled this fit_step -> forward progress; clear the
+        # empty-accumulation starvation-reset counter.
+        self._consecutive_starvation_resets = 0
         self._accumulated_train_batches.append(train_batch)
         self._accumulated_train_tokens += self._count_train_tokens(train_batch)
         budget_met = self._accumulated_train_tokens >= self._optimizer_step_token_budget
@@ -1090,6 +1120,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         state = await asyncio.wrap_future(self.rollouter.get_generation_state.remote().future())
         return bool(state.get("paused")), int(state.get("active_tasks", 0))
 
+    async def _reset_rollouter_staleness(self):
+        """Directly reset the rollouter's staleness counter (RPC) to resume generation
+        WITHOUT a version bump. Used by the starvation escape only when there is no
+        accumulated supervision to flush, so the rollouter dispatches its pending samples and
+        chunks flow again. Safe: it does not advance the policy version, so newly generated
+        chunks stay fresh (not stale-dropped)."""
+        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        try:
+            self.logger.log(data=timing_raw, step=self.current_param_version)
+        except Exception:
+            pass
+
     def _force_flush_accumulated(self) -> DataProto:
         """Starvation escape: run ONE optimizer step over the currently accumulated sub-
         batches regardless of whether the token budget is met (it is not -- the rollouter
@@ -1098,6 +1140,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         memory-safe gradient accumulation as a normal budget flush, so it is numerically a
         valid (smaller) optimizer step."""
         assert self._accumulated_train_batches, "force-flush invoked with no accumulated batches"
+        self._consecutive_starvation_resets = 0  # a flush is forward progress
         subs = self._accumulated_train_batches
         acc_tokens = self._accumulated_train_tokens
         self._accumulated_train_batches = []

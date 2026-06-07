@@ -612,20 +612,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Returns timing_raw dictionary for metrics.
         """
         reset_start = time.time()
+        # Fetch queue depth first (RPC) WITHOUT holding the rollouter state lock; it does not
+        # touch our state, and the processor also needs this lock to make forward progress.
+        queue_size = await self.message_queue_client.get_queue_size()
+
         async with self.lock:
+            # Publish staleness_samples, paused, and the resume signal ATOMICALLY under one
+            # lock. Updating staleness BEFORE setting paused=False / _resume_event.set() is
+            # required: a processor woken by the resume signal re-evaluates
+            # _should_pause_generation(), and it must see the FRESH (low) staleness -- otherwise
+            # it re-pauses and clears the resume event we just set (a clear-after-set race that
+            # stalls generation until the 10s monitor recovers it). active_tasks is read here
+            # (post-RPC) so the count is not an over-estimate from completed in-flight tasks.
+            self.staleness_samples = len(self.active_tasks) + queue_size
             self.paused = False
             # Wake the drain loop in _processor_worker so it can exit early and resume submitting
             # new samples to idle replicas instead of waiting for long-tail in-flight tasks.
             self._resume_event.set()
-            active_task_count = len(self.active_tasks)
-
-        # Avoid holding the rollouter state lock across RPC.  The processor
-        # also needs this lock to make forward progress after a param sync.
-        queue_size = await self.message_queue_client.get_queue_size()
-
-        async with self.lock:
-            # every time param change, reset staleness_samples
-            self.staleness_samples = active_task_count + queue_size
             timing_raw = {}
             rollout_version_time = max(time.time() - self.step_start_time, 1e-6)
             if self.idle_start_time > self.step_start_time:

@@ -50,6 +50,12 @@ async_training:
   # OPD_STARVATION_ESCAPE. Set false to reproduce the old (deadlocking) behavior.
   starvation_escape: true
 
+  # Cap on consecutive direct rollouter resumes (reset_staleness, no version bump) the escape
+  # uses when starved with NO accumulated supervision to flush (e.g. right after a flush). The
+  # counter resets on any forward progress; on the cap the run stops rather than spins.
+  # Env override OPD_STARVATION_MAX_RESETS. Default 8.
+  starvation_max_resets: 8
+
   # Optional safety cap (0 = OFF): force a budget-mode optimizer-step flush after at most
   # this many accumulated chunk-batch fit_steps even if optimizer_step_token_budget is not
   # met, bounding version lag. 0 keeps the pure-token-budget cadence. Env override

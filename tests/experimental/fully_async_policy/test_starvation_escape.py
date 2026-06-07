@@ -34,55 +34,39 @@ def _cfg(**async_training):
     return types.SimpleNamespace(async_training=_AT(dict(async_training)))
 
 
-# The exact deadlock fingerprint: budget on, escape on, current chunk batch not yet
-# satisfiable, accumulated work pending, queue observed+confirmed empty, rollouter paused
-# with nothing in flight. This MUST trigger the escape.
-STARVED = dict(
-    budget_enabled=True,
-    escape_enabled=True,
-    minimum_met=False,
-    observed_queue_len=0,
-    accumulated_nonempty=True,
-    confirmed_queue_size=0,
-    rollouter_paused=True,
-    rollouter_active_tasks=0,
-)
+# ----------------------------------------------------------- stall fingerprint detection
+# The full stall: chunk queue drained AND rollouter paused AND nothing in flight -> no chunk
+# can arrive until the trainer acts (flush if accumulated, else direct resume). The caller
+# checks the cheap pre-gates (budget on, escape enabled, batch not satisfiable, observed
+# queue empty) inline before the confirming RPCs fed here.
+def test_stall_fires_on_fingerprint():
+    assert stv.starvation_stall_detected(confirmed_queue_size=0, rollouter_paused=True, rollouter_active_tasks=0) is True
 
 
-# --------------------------------------------------------------------------- decision
-def test_decision_fires_on_exact_deadlock_fingerprint():
-    assert stv.starvation_escape_decision(**STARVED) is True
-
-
-def test_decision_confirmed_queue_none_still_fires():
-    # confirmed_queue_size None means "unknown" -> rely on observed empty + rollouter stall.
-    assert stv.starvation_escape_decision(**{**STARVED, "confirmed_queue_size": None}) is True
+def test_stall_confirmed_queue_none_still_fires():
+    # None means "unknown / treat as empty" -> rely on the rollouter being fully stalled.
+    assert stv.starvation_stall_detected(confirmed_queue_size=None, rollouter_paused=True, rollouter_active_tasks=0) is True
 
 
 @pytest.mark.parametrize(
-    "override",
+    "q,paused,active,expected",
     [
-        {"budget_enabled": False},        # control arm (budget<=0) is immune
-        {"escape_enabled": False},        # A/B toggle off -> old (deadlocking) behavior
-        {"minimum_met": True},            # batch already satisfiable -> just assemble it
-        {"accumulated_nonempty": False},  # nothing to flush -> never no-op reset (livelock guard)
-        {"observed_queue_len": None},     # not yet about to block
-        {"observed_queue_len": 7},        # queue had items on last pop
-        {"confirmed_queue_size": 4},      # fresh probe: a chunk arrived (race) -> consume it
-        {"confirmed_queue_size": 1},      # boundary: any positive confirmed depth suppresses
-        {"rollouter_paused": False},      # rollouter still running -> chunks will come
-        {"rollouter_active_tasks": 3},    # in-flight decodes can still emit chunks -> wait
-        {"rollouter_active_tasks": 1},    # boundary: a single in-flight task suppresses
+        (0, True, 0, True),     # exact fingerprint -> stalled
+        (None, True, 0, True),  # unknown queue + fully stalled -> stalled
+        (1, True, 0, False),    # boundary: any positive confirmed depth -> consume it
+        (5, True, 0, False),    # queue has chunks -> not stalled
+        (0, False, 0, False),   # not paused -> chunks coming
+        (0, True, 1, False),    # boundary: a single in-flight task -> wait, may still emit
+        (0, True, 3, False),    # in-flight decodes -> wait
     ],
 )
-def test_decision_suppressed_when_any_condition_missing(override):
-    assert stv.starvation_escape_decision(**{**STARVED, **override}) is False
-
-
-def test_decision_positive_boundaries_fire():
-    # The exact zero-boundaries (queue drained, nothing in flight) MUST allow the escape.
-    assert stv.starvation_escape_decision(**{**STARVED, "confirmed_queue_size": 0}) is True
-    assert stv.starvation_escape_decision(**{**STARVED, "rollouter_active_tasks": 0}) is True
+def test_stall_truth_table(q, paused, active, expected):
+    assert (
+        stv.starvation_stall_detected(
+            confirmed_queue_size=q, rollouter_paused=paused, rollouter_active_tasks=active
+        )
+        is expected
+    )
 
 
 # ----------------------------------------------------------- starvation_escape_enabled
@@ -173,11 +157,46 @@ def test_max_fit_steps_config_non_int_defaults_to_zero(monkeypatch, bad):
     assert stv.get_optimizer_step_max_fit_steps(_cfg(optimizer_step_max_fit_steps=bad)) == 0
 
 
+# ----------------------------------------------------------- max_starvation_resets cap
+def test_max_resets_default(monkeypatch):
+    monkeypatch.delenv("OPD_STARVATION_MAX_RESETS", raising=False)
+    assert stv.get_max_starvation_resets(_cfg()) == 8
+    assert stv.get_max_starvation_resets(None) == 8
+
+
+@pytest.mark.parametrize("val,expected", [("3", 3), ("0", 8), ("-1", 8), ("abc", 8), ("  5 ", 5)])
+def test_max_resets_env(monkeypatch, val, expected):
+    monkeypatch.setenv("OPD_STARVATION_MAX_RESETS", val)
+    assert stv.get_max_starvation_resets(_cfg()) == expected
+
+
+@pytest.mark.parametrize("cfgval,expected", [(4, 4), (0, 8), (3.5, 8), ("x", 8), (None, 8), (True, 8)])
+def test_max_resets_config(monkeypatch, cfgval, expected):
+    monkeypatch.delenv("OPD_STARVATION_MAX_RESETS", raising=False)
+    assert stv.get_max_starvation_resets(_cfg(starvation_max_resets=cfgval)) == expected
+
+
+def test_max_resets_env_overrides_config(monkeypatch):
+    monkeypatch.setenv("OPD_STARVATION_MAX_RESETS", "6")
+    assert stv.get_max_starvation_resets(_cfg(starvation_max_resets=4)) == 6
+
+
 # ------------------------------------------------------ all resolvers coexist cleanly
 def test_all_resolvers_coexist_in_one_config(monkeypatch):
-    for k in ("OPD_STARVATION_ESCAPE", "OPD_OPTIMIZER_STEP_MAX_FIT_STEPS", "OPD_VALIDATE_EVERY_FLUSH"):
+    for k in (
+        "OPD_STARVATION_ESCAPE",
+        "OPD_OPTIMIZER_STEP_MAX_FIT_STEPS",
+        "OPD_VALIDATE_EVERY_FLUSH",
+        "OPD_STARVATION_MAX_RESETS",
+    ):
         monkeypatch.delenv(k, raising=False)
-    cfg = _cfg(starvation_escape=False, optimizer_step_max_fit_steps=10, validate_every_flush=True)
+    cfg = _cfg(
+        starvation_escape=False,
+        optimizer_step_max_fit_steps=10,
+        validate_every_flush=True,
+        starvation_max_resets=4,
+    )
     assert stv.get_starvation_escape_enabled(cfg) is False
     assert stv.get_optimizer_step_max_fit_steps(cfg) == 10
     assert stv.get_validate_every_flush(cfg) is True
+    assert stv.get_max_starvation_resets(cfg) == 4
