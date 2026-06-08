@@ -1310,6 +1310,99 @@ def pad_chunk_dataproto_to_response_width(
     )
 
 
+def _front_pad_dim(tensor: torch.Tensor, dim: int, target: int, value) -> torch.Tensor:
+    """Left-pad (prepend) `tensor` along `dim` to width `target` (mirror of _pad_tensor_dim)."""
+    cur = tensor.shape[dim]
+    if cur == target:
+        return tensor.clone()
+    if cur > target:  # not expected (target is the batch max); keep the rightmost `target`
+        idx = [slice(None)] * tensor.dim()
+        idx[dim] = slice(cur - target, cur)
+        return tensor[tuple(idx)].clone()
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = target - cur
+    pad = torch.full(pad_shape, value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([pad, tensor], dim=dim)
+
+
+def _split_pad_seq(tensor: torch.Tensor, p: int, target_p: int, target_r: int, value) -> torch.Tensor:
+    """For a [B, p+r, ...] sequence tensor: LEFT-pad the prompt span (first p) to target_p and
+    RIGHT-pad the response span (remaining r) to target_r, preserving the prompt|response split."""
+    prompt_part = _front_pad_dim(tensor[:, :p], 1, target_p, value)
+    resp_part = _pad_tensor_dim(tensor[:, p:], 1, target_r, value)
+    return torch.cat([prompt_part, resp_part], dim=1)
+
+
+_PAD_PROMPT_KEYS = {"prompts"}
+_PAD_RESPONSE_KEYS = {
+    "responses", "response_mask", "rollout_log_probs", "rm_scores",
+    "token_level_scores", "advantages", "old_log_probs",
+}
+_PAD_SEQ_KEYS = {"input_ids", "attention_mask", "teacher_logprobs", "routed_experts", "teacher_ids"}
+_PAD_TOKEN_VALUE_KEYS = {"prompts", "responses", "input_ids", "teacher_ids"}
+
+
+def pad_dataproto_to_prompt_response_width(
+    batch: DataProto, target_prompt_width: int, target_response_width: int, pad_token_id: int
+) -> DataProto:
+    """Pad one DataProto so its prompt span (LEFT-padded) reaches `target_prompt_width` and its
+    response span (RIGHT-padded) reaches `target_response_width`, so DataProto.concat can combine
+    samples/chunks with different prompt AND response lengths (the prior helper unified responses
+    only -> mixed prompt widths crashed torch.cat). attention_mask is padded with 0 in both spans
+    and position_ids is recomputed from the padded mask (standard left-pad convention), so padded
+    positions are masked and never affect the loss. Token tensors pad with pad_token_id; masks /
+    log-probs / scores pad with 0."""
+    P, R = int(target_prompt_width), int(target_response_width)
+    p = int(batch.batch["prompts"].shape[1])
+    r = int(batch.batch["responses"].shape[1])
+    S = p + r
+    if p == P and r == R:
+        return DataProto(
+            batch=batch.batch.clone(),
+            non_tensor_batch=_clone_numpy_dict(batch.non_tensor_batch),
+            meta_info=dict(batch.meta_info),
+        )
+    out = {}
+    for key, t in batch.batch.items():
+        if key == "position_ids":
+            out[key] = t  # recomputed from the padded attention_mask below
+            continue
+        val = pad_token_id if key in _PAD_TOKEN_VALUE_KEYS else 0
+        if key in _PAD_PROMPT_KEYS:
+            out[key] = _front_pad_dim(t, 1, P, val)
+        elif key in _PAD_RESPONSE_KEYS:
+            out[key] = _pad_tensor_dim(t, 1, R, val)
+        elif key in _PAD_SEQ_KEYS:
+            out[key] = _split_pad_seq(t, p, P, R, val)
+        else:
+            # unknown key: classify by width (sequence > response > prompt); clone if none match
+            w = t.shape[1] if t.dim() >= 2 else None
+            if w == S:
+                out[key] = _split_pad_seq(t, p, P, R, val)
+            elif w == r:
+                out[key] = _pad_tensor_dim(t, 1, R, val)
+            elif w == p and p != r:
+                out[key] = _front_pad_dim(t, 1, P, val)
+            else:
+                out[key] = t.clone()
+    # Recompute position_ids from the padded attention_mask (left-pad convention) so real tokens
+    # keep contiguous positions and pad positions are harmless (masked out).
+    if "position_ids" in batch.batch:
+        am = out.get("attention_mask")
+        orig_pos = batch.batch["position_ids"]
+        if am is not None and orig_pos.dim() == 2:
+            out["position_ids"] = (am.cumsum(dim=-1) - 1).clamp_(min=0).to(orig_pos.dtype)
+        elif orig_pos.dim() >= 2 and orig_pos.shape[1] == S:
+            out["position_ids"] = _split_pad_seq(orig_pos, p, P, R, 0)  # uncommon (e.g. mrope)
+        else:
+            out["position_ids"] = orig_pos.clone()
+    return DataProto(
+        batch=TensorDict(source=out, batch_size=batch.batch.batch_size),
+        non_tensor_batch=_clone_numpy_dict(batch.non_tensor_batch),
+        meta_info=dict(batch.meta_info),
+    )
+
+
 def create_chunk_samples_from_rollout_sample(
     rollout_sample: RolloutSample,
     chunk_tokens: int,
@@ -1395,11 +1488,16 @@ def assemble_batch_from_chunk_samples(
 
     print(f"[BatchUtils] Assembling batch from {len(chunk_samples)} ChunkSample objects")
 
+    max_prompt_width = max(int(chunk.parent_payload.batch["prompts"].shape[1]) for chunk in chunk_samples)
     max_response_width = max(int(chunk.parent_payload.batch["responses"].shape[1]) for chunk in chunk_samples)
     pad_token_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
     chunk_batches = []
     for chunk in chunk_samples:
-        padded = pad_chunk_dataproto_to_response_width(chunk.parent_payload, max_response_width, pad_token_id)
+        # Unify BOTH prompt and response widths (the prior response-only padding crashed
+        # torch.cat when parents had different prompt lengths).
+        padded = pad_dataproto_to_prompt_response_width(
+            chunk.parent_payload, max_prompt_width, max_response_width, pad_token_id
+        )
         chunk_batches.append(addition_process(padded))
 
     final_batch = DataProto.concat(chunk_batches)
@@ -1525,14 +1623,22 @@ def assemble_batch_from_rollout_samples(
 
     print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
 
-    rollout_samples_batch = []
     rollout_status = rollout_samples[0].rollout_status
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
-    for rs in rollout_samples:
-        batch = addition_process(rs.full_batch)
-        rollout_samples_batch.append(batch)
+    processed = [addition_process(rs.full_batch) for rs in rollout_samples]
+    # Pad prompts (left) + responses (right) to a common width before concat. Upstream's
+    # assembly concatenated unpadded samples, which crashes torch.cat on variable-length
+    # batches (the long-reasoning regime) -- an infra fix needed to run completed-sample async
+    # here at all; applied identically to all arms so it does not bias the comparison.
+    target_prompt_width = max(int(b.batch["prompts"].shape[1]) for b in processed)
+    target_response_width = max(int(b.batch["responses"].shape[1]) for b in processed)
+    pad_token_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    rollout_samples_batch = [
+        pad_dataproto_to_prompt_response_width(b, target_prompt_width, target_response_width, pad_token_id)
+        for b in processed
+    ]
     final_batch = DataProto.concat(rollout_samples_batch)
 
     # Calculate response_mask (if not present)
