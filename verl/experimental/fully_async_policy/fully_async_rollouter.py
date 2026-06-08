@@ -1375,11 +1375,37 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.paused and not await self._should_pause_generation():
-                async with self.lock:
-                    self.paused = False
-                    print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
-                    self._resume_event.set()
+            if self.paused:
+                if not await self._should_pause_generation():
+                    async with self.lock:
+                        self.paused = False
+                        print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
+                        self._resume_event.set()
+                else:
+                    # Fully-stalled self-heal (arm-agnostic deadlock breaker): if the rollouter
+                    # is paused with NOTHING in flight AND the chunk queue is drained, then
+                    # staleness_samples is stale-high from a prior reset that counted a large
+                    # chunk backlog (reset_staleness sets it to active + queue_size). Nothing
+                    # will ever lower it now -- no dispatch (paused), and no trainer-side
+                    # reset_staleness while the trainer is blocked in get_sample() waiting for
+                    # chunks that cannot arrive. Recompute from the true (empty) backlog and
+                    # resume so generation restarts. Safe: with no in-flight tasks and an empty
+                    # queue there is no off-policy backlog, and the policy version is unchanged.
+                    queue_stats = await self.message_queue_client.get_statistics()
+                    async with self.lock:
+                        if (
+                            self.paused
+                            and len(self.active_tasks) == 0
+                            and int(queue_stats.get("queue_size", 0)) == 0
+                        ):
+                            self.staleness_samples = 0
+                            self.paused = False
+                            self._resume_event.set()
+                            print(
+                                "[FullyAsyncRollouter][MonitorLoop] fully-stalled self-heal: "
+                                "no in-flight tasks and queue drained -> reset staleness_samples=0 "
+                                "and resumed (breaks the staleness<->collection deadlock)."
+                            )
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""

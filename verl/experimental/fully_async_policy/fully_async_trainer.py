@@ -609,9 +609,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self._starvation_escape_enabled
                 and self._optimizer_step_token_budget > 0
                 and not minimum_met
-                and observed_queue_len is not None
-                and observed_queue_len <= 0
+                and (observed_queue_len is None or observed_queue_len <= 0)
             ):
+                # observed_queue_len is None on the FIRST loop iteration of each collection
+                # round (it is only set after a get_sample pop). We must still check here:
+                # if the round is entered with an already-empty queue and a paused rollouter,
+                # the first get_sample() would block forever before observed_queue_len is ever
+                # set. starvation_stall_detected() returns False when the queue is non-empty,
+                # so a full queue here just costs one extra probe.
                 confirmed_qsize = await self.message_queue_client.get_queue_size()
                 rollouter_paused, rollouter_active = await self._rollouter_pause_state()
                 if starvation_stall_detected(
