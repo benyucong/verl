@@ -1021,6 +1021,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     # Control plane OFF (default): one optimizer step + version bump + sync
                     # per fit_step, exactly as before.
                     batch = self._fit_update_actor(batch)
+                    # Apples-to-apples trained-token accounting: emit the response tokens that
+                    # got a gradient this step. Covers both completed-sample async (baseline)
+                    # and chunk streaming with frequent sync (ctrl).
+                    self._trace_opt_step(self._count_train_tokens(train_batch))
                     self._trace_chunk_train_events(train_batch, "chunk_train_end")
                     self._fit_update_local_step()
                     await self._fit_update_weights()
@@ -1057,6 +1061,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             pass
         return 0
 
+    def _trace_opt_step(self, train_tokens):
+        """Emit a backend-agnostic optimizer-step trace event recording the response tokens
+        that received a gradient this step (response_mask sum). Emitted on BOTH the sample
+        path (completed-sample async baseline) and the chunk path, so trained-token throughput
+        is an apples-to-apples metric across arms. No-op unless stage-0 tracing is enabled."""
+        _stage0_trace(
+            "opt_step",
+            f"opt_{self.global_steps}",
+            role="trainer",
+            train_tokens=int(train_tokens),
+            param_version=int(self.current_param_version),
+            global_steps=int(self.global_steps),
+        )
+
     def _run_accumulated_optimizer_step(self, subs: list[DataProto]):
         """Fork 2: perform ONE optimizer step over `subs` (memory-safe per-fit-step chunk
         batches) via gradient accumulation, keeping peak memory at a single sub-batch.
@@ -1082,6 +1100,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # train_mini_batch issues exactly one engine.train_batch call for it.
             b.meta_info["fully_async/chunk_batch/actor_mini_batch_size"] = int(len(b))
             step_batch = self._fit_update_actor(b)
+        # Apples-to-apples trained-token accounting for the budget / starvation-flush path.
+        self._trace_opt_step(total_tokens)
         return step_batch
 
     def _maybe_flush_optimizer_step(self, train_batch: DataProto):
