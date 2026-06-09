@@ -109,6 +109,50 @@ def test_reconstructed_tensor_schema_matches_upstream():
     assert t["input_ids"][P:].tolist() == resp
 
 
+def test_span_from_chunk_payload_stitches_to_carrier():
+    """H-ACC: slicing each chunk's NEW span out of its (full-sequence-aligned) parent_payload and
+    accumulating reproduces the carrier's response-region labels bit-identically -- the equivalence
+    the runtime relies on when it reuses the final chunk's payload as the actor row."""
+    import torch
+    from types import SimpleNamespace
+
+    from verl.experimental.fully_async_policy.hybrid_assembler import build_sample_tensors, span_from_chunk_payload
+
+    P, R, k = 4, 12, 8  # prompt_width, response_width(=L), topk; teacher tensors are [1, P+R, k]
+    g = torch.Generator().manual_seed(11)
+    responses = torch.randint(0, 50000, (1, R), generator=g)
+    teacher_ids = torch.randint(0, 50000, (1, P + R, k), generator=g)
+    teacher_lps = -torch.rand(1, P + R, k, generator=g)
+    payload = SimpleNamespace(batch={
+        "prompts": torch.zeros(1, P, dtype=torch.long),
+        "responses": responses,
+        "teacher_ids": teacher_ids,
+        "teacher_logprobs": teacher_lps,
+    })
+
+    acc = ParentLabelAccumulator(parent_id="p", prompt_token_ids=[0] * P, topk=k)
+    chunk_size = 4
+    for o in range(0, R, chunk_size):
+        n = min(chunk_size, R - o)
+        chunk = SimpleNamespace(parent_payload=payload, token_offset=o, n_tokens=n,
+                                policy_version=0, is_final=(o + n == R))
+        acc.add_span(span_from_chunk_payload(chunk))
+    acc.finalize(R)
+    out = acc.assemble()
+
+    # stitched labels == the carrier's response region (response token j is at teacher index P+j)
+    assert out["response_token_ids"] == responses[0].tolist()
+    assert out["teacher_topk_ids"] == teacher_ids[0, P:P + R].tolist()
+    assert out["teacher_topk_log_probs"] == teacher_lps[0, P:P + R].tolist()
+    assert out["response_mask"] == [1] * R
+
+    # built tensors match the carrier's response region exactly (carrier-overwrite would be a no-op)
+    t = build_sample_tensors(out, pad_token_id=0)
+    assert torch.equal(t["teacher_ids"], teacher_ids[0, P:P + R])
+    assert torch.allclose(t["teacher_logprobs"], teacher_lps[0, P:P + R], atol=1e-6)
+    assert torch.equal(t["responses"], responses[0])
+
+
 def _raised(fn):
     try:
         fn()
@@ -121,4 +165,5 @@ if __name__ == "__main__":
     test_stitch_equals_whole_response()
     test_gap_overlap_shape_and_coverage_are_hard_errors()
     test_reconstructed_tensor_schema_matches_upstream()
-    print("HYBRID ASSEMBLER (Phase A1) PASS: stitch==whole; coverage/gap/overlap guarded; schema matches upstream")
+    test_span_from_chunk_payload_stitches_to_carrier()
+    print("HYBRID ASSEMBLER (A1+H-ACC) PASS: stitch==whole; coverage guarded; schema matches; span-slice==carrier")

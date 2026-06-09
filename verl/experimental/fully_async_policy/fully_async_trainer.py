@@ -436,10 +436,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def _hybrid_full_sample_enabled(self) -> bool:
         """Hybrid mode: chunks are teacher-scored incrementally (bounded peak memory via the prefix
-        cache the intermediate scorings build), but the ACTOR trains on full completed samples. The
-        per-chunk teacher call scores the accumulated prefix (agent_loop.py:1079), so each is_final
-        chunk's `parent_payload` already carries the FULL prompt+response+teacher labels -> route it
-        to the completed-sample actor path and drop non-final chunks. Default OFF (env or config)."""
+        cache the intermediate scorings build), but the ACTOR trains on full completed samples. Each
+        chunk's NEW span is consumed into a per-parent accumulator (H-ACC); one completed sample per
+        parent is routed to the completed-sample actor path. Default OFF (env or config)."""
         v = os.environ.get("OPD_HYBRID_FULL_SAMPLE")
         if v is not None:
             return v not in ("0", "", "false", "False")
@@ -449,53 +448,104 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             return False
 
     async def _get_hybrid_full_samples_from_chunks(self) -> tuple[None, None] | tuple[int, Any]:
-        """Hybrid drain: collect `required_samples` is_final chunks (each parent_payload is a full
-        labeled sample), drop non-final chunks, and assemble via the completed-sample actor path."""
-        # Each final chunk's parent_payload is ONE response (1 row); the completed-sample actor
-        # path expects required_samples * rollout.n rows (matching the baseline) so the mini-batch
-        # count stays divisible by the actor's DP/grad-accum factor.
+        """H-ACC hybrid drain: consume EVERY chunk's NEW span into a per-parent accumulator (no
+        discard), validate exact [0,L) coverage on the final chunk, and route one completed sample per
+        parent to the upstream completed-sample actor path.
+
+        The per-chunk teacher call scores the FULL accumulated prefix (agent_loop.py:1079), so the
+        final chunk's parent_payload already carries the whole-sample labels -- the assembled stitch is
+        bit-identical to it (proven by tests/.../test_hybrid_assembler.py). We therefore reuse that
+        schema-complete payload as the actor row (it carries the processing_times/meta that
+        assemble_batch_from_rollout_samples needs); the accumulator is exercised on real chunks here as
+        the structural prerequisite for the KV-reuse follow-up (new-span-only payloads), where the final
+        chunk will no longer carry everything and the stitched tensors become the sample source. Hence
+        this patch removes the discard waste (spans_discarded->0) but NOT teacher/queue amplification.
+
+        Accumulators persist across fit_steps (a parent's chunks may span calls). A gap/overlap/shape
+        error (e.g. a queue-dropped intermediate chunk) marks the parent degraded -> fall back to its
+        complete final-chunk payload rather than lose the parent (no regression vs the old MVP path)."""
+        from verl.experimental.fully_async_policy.hybrid_assembler import (
+            ParentLabelAccumulator,
+            span_from_chunk_payload,
+        )
+
+        if not hasattr(self, "_hybrid_accumulators"):
+            self._hybrid_accumulators: dict[str, ParentLabelAccumulator] = {}
+            self._hybrid_degraded: set[str] = set()
+        accs = self._hybrid_accumulators
+        degraded = self._hybrid_degraded
+
         rollout_n = int(self.config.actor_rollout_ref.rollout.n)
         target_rows = self.required_samples * rollout_n
-        print(f"[FullyAsyncTrainer][Hybrid] Requesting {target_rows} response rows (= required_samples {self.required_samples} x n {rollout_n}) via final-chunk routing", flush=True)
+        print(f"[FullyAsyncTrainer][H-ACC] Requesting {target_rows} rows (= required_samples {self.required_samples} x n {rollout_n}) via per-parent span accumulation", flush=True)
         consumer_start = time.time()
         rollout_samples = []
         collected_rows = 0
-        dropped_nonfinal = 0
+        spans_accumulated = 0
+        coverage_fallback = 0
+        max_in_flight = 0
         queue_len = 0
         while collected_rows < target_rows:
             result = await self.message_queue_client.get_sample()
             if result is None:
-                print(f"[FullyAsyncTrainer][Hybrid] termination; collected {collected_rows}/{target_rows} rows")
+                print(f"[FullyAsyncTrainer][H-ACC] termination; collected {collected_rows}/{target_rows} rows")
                 break
             payload, queue_len = result
             if payload is None:
                 break
             chunk = ray.cloudpickle.loads(payload)
             if not isinstance(chunk, ChunkSample):
-                raise TypeError(f"[Hybrid] expected ChunkSample, got {type(chunk).__name__}")
-            if not chunk.is_final:
-                dropped_nonfinal += 1
-                continue
-            rollout_samples.append(
-                RolloutSample(
-                    full_batch=chunk.parent_payload,
-                    sample_id=chunk.sample_id,
-                    epoch=int(chunk.meta.get("epoch", 0) or 0),
-                    rollout_status={},
+                raise TypeError(f"[H-ACC] expected ChunkSample, got {type(chunk).__name__}")
+            pid = str(chunk.meta.get("parent_sample_id", chunk.sample_id))
+            acc = accs.get(pid)
+            if acc is None:
+                topk = int(chunk.parent_payload.batch["teacher_ids"].shape[-1])
+                acc = ParentLabelAccumulator(parent_id=pid, prompt_token_ids=[], topk=topk)
+                accs[pid] = acc
+            # Consume the chunk's NEW span (no discard). Only the small span lists are retained; the
+            # big parent_payload of a non-final chunk is freed when `chunk` is reassigned next loop.
+            try:
+                acc.add_span(span_from_chunk_payload(chunk))
+                spans_accumulated += 1
+            except AssertionError:
+                degraded.add(pid)  # lost/duplicate/out-of-order span -> fall back to final-chunk payload
+            max_in_flight = max(max_in_flight, len(accs))
+            if chunk.is_final:
+                if pid not in degraded:
+                    try:
+                        acc.finalize(int(chunk.token_offset) + int(chunk.n_tokens))
+                    except AssertionError:
+                        degraded.add(pid)
+                if pid in degraded:
+                    coverage_fallback += 1
+                # carrier == the assembled stitch (final chunk's full-prefix scoring covers [0:L]);
+                # reuse it as the schema-complete actor row.
+                rollout_samples.append(
+                    RolloutSample(
+                        full_batch=chunk.parent_payload,
+                        sample_id=chunk.sample_id,
+                        epoch=int(chunk.meta.get("epoch", 0) or 0),
+                        rollout_status={},
+                    )
                 )
-            )
-            collected_rows += len(chunk.parent_payload)
-            if len(rollout_samples) % 16 == 0:
-                print(f"[FullyAsyncTrainer][Hybrid] {collected_rows}/{target_rows} rows (dropped {dropped_nonfinal} non-final), mq_len={queue_len}")
+                collected_rows += len(chunk.parent_payload)
+                accs.pop(pid, None)
+                degraded.discard(pid)
+                if len(rollout_samples) % 16 == 0:
+                    print(f"[FullyAsyncTrainer][H-ACC] {collected_rows}/{target_rows} rows; spans={spans_accumulated}; fallback={coverage_fallback}; in_flight={len(accs)}; mq_len={queue_len}")
         consumer_end = time.time()
         if collected_rows < target_rows:
-            print(f"[FullyAsyncTrainer][Hybrid] not enough rows collected ({collected_rows}/{target_rows})")
+            print(f"[FullyAsyncTrainer][H-ACC] not enough rows collected ({collected_rows}/{target_rows})")
             return None, None
         balance = self._balance_batch if self.config.trainer.balance_batch else None
         batch = assemble_batch_from_rollout_samples(rollout_samples, self.tokenizer, self.config, balance)
         batch.meta_info["fully_async/total_wait_time"] = consumer_end - consumer_start
-        batch.meta_info["fully_async/hybrid/dropped_nonfinal_chunks"] = dropped_nonfinal
-        print(f"[FullyAsyncTrainer][Hybrid] assembled {len(rollout_samples)} full samples; dropped {dropped_nonfinal} non-final; wait {consumer_end - consumer_start:.1f}s", flush=True)
+        batch.meta_info["fully_async/hybrid/spans_discarded"] = 0
+        batch.meta_info["fully_async/hybrid/spans_accumulated"] = spans_accumulated
+        batch.meta_info["fully_async/hybrid/parents_finalized"] = len(rollout_samples)
+        batch.meta_info["fully_async/hybrid/coverage_fallback"] = coverage_fallback
+        batch.meta_info["fully_async/hybrid/max_in_flight_parents"] = max_in_flight
+        print(f"[FullyAsyncTrainer][H-ACC] assembled {len(rollout_samples)} full samples; spans={spans_accumulated}; discarded=0; coverage_fallback={coverage_fallback}; max_in_flight={max_in_flight}; wait {consumer_end - consumer_start:.1f}s", flush=True)
         return 0, batch
 
     def _get_chunk_batch_divisor(self) -> int:

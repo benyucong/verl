@@ -108,6 +108,29 @@ class ParentLabelAccumulator:
         }
 
 
+def span_from_chunk_payload(chunk, prompt_width=None) -> ChunkLabelSpan:
+    """Slice ONE chunk's NEW-span labels [token_offset : token_offset+n_tokens] out of its
+    `parent_payload` DataProto into a ChunkLabelSpan (stdlib lists, so the accumulator validates them).
+
+    Layout (verified): teacher tensors in parent_payload are FULL-SEQUENCE aligned, shape
+    [1, prompt_width + response_width, k] (left-padded prompt + right-padded response), so response
+    token j lives at absolute index prompt_width + j. `responses` is response-only width
+    [1, response_width]. prompt_width is constant per parent (= rollout.prompt_length).
+    """
+    b = chunk.parent_payload.batch
+    o = int(chunk.token_offset)
+    n = int(chunk.n_tokens)
+    P = int(b["prompts"].shape[1]) if prompt_width is None else int(prompt_width)
+    return ChunkLabelSpan(
+        span_start=o,
+        span_end=o + n,
+        response_token_ids=b["responses"][0, o:o + n].tolist(),
+        teacher_topk_ids=b["teacher_ids"][0, P + o:P + o + n, :].tolist(),
+        teacher_topk_log_probs=b["teacher_logprobs"][0, P + o:P + o + n, :].tolist(),
+        policy_version=int(getattr(chunk, "policy_version", 0) or 0),
+    )
+
+
 def build_sample_tensors(assembled: dict, pad_token_id: int = 0):
     """Build the canonical padded per-sample tensors from an assembled dict (needs torch).
 
