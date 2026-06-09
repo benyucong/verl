@@ -222,6 +222,39 @@ def distillation_ppo_loss(
     return policy_loss, policy_metrics
 
 
+def _compute_rollout_drift_surrogate(model_output: dict, data: TensorDict) -> dict[str, Any]:
+    """Detached, analysis-only rollout-drift surrogate D^roll_hat (FROST mechanism diagnostic).
+
+    Returns metrics {distillation/d_roll_hat_(mean|absmean|p95)} computed as the masked per-response-
+    token log-ratio logp_current - logp_stale, where logp_stale := data["rollout_log_probs"] (the
+    generate-time student) and logp_current := model_output["log_probs"] (the current student, same
+    sampled token). Never enters the gradient. Returns {} if the required tensors are absent or
+    mis-shaped (e.g. the supervised batch does not carry rollout_log_probs) so it is always safe.
+    """
+    try:
+        if "rollout_log_probs" not in data.keys():
+            return {}
+        rm = data["response_mask"]
+        rm = rm.to_padded_tensor(False) if rm.is_nested else rm
+        rm = rm.bool()
+        cur = no_padding_2_padding(model_output["log_probs"], data)
+        stale = data["rollout_log_probs"]
+        stale = stale.to_padded_tensor(0.0) if stale.is_nested else stale
+        if not (cur.shape == stale.shape == rm.shape):
+            return {}
+        d = (cur - stale).detach()[rm]
+        if d.numel() == 0:
+            return {}
+        d_abs = d.abs().float()
+        return {
+            "distillation/d_roll_hat_mean": Metric(AggregationType.MEAN, d.mean()),
+            "distillation/d_roll_hat_absmean": Metric(AggregationType.MEAN, d_abs.mean()),
+            "distillation/d_roll_hat_p95": Metric(AggregationType.MAX, torch.quantile(d_abs, 0.95)),
+        }
+    except Exception:
+        return {}
+
+
 def distillation_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -250,6 +283,18 @@ def distillation_loss(
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
     )
+
+    # --- FROST rollout-drift surrogate diagnostic (detached, analysis-only; never enters the gradient) ---
+    # D^roll_hat = logp_current(sampled token) - logp_stale(sampled token): a k1 log-ratio SURROGATE
+    # for the per-token rollout drift KL(pi_stale || pi_current). `rollout_log_probs` holds the stale
+    # (generate-time) student's sampled-token logprob; model_output["log_probs"] is the current
+    # student's logprob of the same token (computed in the forward -> zero extra model pass). This is a
+    # surrogate, NOT the paper's full top-k KL (rollout_log_probs is a per-token scalar, not a
+    # distribution); calibrate offline against the full KL before trusting it. Logged in ALL arms.
+    distillation_metrics.update(
+        _compute_rollout_drift_surrogate(model_output=model_output, data=data)
+    )
+
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
