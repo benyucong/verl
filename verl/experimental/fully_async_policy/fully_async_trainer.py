@@ -27,6 +27,7 @@ from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
+    RolloutSample,
     assemble_batch_from_chunk_samples,
     assemble_batch_from_rollout_samples,
     choose_chunk_actor_mini_batch_size,
@@ -363,6 +364,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             tuple: (epoch, batch_dict, gen_batch_output)
         """
         if is_chunk_data_path_enabled(self.config):
+            if self._hybrid_full_sample_enabled():
+                return await self._get_hybrid_full_samples_from_chunks()
             return await self._get_chunks_from_queue()
 
         print(
@@ -429,6 +432,70 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+        return 0, batch
+
+    def _hybrid_full_sample_enabled(self) -> bool:
+        """Hybrid mode: chunks are teacher-scored incrementally (bounded peak memory via the prefix
+        cache the intermediate scorings build), but the ACTOR trains on full completed samples. The
+        per-chunk teacher call scores the accumulated prefix (agent_loop.py:1079), so each is_final
+        chunk's `parent_payload` already carries the FULL prompt+response+teacher labels -> route it
+        to the completed-sample actor path and drop non-final chunks. Default OFF (env or config)."""
+        v = os.environ.get("OPD_HYBRID_FULL_SAMPLE")
+        if v is not None:
+            return v not in ("0", "", "false", "False")
+        try:
+            return bool(self.config.async_training.get("hybrid_full_sample", False))
+        except Exception:
+            return False
+
+    async def _get_hybrid_full_samples_from_chunks(self) -> tuple[None, None] | tuple[int, Any]:
+        """Hybrid drain: collect `required_samples` is_final chunks (each parent_payload is a full
+        labeled sample), drop non-final chunks, and assemble via the completed-sample actor path."""
+        # Each final chunk's parent_payload is ONE response (1 row); the completed-sample actor
+        # path expects required_samples * rollout.n rows (matching the baseline) so the mini-batch
+        # count stays divisible by the actor's DP/grad-accum factor.
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        target_rows = self.required_samples * rollout_n
+        print(f"[FullyAsyncTrainer][Hybrid] Requesting {target_rows} response rows (= required_samples {self.required_samples} x n {rollout_n}) via final-chunk routing", flush=True)
+        consumer_start = time.time()
+        rollout_samples = []
+        collected_rows = 0
+        dropped_nonfinal = 0
+        queue_len = 0
+        while collected_rows < target_rows:
+            result = await self.message_queue_client.get_sample()
+            if result is None:
+                print(f"[FullyAsyncTrainer][Hybrid] termination; collected {collected_rows}/{target_rows} rows")
+                break
+            payload, queue_len = result
+            if payload is None:
+                break
+            chunk = ray.cloudpickle.loads(payload)
+            if not isinstance(chunk, ChunkSample):
+                raise TypeError(f"[Hybrid] expected ChunkSample, got {type(chunk).__name__}")
+            if not chunk.is_final:
+                dropped_nonfinal += 1
+                continue
+            rollout_samples.append(
+                RolloutSample(
+                    full_batch=chunk.parent_payload,
+                    sample_id=chunk.sample_id,
+                    epoch=int(chunk.meta.get("epoch", 0) or 0),
+                    rollout_status={},
+                )
+            )
+            collected_rows += len(chunk.parent_payload)
+            if len(rollout_samples) % 16 == 0:
+                print(f"[FullyAsyncTrainer][Hybrid] {collected_rows}/{target_rows} rows (dropped {dropped_nonfinal} non-final), mq_len={queue_len}")
+        consumer_end = time.time()
+        if collected_rows < target_rows:
+            print(f"[FullyAsyncTrainer][Hybrid] not enough rows collected ({collected_rows}/{target_rows})")
+            return None, None
+        balance = self._balance_batch if self.config.trainer.balance_batch else None
+        batch = assemble_batch_from_rollout_samples(rollout_samples, self.tokenizer, self.config, balance)
+        batch.meta_info["fully_async/total_wait_time"] = consumer_end - consumer_start
+        batch.meta_info["fully_async/hybrid/dropped_nonfinal_chunks"] = dropped_nonfinal
+        print(f"[FullyAsyncTrainer][Hybrid] assembled {len(rollout_samples)} full samples; dropped {dropped_nonfinal} non-final; wait {consumer_end - consumer_start:.1f}s", flush=True)
         return 0, batch
 
     def _get_chunk_batch_divisor(self) -> int:
