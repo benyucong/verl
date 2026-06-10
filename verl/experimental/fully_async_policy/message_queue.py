@@ -14,6 +14,8 @@
 
 import asyncio
 import logging
+import os
+import time
 from collections import deque
 from typing import Any
 
@@ -23,7 +25,11 @@ from omegaconf import DictConfig
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=2, max_concurrency=20)
+# max_concurrency must exceed the max number of concurrently-blocked producers (in-flight agent
+# loops awaiting put_sample under non-dropping backpressure) PLUS consumer headroom: a blocked
+# put_sample holds an asyncio-actor slot while it waits, so if every slot were a blocked producer
+# the consumer's get_sample could never be scheduled to drain -> deadlock. 256 >> rollout in-flight.
+@ray.remote(num_cpus=2, max_concurrency=256)
 class MessageQueue:
     """
     Simplified Ray-based asynchronous message queue for communication between Rollouter and Trainer
@@ -44,13 +50,26 @@ class MessageQueue:
         # async safe
         self._lock = asyncio.Lock()
         self._consumer_condition = asyncio.Condition(self._lock)
+        self._producer_condition = asyncio.Condition(self._lock)
 
         # statistic message
         self.total_produced = 0
         self.total_consumed = 0
         self.dropped_samples = 0
 
-        print(f"[MessageQueue] initialized with max_queue_size={max_queue_size}")
+        # H-ACC-SPAN bounded NON-DROPPING backpressure: when enabled, a full queue BLOCKS the
+        # producer until the consumer frees space instead of silently evicting the oldest span.
+        # A generous timeout preserves liveness (e.g. dead consumer) with an EXPLICIT, counted drop
+        # rather than a silent one. Off by default -> legacy popleft-drop behavior is unchanged.
+        self.block_on_full = os.environ.get("OPD_QUEUE_BLOCK_ON_FULL", "0") not in ("0", "", "false", "False")
+        self.block_timeout_s = float(os.environ.get("OPD_QUEUE_BLOCK_TIMEOUT_S", "600"))
+        self.producer_blocked_time_s = 0.0
+        self.producer_block_events = 0
+        self.blocked_timeout_drops = 0
+        self.max_queue_depth = 0
+        self._depth_samples: deque = deque(maxlen=4096)  # for p50/p95 depth
+
+        print(f"[MessageQueue] initialized max_queue_size={max_queue_size} block_on_full={self.block_on_full} timeout={self.block_timeout_s}s")
 
     async def put_sample(self, sample: Any) -> bool:
         """
@@ -63,21 +82,45 @@ class MessageQueue:
             bool: Whether the sample was successfully put into the queue
         """
         async with self._lock:
-            # If queue is full, remove the oldest sample (rarely happens)
             is_drop = False
             if len(self.queue) >= self.max_queue_size:
-                self.queue.popleft()
-                self.dropped_samples += 1
-                is_drop = True
-                logger.warning("Queue full, dropped sample")
+                if self.block_on_full:
+                    # Bounded NON-dropping backpressure: wait for the consumer to free space.
+                    blocked_start = time.monotonic()
+                    self.producer_block_events += 1
+                    while len(self.queue) >= self.max_queue_size and self.running:
+                        try:
+                            await asyncio.wait_for(self._producer_condition.wait(), timeout=self.block_timeout_s)
+                        except asyncio.TimeoutError:
+                            # Liveness guard: explicit, counted drop (NOT silent) after a long stall.
+                            self.queue.popleft()
+                            self.dropped_samples += 1
+                            self.blocked_timeout_drops += 1
+                            logger.error(
+                                "Queue block timed out after %.0fs (consumer stalled?); EXPLICIT drop #%d",
+                                self.block_timeout_s, self.blocked_timeout_drops,
+                            )
+                            is_drop = True
+                            break
+                    self.producer_blocked_time_s += time.monotonic() - blocked_start
+                else:
+                    # Legacy behavior: silently evict the oldest sample.
+                    self.queue.popleft()
+                    self.dropped_samples += 1
+                    is_drop = True
+                    logger.warning("Queue full, dropped sample")
             self.queue.append(sample)
             self.total_produced += 1
+            depth = len(self.queue)
+            self.max_queue_depth = max(self.max_queue_depth, depth)
+            self._depth_samples.append(depth)
 
             # Notify waiting consumers
             self._consumer_condition.notify_all()
 
             if self.total_produced % 100 == 0:
-                print(f"MessageQueue stats: produced={self.total_produced}, queue_size={len(self.queue)}")
+                print(f"MessageQueue stats: produced={self.total_produced}, queue_size={depth}, "
+                      f"blocked_s={self.producer_blocked_time_s:.1f}, timeout_drops={self.blocked_timeout_drops}")
             if is_drop:
                 return False
             return True
@@ -100,6 +143,8 @@ class MessageQueue:
             # Get one sample
             data = self.queue.popleft()
             self.total_consumed += 1
+            # Space freed -> wake a blocked producer (non-dropping backpressure).
+            self._producer_condition.notify(1)
             return data, len(self.queue)
 
     async def get_queue_size(self) -> int:
@@ -110,12 +155,23 @@ class MessageQueue:
     async def get_statistics(self) -> dict[str, Any]:
         """Get queue statistics"""
         async with self._lock:
+            d = sorted(self._depth_samples)
+            def _pct(p):
+                return d[min(len(d) - 1, int(p * len(d)))] if d else 0
             return {
                 "queue_size": len(self.queue),
                 "total_produced": self.total_produced,
                 "total_consumed": self.total_consumed,
                 "dropped_samples": self.dropped_samples,
                 "max_queue_size": self.max_queue_size,
+                # H-ACC-SPAN backpressure metrics
+                "block_on_full": self.block_on_full,
+                "producer_blocked_time_s": self.producer_blocked_time_s,
+                "producer_block_events": self.producer_block_events,
+                "blocked_timeout_drops": self.blocked_timeout_drops,
+                "queue_depth_p50": _pct(0.50),
+                "queue_depth_p95": _pct(0.95),
+                "queue_depth_max": self.max_queue_depth,
             }
 
     async def clear_queue(self):
@@ -129,8 +185,9 @@ class MessageQueue:
         """Shutdown the message queue"""
         async with self._lock:
             self.running = False
-            # Notify all waiting coroutines so they can exit
+            # Notify all waiting coroutines (consumers AND blocked producers) so they can exit.
             self._consumer_condition.notify_all()
+            self._producer_condition.notify_all()
         logger.info("MessageQueue shutdown")
 
     async def get_memory_usage(self) -> dict:

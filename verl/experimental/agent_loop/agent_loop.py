@@ -716,6 +716,28 @@ class AgentLoopWorker:
                 [policy_version] * batch_size, dtype=np.int32
             )
 
+            # H-ACC-SPAN: ship only THIS chunk's new-span teacher labels. Non-final chunks carry NO
+            # parent_payload (the full-prefix [P+R, k] labels are never serialized); the final chunk
+            # carries a structural carrier with those big tensors stripped, and the trainer rebuilds
+            # them from the accumulated spans. Off -> legacy full-prefix payload per chunk.
+            from verl.experimental.fully_async_policy.hybrid_assembler import hybrid_span_payload_enabled
+
+            span_teacher_ids = None
+            span_teacher_logprobs = None
+            chunk_parent_payload = chunk_batch
+            if hybrid_span_payload_enabled() and "teacher_ids" in chunk_batch.batch.keys():
+                P = int(chunk_batch.batch["prompts"].shape[1])
+                lo, hi = P + token_offset, P + token_offset + n_tokens
+                span_teacher_ids = chunk_batch.batch["teacher_ids"][0, lo:hi, :].detach().cpu().clone()
+                span_teacher_logprobs = chunk_batch.batch["teacher_logprobs"][0, lo:hi, :].detach().cpu().clone()
+                if is_final:
+                    for _k in ("teacher_ids", "teacher_logprobs"):
+                        if _k in chunk_batch.batch.keys():
+                            del chunk_batch.batch[_k]
+                    chunk_parent_payload = chunk_batch  # structural carrier (no big teacher tensors)
+                else:
+                    chunk_parent_payload = None
+
             chunk = ChunkSample(
                 sample_id=str(sample_id),
                 chunk_idx=int(chunk_idx),
@@ -724,7 +746,9 @@ class AgentLoopWorker:
                 tokens=list(output.response_ids[token_offset : token_offset + n_tokens]),
                 is_final=bool(is_final),
                 policy_version=policy_version,
-                parent_payload=chunk_batch,
+                parent_payload=chunk_parent_payload,
+                span_teacher_ids=span_teacher_ids,
+                span_teacher_logprobs=span_teacher_logprobs,
                 meta={
                     "epoch": epoch,
                     "parent_sample_id": parent_sample_id,
