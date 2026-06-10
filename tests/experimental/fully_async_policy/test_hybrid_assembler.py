@@ -66,14 +66,17 @@ def test_gap_overlap_shape_and_coverage_are_hard_errors():
     resp, tk_ids, tk_lps = _synthetic_whole_response(512, k)
     spans = _spans(resp, tk_ids, tk_lps, 256)
 
-    # out-of-order / gap: feeding span[1] before span[0]
+    # out-of-order is NO LONGER an error (reorder-tolerant): span[1] before span[0] buffers, then completes
     acc = ParentLabelAccumulator(parent_id="g", prompt_token_ids=[1], topk=k)
-    _raised(lambda: acc.add_span(spans[1]))  # starts at 256, expected 0
+    acc.add_span(spans[1])                      # starts at 256 -> buffered, nothing drained yet
+    assert acc.next_expected_offset == 0
+    acc.add_span(spans[0])                      # fills the gap -> drains both contiguously
+    assert acc.next_expected_offset == 512
 
-    # overlap: re-add span[0]
+    # overlap: re-add span[0] (start 0 < already-consumed 256) is a hard error
     acc2 = ParentLabelAccumulator(parent_id="o", prompt_token_ids=[1], topk=k)
     acc2.add_span(spans[0])
-    _raised(lambda: acc2.add_span(spans[0]))  # starts at 0, expected 256
+    _raised(lambda: acc2.add_span(spans[0]))  # starts at 0, already consumed -> overlap
 
     # wrong top-k width
     acc3 = ParentLabelAccumulator(parent_id="w", prompt_token_ids=[1], topk=k)
@@ -153,6 +156,87 @@ def test_span_from_chunk_payload_stitches_to_carrier():
     assert torch.equal(t["responses"], responses[0])
 
 
+def test_span_only_payload_reconstructs_full_sample():
+    """H-ACC-SPAN: span-only ChunkSamples (carrying only their new-span teacher labels, no full-prefix
+    payload) accumulate into the SAME full sample as the whole-payload path, and fill_carrier_teacher_
+    tensors rebuilds the full-sequence [1, P+RW, k] layout the actor path expects."""
+    import torch
+
+    from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
+    from verl.experimental.fully_async_policy.hybrid_assembler import fill_carrier_teacher_tensors, span_from_chunk
+
+    R, k, P, RW = 12, 8, 4, 16  # L=R=12, response_width RW=16 (4 pad slots)
+    g = torch.Generator().manual_seed(7)
+    gt_resp = torch.randint(0, 50000, (R,), generator=g)
+    gt_ids = torch.randint(0, 50000, (R, k), generator=g)
+    gt_lps = -torch.rand(R, k, generator=g)
+
+    acc = ParentLabelAccumulator(parent_id="s", prompt_token_ids=[], topk=k)
+    cs = 4
+    for o in range(0, R, cs):
+        n = min(cs, R - o)
+        ch = ChunkSample(
+            sample_id="s", chunk_idx=o // cs, token_offset=o, n_tokens=n,
+            tokens=gt_resp[o:o + n].tolist(), is_final=(o + n == R), policy_version=0,
+            parent_payload=None,  # span-only: non-final chunks ship no payload
+            span_teacher_ids=gt_ids[o:o + n].clone(),
+            span_teacher_logprobs=gt_lps[o:o + n].clone(),
+        )
+        acc.add_span(span_from_chunk(ch))
+    acc.finalize(R)
+    out = acc.assemble()
+    assert out["response_token_ids"] == gt_resp.tolist()
+    assert out["teacher_topk_ids"] == gt_ids.tolist()
+    assert out["teacher_topk_log_probs"] == gt_lps.tolist()
+
+    # fill_carrier rebuilds full-sequence teacher tensors: response token j at index P+j; pad elsewhere
+    from types import SimpleNamespace
+    carrier = SimpleNamespace(batch={
+        "prompts": torch.zeros(1, P, dtype=torch.long),
+        "responses": torch.zeros(1, RW, dtype=torch.long),
+    })
+    fill_carrier_teacher_tensors(carrier, out)
+    assert tuple(carrier.batch["teacher_ids"].shape) == (1, P + RW, k)
+    assert carrier.batch["teacher_ids"].dtype == torch.int32  # matches native teacher tensor dtype
+    assert torch.equal(carrier.batch["teacher_ids"][0, P:P + R], gt_ids.to(torch.int32))
+    assert torch.allclose(carrier.batch["teacher_logprobs"][0, P:P + R], gt_lps, atol=1e-6)
+    assert int(torch.count_nonzero(carrier.batch["teacher_ids"][0, :P])) == 0          # prompt region pad
+    assert int(torch.count_nonzero(carrier.batch["teacher_ids"][0, P + R:])) == 0      # response pad region
+
+
+def test_reorder_tolerant_reassembly():
+    """Chunks are emitted as concurrent asyncio tasks (single_turn_agent_loop.py:402) and arrive out of
+    order -- including the final chunk before earlier ones. The accumulator must buffer and stitch the
+    SAME whole response, and only report is_complete once contiguous coverage [0,L) reaches final_length."""
+    L, k, chunk = 1024, 8, 256
+    resp, tk_ids, tk_lps = _synthetic_whole_response(L, k)
+    spans = _spans(resp, tk_ids, tk_lps, chunk)  # 4 spans: [0,256) [256,512) [512,768) [768,1024)
+    acc = ParentLabelAccumulator(parent_id="r", prompt_token_ids=[1, 2], topk=k)
+    # worst case: final span (idx 3) arrives FIRST, then 1, 2, and offset-0 (idx 0) LAST
+    for idx in (3, 1, 2, 0):
+        if idx == 3:
+            acc.mark_final(L)               # final chunk seen before any earlier chunk
+        acc.add_span(spans[idx])
+        if idx != 0:
+            assert not acc.is_complete       # gap at offset 0 keeps it incomplete until idx 0 lands
+    assert acc.is_complete                   # offset-0 span closed the contiguous chain to L
+    acc.finalize(L)
+    out = acc.assemble()
+    assert out["response_token_ids"] == resp
+    assert out["teacher_topk_ids"] == tk_ids
+    assert out["teacher_topk_log_probs"] == tk_lps
+    assert out["response_mask"] == [1] * L
+
+
+def test_finalize_is_exactly_once():
+    """A parent finalizes (and is enqueued for the actor) EXACTLY once -> a second finalize raises."""
+    k = 4
+    acc = ParentLabelAccumulator(parent_id="x", prompt_token_ids=[], topk=k)
+    acc.add_span(ChunkLabelSpan(0, 2, [1, 2], [[0] * k, [0] * k], [[0.0] * k, [0.0] * k]))
+    acc.finalize(2)
+    _raised(lambda: acc.finalize(2))
+
+
 def _raised(fn):
     try:
         fn()
@@ -166,4 +250,8 @@ if __name__ == "__main__":
     test_gap_overlap_shape_and_coverage_are_hard_errors()
     test_reconstructed_tensor_schema_matches_upstream()
     test_span_from_chunk_payload_stitches_to_carrier()
-    print("HYBRID ASSEMBLER (A1+H-ACC) PASS: stitch==whole; coverage guarded; schema matches; span-slice==carrier")
+    test_span_only_payload_reconstructs_full_sample()
+    test_reorder_tolerant_reassembly()
+    test_finalize_is_exactly_once()
+    print("HYBRID ASSEMBLER (A1+H-ACC+SPAN+REORDER) PASS: stitch==whole; coverage guarded; span-slice==carrier; "
+          "span-only==full; fill_carrier layout; reorder-tolerant; finalize-once")

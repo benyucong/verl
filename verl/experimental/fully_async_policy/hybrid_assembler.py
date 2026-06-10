@@ -11,8 +11,21 @@
 # is unit-testable without torch; a torch tensor-builder lives in build_sample_tensors().
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+def hybrid_span_payload_enabled() -> bool:
+    """H-ACC-SPAN gate: emit span-only teacher labels (no full-prefix labels on the wire).
+
+    Requires the hybrid full-sample trainer (OPD_HYBRID_FULL_SAMPLE) to also be on: the legacy
+    chunk-training path needs full-width teacher tensors in every payload, so span-only payloads
+    are only valid when the trainer stitches spans per parent. Default OFF.
+    """
+    span = os.environ.get("OPD_HYBRID_SPAN_PAYLOAD", "0") not in ("0", "", "false", "False")
+    full = os.environ.get("OPD_HYBRID_FULL_SAMPLE", "0") not in ("0", "", "false", "False")
+    return span and full
 
 # Canonical per-sample fields an upstream completed-sample OPD example carries, so the
 # reconstructed sample is schema-indistinguishable to the existing actor-training path.
@@ -50,6 +63,8 @@ class ParentLabelAccumulator:
     teacher_topk_log_probs: list[list[float]] = field(default_factory=list)
     rollout_policy_versions: list[int] = field(default_factory=list)  # per-token, diagnostics
     next_expected_offset: int = 0
+    is_final_known: bool = False
+    _pending: dict = field(default_factory=dict)  # reorder buffer: span_start -> ChunkLabelSpan
     is_finished: bool = False
     final_length: Optional[int] = None
     finish_reason: Optional[str] = None
@@ -57,12 +72,6 @@ class ParentLabelAccumulator:
     def add_span(self, span: ChunkLabelSpan) -> None:
         if self.is_finished:
             raise AssertionError(f"parent {self.parent_id} already finalized")
-        # MVP invariant: spans arrive strictly in order and contiguous -> exactly-once coverage.
-        if span.span_start != self.next_expected_offset:
-            raise AssertionError(
-                f"parent {self.parent_id}: non-contiguous span (gap/overlap): "
-                f"expected start {self.next_expected_offset}, got {span.span_start}"
-            )
         span_len = span.span_end - span.span_start
         if span_len <= 0:
             raise AssertionError(f"parent {self.parent_id}: empty/negative span [{span.span_start},{span.span_end})")
@@ -73,14 +82,42 @@ class ParentLabelAccumulator:
         for ids, lps in zip(span.teacher_topk_ids, span.teacher_topk_log_probs):
             if len(ids) != self.topk or len(lps) != self.topk:
                 raise AssertionError(f"parent {self.parent_id}: teacher top-k width != {self.topk}")
-        self.response_token_ids.extend(span.response_token_ids)
-        self.teacher_topk_ids.extend(span.teacher_topk_ids)
-        self.teacher_topk_log_probs.extend(span.teacher_topk_log_probs)
-        self.rollout_policy_versions.extend([span.policy_version] * span_len)
-        self.next_expected_offset = span.span_end
+        # Reorder-tolerant: streaming chunks are emitted as concurrent asyncio tasks
+        # (single_turn_agent_loop.py:402) and teacher-scoring latency reorders them, so a later span can
+        # arrive first. Buffer by start offset and stitch the contiguous prefix as gaps fill. A span at/below
+        # what we already consumed, or a second span at the same start, is a real overlap/duplicate -> error.
+        if span.span_start < self.next_expected_offset:
+            raise AssertionError(
+                f"parent {self.parent_id}: overlap -- span_start {span.span_start} < already-consumed {self.next_expected_offset}"
+            )
+        if span.span_start in self._pending:
+            raise AssertionError(f"parent {self.parent_id}: duplicate span at start {span.span_start}")
+        self._pending[span.span_start] = span
+        while self.next_expected_offset in self._pending:
+            s = self._pending.pop(self.next_expected_offset)
+            self.response_token_ids.extend(s.response_token_ids)
+            self.teacher_topk_ids.extend(s.teacher_topk_ids)
+            self.teacher_topk_log_probs.extend(s.teacher_topk_log_probs)
+            self.rollout_policy_versions.extend([s.policy_version] * (s.span_end - s.span_start))
+            self.next_expected_offset = s.span_end
+
+    def mark_final(self, final_length: int, reason: str = "eos") -> None:
+        """Record the response's known final length. The is_final chunk may arrive BEFORE earlier chunks
+        (concurrent emission), so this only records the target -- emission waits for is_complete."""
+        self.is_final_known = True
+        self.final_length = final_length
+        self.finish_reason = reason
+
+    @property
+    def is_complete(self) -> bool:
+        """True once the final length is known AND contiguous coverage [0, final_length) has reached it."""
+        return self.is_final_known and self.final_length is not None and self.next_expected_offset == self.final_length
 
     def finalize(self, final_length: int, reason: str = "eos") -> None:
-        """Mark the response complete (EOS / max-length / truncation). Requires exact coverage."""
+        """Mark the response complete (EOS / max-length / truncation). Requires exact coverage.
+        Idempotence guard: a parent finalizes (and is enqueued for the actor) EXACTLY once."""
+        if self.is_finished:
+            raise AssertionError(f"parent {self.parent_id}: finalize() called twice")
         if self.next_expected_offset != final_length:
             raise AssertionError(
                 f"parent {self.parent_id}: coverage gap -- have [0,{self.next_expected_offset}), "
@@ -108,6 +145,28 @@ class ParentLabelAccumulator:
         }
 
 
+def span_from_chunk(chunk) -> ChunkLabelSpan:
+    """Build a ChunkLabelSpan from a ChunkSample in EITHER payload format.
+
+    Span-only format (H-ACC-SPAN): the chunk carries `span_teacher_ids`/`span_teacher_logprobs`
+    tensors of shape [n_tokens, k] plus `tokens` (the new-span response ids) -- no parent_payload
+    needed (non-final chunks ship none). Legacy format: slice the new span out of the full-prefix
+    parent_payload (span_from_chunk_payload).
+    """
+    if getattr(chunk, "span_teacher_ids", None) is not None:
+        o = int(chunk.token_offset)
+        n = int(chunk.n_tokens)
+        return ChunkLabelSpan(
+            span_start=o,
+            span_end=o + n,
+            response_token_ids=[int(t) for t in chunk.tokens],
+            teacher_topk_ids=chunk.span_teacher_ids.tolist(),
+            teacher_topk_log_probs=chunk.span_teacher_logprobs.tolist(),
+            policy_version=int(getattr(chunk, "policy_version", 0) or 0),
+        )
+    return span_from_chunk_payload(chunk)
+
+
 def span_from_chunk_payload(chunk, prompt_width=None) -> ChunkLabelSpan:
     """Slice ONE chunk's NEW-span labels [token_offset : token_offset+n_tokens] out of its
     `parent_payload` DataProto into a ChunkLabelSpan (stdlib lists, so the accumulator validates them).
@@ -129,6 +188,31 @@ def span_from_chunk_payload(chunk, prompt_width=None) -> ChunkLabelSpan:
         teacher_topk_log_probs=b["teacher_logprobs"][0, P + o:P + o + n, :].tolist(),
         policy_version=int(getattr(chunk, "policy_version", 0) or 0),
     )
+
+
+def fill_carrier_teacher_tensors(carrier, assembled: dict) -> None:
+    """H-ACC-SPAN: rebuild full-sequence teacher tensors from the accumulated stitch and write them
+    INTO the final chunk's structural carrier (whose big full-prefix teacher tensors were stripped
+    before serialization). Produces [1, prompt_width + response_width, k] with response token j at
+    index prompt_width + j -- the legacy full-prefix layout the actor path + loss expect."""
+    import torch
+
+    b = carrier.batch
+    P = int(b["prompts"].shape[1])
+    RW = int(b["responses"].shape[1])
+    ids = assembled["teacher_topk_ids"]
+    lps = assembled["teacher_topk_log_probs"]
+    L = len(ids)
+    k = len(ids[0]) if L else 0
+    # Match the native teacher tensor dtype (teacher_manager.py:124 -> int32) so the rebuilt carrier is
+    # bit-for-bit schema-identical to the upstream path (no torch.cat/dtype-assert divergence downstream).
+    t_ids = torch.zeros(1, P + RW, k, dtype=torch.int32)
+    t_lps = torch.zeros(1, P + RW, k, dtype=torch.float32)
+    if L:
+        t_ids[0, P:P + L] = torch.tensor(ids, dtype=torch.int32)
+        t_lps[0, P:P + L] = torch.tensor(lps, dtype=torch.float32)
+    b["teacher_ids"] = t_ids
+    b["teacher_logprobs"] = t_lps
 
 
 def build_sample_tensors(assembled: dict, pad_token_id: int = 0):

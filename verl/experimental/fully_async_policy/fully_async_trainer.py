@@ -466,25 +466,35 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         complete final-chunk payload rather than lose the parent (no regression vs the old MVP path)."""
         from verl.experimental.fully_async_policy.hybrid_assembler import (
             ParentLabelAccumulator,
-            span_from_chunk_payload,
+            fill_carrier_teacher_tensors,
+            span_from_chunk,
         )
 
         if not hasattr(self, "_hybrid_accumulators"):
             self._hybrid_accumulators: dict[str, ParentLabelAccumulator] = {}
             self._hybrid_degraded: set[str] = set()
+            self._hybrid_carriers: dict = {}  # pid -> (carrier, sample_id, epoch, span_mode); held until complete
+            self._hybrid_prev_assemble_end = None
         accs = self._hybrid_accumulators
         degraded = self._hybrid_degraded
+        carriers = self._hybrid_carriers
 
         rollout_n = int(self.config.actor_rollout_ref.rollout.n)
         target_rows = self.required_samples * rollout_n
-        print(f"[FullyAsyncTrainer][H-ACC] Requesting {target_rows} rows (= required_samples {self.required_samples} x n {rollout_n}) via per-parent span accumulation", flush=True)
+        print(f"[FullyAsyncTrainer][H-ACC] Requesting {target_rows} rows via per-parent span accumulation", flush=True)
         consumer_start = time.time()
         rollout_samples = []
         collected_rows = 0
-        spans_accumulated = 0
-        coverage_fallback = 0
+        spans_received = 0
+        span_gap_count = 0
+        coverage_fallback = 0      # legacy full-payload mode: degraded parent -> reuse complete carrier
+        span_drop_count = 0        # span-only mode: degraded parent skipped (carrier lacks labels) -> no silent train
+        parents_stitched = 0       # span-only mode: carrier rebuilt from accumulated spans
+        span_bytes_est = 0
         max_in_flight = 0
         queue_len = 0
+        dbg_logged_pids: set = set()  # DIAGNOSTIC: one failure line per failing parent (gap vs overlap)
+        emitted_pids: set = set()     # responses already emitted this drain (ignore duplicate stragglers)
         while collected_rows < target_rows:
             result = await self.message_queue_client.get_sample()
             if result is None:
@@ -496,56 +506,103 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             chunk = ray.cloudpickle.loads(payload)
             if not isinstance(chunk, ChunkSample):
                 raise TypeError(f"[H-ACC] expected ChunkSample, got {type(chunk).__name__}")
-            pid = str(chunk.meta.get("parent_sample_id", chunk.sample_id))
+            span_mode = getattr(chunk, "span_teacher_ids", None) is not None
+            # Key per RESPONSE (xiaoshuai_sample_id, unique via the _r{i} suffix), NOT per prompt.
+            # parent_sample_id is SHARED across the whole rollout group (fully_async_rollouter.py:884-889),
+            # so keying on it funnels every response's spans into ONE accumulator -> overlap on every 2nd
+            # response. (Real cause of coverage_fallback=100%; the queue drops nothing, depth ~1.)
+            pid = str(chunk.sample_id)
+            if pid in emitted_pids:
+                continue  # this response already emitted -> ignore any duplicate straggler chunk
             acc = accs.get(pid)
             if acc is None:
-                topk = int(chunk.parent_payload.batch["teacher_ids"].shape[-1])
+                topk = int(chunk.span_teacher_ids.shape[-1]) if span_mode else int(chunk.parent_payload.batch["teacher_ids"].shape[-1])
                 acc = ParentLabelAccumulator(parent_id=pid, prompt_token_ids=[], topk=topk)
                 accs[pid] = acc
-            # Consume the chunk's NEW span (no discard). Only the small span lists are retained; the
-            # big parent_payload of a non-final chunk is freed when `chunk` is reassigned next loop.
+            # The final chunk can arrive BEFORE earlier ones (concurrent emission + teacher-latency reorder,
+            # single_turn_agent_loop.py:402). Record the final marker + carrier whenever it shows up; emit on
+            # COVERAGE-COMPLETE below, not on the final chunk's arrival.
+            if chunk.is_final and not acc.is_final_known:
+                acc.mark_final(int(chunk.token_offset) + int(chunk.n_tokens))
+                carriers[pid] = (chunk.parent_payload, chunk.sample_id,
+                                 int(chunk.meta.get("epoch", 0) or 0), span_mode)
+            # Buffer the chunk's NEW span. Reorder-tolerant: out-of-order is fine; only a real
+            # duplicate/overlap/shape mismatch degrades the parent.
             try:
-                acc.add_span(span_from_chunk_payload(chunk))
-                spans_accumulated += 1
-            except AssertionError:
-                degraded.add(pid)  # lost/duplicate/out-of-order span -> fall back to final-chunk payload
+                acc.add_span(span_from_chunk(chunk))
+                spans_received += 1
+                span_bytes_est += int(chunk.n_tokens) * acc.topk * 12  # ~int32 ids + fp32 logprobs
+            except AssertionError as e:
+                span_gap_count += 1
+                if pid not in dbg_logged_pids:
+                    dbg_logged_pids.add(pid)
+                    print(f"[H-ACC][DBG add_span-fail] parent={pid} chunk_idx={chunk.chunk_idx} is_final={chunk.is_final} "
+                          f"n={chunk.n_tokens} tok_off={chunk.token_offset} next_exp={acc.next_expected_offset} :: {e}", flush=True)
+                degraded.add(pid)
             max_in_flight = max(max_in_flight, len(accs))
-            if chunk.is_final:
-                if pid not in degraded:
-                    try:
-                        acc.finalize(int(chunk.token_offset) + int(chunk.n_tokens))
-                    except AssertionError:
-                        degraded.add(pid)
-                if pid in degraded:
-                    coverage_fallback += 1
-                # carrier == the assembled stitch (final chunk's full-prefix scoring covers [0:L]);
-                # reuse it as the schema-complete actor row.
-                rollout_samples.append(
-                    RolloutSample(
-                        full_batch=chunk.parent_payload,
-                        sample_id=chunk.sample_id,
-                        epoch=int(chunk.meta.get("epoch", 0) or 0),
-                        rollout_status={},
-                    )
-                )
-                collected_rows += len(chunk.parent_payload)
-                accs.pop(pid, None)
-                degraded.discard(pid)
-                if len(rollout_samples) % 16 == 0:
-                    print(f"[FullyAsyncTrainer][H-ACC] {collected_rows}/{target_rows} rows; spans={spans_accumulated}; fallback={coverage_fallback}; in_flight={len(accs)}; mq_len={queue_len}")
+
+            # Resolve the parent: emit when coverage is COMPLETE (reorder-safe), else fall back / drop only
+            # if it is BOTH degraded (a real error, not mere reordering) AND its final length is known.
+            did_emit = False
+            if pid not in degraded and acc.is_complete:
+                acc.finalize(acc.final_length)
+                carrier, sample_id, epoch, cmode = carriers.pop(pid)
+                if cmode:
+                    fill_carrier_teacher_tensors(carrier, acc.assemble())  # span mode: rebuild from the stitch
+                    parents_stitched += 1
+                rollout_samples.append(RolloutSample(full_batch=carrier, sample_id=sample_id,
+                                                     epoch=epoch, rollout_status={}))
+                collected_rows += len(carrier)
+                emitted_pids.add(pid); accs.pop(pid, None); did_emit = True
+            elif pid in degraded and acc.is_final_known:
+                carrier, sample_id, epoch, cmode = carriers.pop(pid)
+                if cmode:
+                    span_drop_count += 1  # span-only: no carrier labels -> skip explicitly (no silent train)
+                    print(f"[FullyAsyncTrainer][H-ACC] WARNING span-only coverage gap, parent {pid} skipped (#{span_drop_count})", flush=True)
+                else:
+                    coverage_fallback += 1  # carrier mode: final-chunk payload is complete -> graceful fallback
+                    rollout_samples.append(RolloutSample(full_batch=carrier, sample_id=sample_id,
+                                                         epoch=epoch, rollout_status={}))
+                    collected_rows += len(carrier)
+                    did_emit = True
+                emitted_pids.add(pid); accs.pop(pid, None); degraded.discard(pid)
+            # else: final not yet known, or coverage incomplete (waiting on a reordered chunk) -> keep in flight
+
+            if did_emit and len(rollout_samples) % 16 == 0:
+                print(f"[FullyAsyncTrainer][H-ACC] {collected_rows}/{target_rows} rows; recv={spans_received}; stitched={parents_stitched}; gap={span_gap_count}; fallback={coverage_fallback}; drop={span_drop_count}; in_flight={len(accs)}; mq_len={queue_len}")
         consumer_end = time.time()
         if collected_rows < target_rows:
             print(f"[FullyAsyncTrainer][H-ACC] not enough rows collected ({collected_rows}/{target_rows})")
             return None, None
+        try:
+            qstats = await self.message_queue_client.get_statistics()
+        except Exception:
+            qstats = {}
+        tpb = (consumer_end - self._hybrid_prev_assemble_end) if self._hybrid_prev_assemble_end else None
+        self._hybrid_prev_assemble_end = consumer_end
         balance = self._balance_batch if self.config.trainer.balance_batch else None
         batch = assemble_batch_from_rollout_samples(rollout_samples, self.tokenizer, self.config, balance)
-        batch.meta_info["fully_async/total_wait_time"] = consumer_end - consumer_start
-        batch.meta_info["fully_async/hybrid/spans_discarded"] = 0
-        batch.meta_info["fully_async/hybrid/spans_accumulated"] = spans_accumulated
-        batch.meta_info["fully_async/hybrid/parents_finalized"] = len(rollout_samples)
-        batch.meta_info["fully_async/hybrid/coverage_fallback"] = coverage_fallback
-        batch.meta_info["fully_async/hybrid/max_in_flight_parents"] = max_in_flight
-        print(f"[FullyAsyncTrainer][H-ACC] assembled {len(rollout_samples)} full samples; spans={spans_accumulated}; discarded=0; coverage_fallback={coverage_fallback}; max_in_flight={max_in_flight}; wait {consumer_end - consumer_start:.1f}s", flush=True)
+        m = batch.meta_info
+        m["fully_async/total_wait_time"] = consumer_end - consumer_start
+        m["fully_async/hybrid/spans_discarded"] = 0
+        m["fully_async/hybrid/spans_received"] = spans_received
+        m["fully_async/hybrid/spans_emitted"] = spans_received  # producer-side equal in span mode (no drops)
+        m["fully_async/hybrid/span_gap_count"] = span_gap_count
+        m["fully_async/hybrid/span_drop_count"] = span_drop_count
+        m["fully_async/hybrid/coverage_fallback"] = coverage_fallback
+        m["fully_async/hybrid/parents_stitched_successfully"] = parents_stitched
+        m["fully_async/hybrid/parents_finalized"] = len(rollout_samples)
+        m["fully_async/hybrid/max_in_flight_parents"] = max_in_flight
+        m["fully_async/hybrid/span_payload_bytes"] = span_bytes_est
+        m["fully_async/hybrid/time_to_assemble_32_samples"] = consumer_end - consumer_start
+        if tpb is not None:
+            m["fully_async/hybrid/time_per_version_bump"] = tpb
+        m["fully_async/hybrid/producer_blocked_time_s"] = qstats.get("producer_blocked_time_s", 0.0)
+        m["fully_async/hybrid/queue_depth_p50"] = qstats.get("queue_depth_p50", 0)
+        m["fully_async/hybrid/queue_depth_p95"] = qstats.get("queue_depth_p95", 0)
+        m["fully_async/hybrid/queue_depth_max"] = qstats.get("queue_depth_max", 0)
+        m["fully_async/hybrid/blocked_timeout_drops"] = qstats.get("blocked_timeout_drops", 0)
+        print(f"[FullyAsyncTrainer][H-ACC] assembled {len(rollout_samples)} rows; recv={spans_received}; stitched={parents_stitched}; gap={span_gap_count}; fallback={coverage_fallback}; drop={span_drop_count}; blocked_s={qstats.get('producer_blocked_time_s', 0.0):.1f}; qdepth_p95={qstats.get('queue_depth_p95', 0)}; wait {consumer_end - consumer_start:.1f}s", flush=True)
         return 0, batch
 
     def _get_chunk_batch_divisor(self) -> int:
