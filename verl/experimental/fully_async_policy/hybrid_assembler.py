@@ -245,3 +245,64 @@ def build_sample_tensors(assembled: dict, pad_token_id: int = 0):
         "teacher_logprobs": teacher_logprobs,
         "teacher_ids": teacher_ids,
     }
+
+
+def aggregate_teacher_telemetry(records: list) -> dict:
+    """Aggregate per-chunk teacher telemetry into teacher/* metrics -- the cache-hit PROOF.
+
+    records: list of (parent_id, chunk_idx, n_tokens, telemetry), telemetry having cached_tokens /
+    total_tokens / replica_rank / latency_s / queue_wait_s. Pure stdlib (unit-testable without torch).
+
+    Key signal: prefix_amplification_ratio = processed(uncached) tokens per new-span token. ~1 means
+    full reuse; the no-cache baseline (total/span) is what the teacher processes WITHOUT reuse, so their
+    ratio is the reduction factor. cache_hits_by_chunk_idx should be ~0 at idx 0 and rise after.
+    """
+    out: dict = {}
+    if not records:
+        return out
+
+    def _pct(xs, p):
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        return float(s[min(len(s) - 1, int(p * len(s)))])
+
+    _lat = [t.get("latency_s") for *_, t in records if t.get("latency_s") is not None]
+    _qw = [t.get("queue_wait_s") for *_, t in records if t.get("queue_wait_s") is not None]
+    sum_cached = sum(t.get("cached_tokens") for *_, t in records if t.get("cached_tokens") is not None)
+    sum_total = sum(t.get("total_tokens") for *_, t in records if t.get("total_tokens") is not None)
+    sum_span = sum(n for _, _, n, _ in records)
+    sum_uncached = max(0, sum_total - sum_cached)
+    out["teacher/cached_tokens"] = sum_cached
+    out["teacher/uncached_tokens"] = sum_uncached
+    out["teacher/cache_hit_ratio"] = (sum_cached / sum_total) if sum_total else 0.0
+    out["teacher/prefix_amplification_ratio"] = (sum_uncached / sum_span) if sum_span else 0.0
+    out["teacher/prefix_amplification_no_cache"] = (sum_total / sum_span) if sum_span else 0.0
+
+    by_idx: dict = {}
+    per_parent_reqs: dict = {}
+    per_parent_replicas: dict = {}
+    replica_loads: dict = {}
+    for pid, cidx, n, t in records:
+        c = t.get("cached_tokens")
+        if c is not None:
+            by_idx.setdefault(cidx, []).append(c)
+        per_parent_reqs[pid] = per_parent_reqs.get(pid, 0) + 1
+        rr = t.get("replica_rank")
+        if rr is not None:
+            per_parent_replicas.setdefault(pid, set()).add(rr)
+            replica_loads[rr] = replica_loads.get(rr, 0) + 1
+    out["teacher/cache_hits_by_chunk_idx"] = {k: (sum(v) / len(v)) for k, v in sorted(by_idx.items())}
+    out["teacher/request_latency_p50"] = _pct(_lat, 0.5)
+    out["teacher/request_latency_p95"] = _pct(_lat, 0.95)
+    out["teacher/queue_wait_p50"] = _pct(_qw, 0.5)
+    out["teacher/queue_wait_p95"] = _pct(_qw, 0.95)
+    nparents = len(per_parent_reqs)
+    out["teacher/requests_per_parent"] = (sum(per_parent_reqs.values()) / nparents) if nparents else 0.0
+    if per_parent_replicas:
+        out["teacher/unique_replicas_per_parent"] = sum(len(s) for s in per_parent_replicas.values()) / len(per_parent_replicas)
+    out["teacher/replica_load_distribution"] = {k: replica_loads[k] for k in sorted(replica_loads)}
+    if replica_loads:
+        loads = list(replica_loads.values())
+        out["teacher/replica_load_skew_max_over_mean"] = max(loads) / (sum(loads) / len(loads))
+    return out

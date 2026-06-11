@@ -237,6 +237,37 @@ def test_finalize_is_exactly_once():
     _raised(lambda: acc.finalize(2))
 
 
+def test_aggregate_teacher_telemetry():
+    """The cache-hit proof math: full KV reuse -> only the new span is processed (amplification ~1) and
+    the parent is pinned to one replica; no reuse -> full prefix each chunk (ratio 0) and scattered."""
+    from verl.experimental.fully_async_policy.hybrid_assembler import aggregate_teacher_telemetry
+
+    P, span = 4, 256
+    recs_reuse, recs_noreuse = [], []
+    for i in range(4):  # one response, 4 chunks; prefix grows by `span` each chunk
+        total = P + span * (i + 1)
+        recs_reuse.append(("p_r0", i, span,
+                           {"cached_tokens": total - span, "total_tokens": total, "replica_rank": 2,
+                            "latency_s": 0.1, "queue_wait_s": 0.01}))
+        recs_noreuse.append(("p_r0", i, span,
+                             {"cached_tokens": 0, "total_tokens": total, "replica_rank": i % 4,
+                              "latency_s": 0.2, "queue_wait_s": 0.02}))
+    a = aggregate_teacher_telemetry(recs_reuse)
+    b = aggregate_teacher_telemetry(recs_noreuse)
+
+    assert abs(a["teacher/prefix_amplification_ratio"] - 1.0) < 1e-9     # reuse -> ~1 span processed/span
+    assert a["teacher/cache_hit_ratio"] > 0.5
+    assert a["teacher/unique_replicas_per_parent"] == 1.0                # pinned to replica 2
+    assert a["teacher/replica_load_distribution"] == {2: 4}
+    assert a["teacher/cache_hits_by_chunk_idx"][0] < a["teacher/cache_hits_by_chunk_idx"][3]
+
+    assert b["teacher/cache_hit_ratio"] == 0.0                            # no reuse -> 0 cached
+    assert b["teacher/prefix_amplification_ratio"] > a["teacher/prefix_amplification_ratio"]
+    assert b["teacher/unique_replicas_per_parent"] == 4.0                 # scattered across 4 replicas
+
+    assert aggregate_teacher_telemetry([]) == {}
+
+
 def _raised(fn):
     try:
         fn()
@@ -253,5 +284,6 @@ if __name__ == "__main__":
     test_span_only_payload_reconstructs_full_sample()
     test_reorder_tolerant_reassembly()
     test_finalize_is_exactly_once()
-    print("HYBRID ASSEMBLER (A1+H-ACC+SPAN+REORDER) PASS: stitch==whole; coverage guarded; span-slice==carrier; "
-          "span-only==full; fill_carrier layout; reorder-tolerant; finalize-once")
+    test_aggregate_teacher_telemetry()
+    print("HYBRID ASSEMBLER (A1+H-ACC+SPAN+REORDER+KVTELEM) PASS: stitch==whole; coverage guarded; "
+          "span-slice==carrier; span-only==full; reorder-tolerant; finalize-once; teacher-telemetry-agg")

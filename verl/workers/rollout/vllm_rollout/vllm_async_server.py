@@ -49,6 +49,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_PATH,
     SuppressSignalInThread,
     build_cli_args_from_config,
+    extract_incremental_prompt_logprobs,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
@@ -572,11 +573,46 @@ class vLLMHttpServer:
             # slice to the engine that decoded it (Q3 per-replica refresh).
             "replica_rank": self.replica_rank,
         }
-        extract_prompt_logprobs(
-            output=final_res,
-            num_prompt_logprobs=sampling_params.prompt_logprobs,
-            result_dict=extra_fields,
+        # Teacher incremental scoring: an APC-reusing prompt_logprobs request (skip_reading_prefix_cache
+        # explicitly False) returns full-length logprobs whose cached-prefix rows are GARBAGE. Extract
+        # ONLY the valid recomputed suffix [num_cached_tokens:] and tell the teacher where it starts; the
+        # teacher_manager slices the exact desired span. Normal requests keep the strict parser.
+        _nct = getattr(final_res, "num_cached_tokens", None)
+        _incremental = (
+            sampling_params.prompt_logprobs is not None
+            and getattr(sampling_params, "skip_reading_prefix_cache", True) is False
         )
+        if _incremental:
+            _nct = int(_nct or 0)
+            _flen = len(final_res.prompt_logprobs)
+            # prompt_logprobs[0] is always None, AND the boundary position == num_cached_tokens is not
+            # reliably recomputed (its logits come from the cached region -> garbage top-k width). The
+            # first reliably-valid recomputed row is num_cached_tokens + 1. This is safe: the desired
+            # span is shifted +1 (next-token), so it always starts at >= num_cached_tokens + 1.
+            _start = max(_nct + 1, 1)
+            ids_rows, lp_rows = extract_incremental_prompt_logprobs(
+                final_res, sampling_params.prompt_logprobs, _nct, _start, _flen
+            )
+            extra_fields["prompt_ids"] = ids_rows
+            extra_fields["prompt_logprobs"] = lp_rows
+            extra_fields["valid_suffix_start_abs"] = _start
+            extra_fields["valid_suffix_end_abs"] = _flen
+            extra_fields["full_prefix_len"] = _flen
+        else:
+            extract_prompt_logprobs(
+                output=final_res,
+                num_prompt_logprobs=sampling_params.prompt_logprobs,
+                result_dict=extra_fields,
+            )
+        # Teacher KV-reuse telemetry: prefix-cache hit count + engine queue wait for this request, so
+        # the hybrid trainer can PROVE cache reuse (additive; the rollout path simply ignores these).
+        extra_fields["num_cached_tokens"] = _nct
+        _rm = getattr(final_res, "metrics", None)
+        if _rm is not None:
+            _arr = getattr(_rm, "arrival_time", None)
+            _sched = getattr(_rm, "first_scheduled_time", None)
+            if _arr is not None and _sched is not None:
+                extra_fields["queue_wait_s"] = max(0.0, float(_sched) - float(_arr))
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):

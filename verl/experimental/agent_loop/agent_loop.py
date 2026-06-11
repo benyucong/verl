@@ -684,11 +684,14 @@ class AgentLoopWorker:
 
         try:
             output.reward_score = 0.0
+            # Final-only teacher scoring (F mode, gated): skip the teacher call on non-final chunks; only
+            # the final chunk scores the full response once -> no per-chunk prefix amplification. Default off.
+            _final_only = os.environ.get("OPD_TEACHER_FINAL_ONLY", "0") not in ("0", "", "false", "False")
             internal = await self._agent_loop_postprocess(
                 output,
                 validate,
                 compute_score=False,
-                compute_teacher_logprobs=True,
+                compute_teacher_logprobs=(is_final or not _final_only),
                 **sample_kwargs,
             )
             chunk_batch = self._postprocess(
@@ -757,6 +760,8 @@ class AgentLoopWorker:
                     "source": "streaming",
                     "response_end": token_offset + n_tokens,
                     "response_width": self.rollout_config.response_length,
+                    # Teacher KV-reuse telemetry for this chunk (cached/total tokens, replica, latency).
+                    "teacher_telemetry": output.extra_fields.get("teacher_telemetry"),
                 },
             )
             success = await self.chunk_message_queue_client.put_sample(ray.cloudpickle.dumps(chunk))
@@ -1094,19 +1099,52 @@ class AgentLoopWorker:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
             routing_key = None
+            session_id = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                # Per-RESPONSE id pins this response's chunks to one teacher replica (KV reuse, gated).
+                sid = sample_kwargs.get("xiaoshuai_sample_id")
+                if sid is not None:
+                    session_id = sid.item() if hasattr(sid, "item") else sid
+            # Incremental-scoring span coordinates, derived from this chunk's response_mask
+            # ([0]*token_offset + [1]*n_new_tokens, single_turn_agent_loop.py:390): span_start = first 1,
+            # n_tokens = sum. The teacher then re-scores only this span (gated OPD_TEACHER_INCREMENTAL_SCORE).
+            span_start = span_end = prompt_width = None
+            rm = output.response_mask
+            if rm is not None and any(rm):
+                span_start = list(rm).index(1)
+                n_tokens = int(sum(rm))
+                span_end = span_start + n_tokens
+                prompt_width = len(prompt_ids)
+            teacher_ids, teacher_logprobs, teacher_telemetry = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
+                session_id=session_id,
+                span_start=span_start,
+                span_end=span_end,
+                prompt_width=prompt_width,
             )
+            if teacher_telemetry.get("incremental"):
+                # Teacher returned ONLY the new span [n, k]. Re-place it into a full-prefix-aligned [S, k]
+                # tensor (zeros for the cached prefix we did not re-score), so the existing span-only slice
+                # and every downstream consumer are byte-for-byte unchanged. The span-only emission strips
+                # the zeros back to [n, k] on the wire; compute was still incremental.
+                S = len(prompt_ids) + len(response_ids)
+                k = teacher_ids.shape[1]
+                full_ids = torch.zeros(S, k, dtype=torch.int32)
+                full_lps = torch.zeros(S, k, dtype=torch.float32)
+                ss = prompt_width + span_start
+                full_ids[ss:ss + (span_end - span_start)] = teacher_ids
+                full_lps[ss:ss + (span_end - span_start)] = teacher_logprobs
+                teacher_ids, teacher_logprobs = full_ids, full_lps
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            output.extra_fields["teacher_telemetry"] = teacher_telemetry
 
     def _postprocess(
         self,

@@ -760,6 +760,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._create_worker_classes()
         await self._create_reward_loop_manager()
         await self._create_teacher_model_manager()
+        if os.environ.get("OPD_TEACHER_SEQ_GATE", "0") not in ("0", "", "false", "False"):
+            await self._run_teacher_sequential_gate()  # exits the process when done
         await self._init_async_rollout_manager()
 
     async def _create_reward_loop_manager(self):
@@ -814,6 +816,90 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 None,
                 lambda: MultiTeacherModelManager(config=self.config, resource_pool=teacher_resource_pool),
             )
+
+    async def _run_teacher_sequential_gate(self):
+        """Stage-1 sequential real-server gate (gated OPD_TEACHER_SEQ_GATE + OPD_TEACHER_INCREMENTAL_SCORE=1).
+        Scores a fixed parent STRICTLY SEQUENTIALLY and builds three teacher-label sources as full [S, K]
+        tensors (A=final-only clean full; B=streamed per-chunk clean, no KV reuse; C=incremental streamed
+        with KV reuse), then saves them + input_ids + response mask + the per-chunk dummy positions for the
+        offline forward-KL loss/gradient comparison. Exits when done."""
+        import os as _os
+        import random as _random
+
+        import torch
+
+        from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+        if self.teacher_model_manager is None:
+            print("[SEQ-GATE] no teacher manager configured; skipping", flush=True)
+            _os._exit(2)
+        mgr = AsyncTeacherLLMServerManager(self.config, self.teacher_model_manager.get_client())
+        K = mgr.distillation_loss_config.topk if mgr.distillation_loss_config.loss_settings.use_topk else 1
+        rng = _random.Random(0)
+        P, L, chunk = 8, 1024, 256
+        prompt = [rng.randint(100, 30000) for _ in range(P)]
+        response = [rng.randint(100, 30000) for _ in range(L)]
+        S = P + L
+        starts = list(range(0, L, chunk))
+        print(f"[SEQ-GATE] K={K} P={P} L={L} chunk={chunk} S={S}", flush=True)
+
+        async def score(seq, sid, sstart=None, send=None):
+            return await mgr.compute_teacher_logprobs_single(
+                sequence_ids=seq, routing_key=None, session_id=sid,
+                span_start=sstart, span_end=send, prompt_width=(P if sstart is not None else None))
+
+        # C: incremental streamed (sequential, KV reuse). Build response region of a full [S, K] tensor.
+        C_ids = torch.zeros(S, K, dtype=torch.int32)
+        C_lps = torch.zeros(S, K, dtype=torch.float32)
+        prev_cached, cached_rising = -1, True
+        try:
+            for c, st in enumerate(starts):
+                en = min(st + chunk, L)
+                tid, tlp, tel = await score(prompt + response[:en], "seqgate_C", st, en)
+                nc = tel.get("cached_tokens") or 0
+                print(f"[SEQ-GATE] C chunk {c}: full_prefix_len={tel.get('full_prefix_len')} num_cached={nc} "
+                      f"valid_suffix=[{tel.get('valid_suffix_start_abs')},{tel.get('valid_suffix_end_abs')}) "
+                      f"retained={tel.get('retained_span_rows')} lat={tel.get('latency_s'):.3f}s "
+                      f"replica={tel.get('replica_rank')}", flush=True)
+                cached_rising = cached_rising and nc >= prev_cached
+                prev_cached = nc
+                C_ids[P + st:P + en] = tid
+                C_lps[P + st:P + en] = tlp
+        except Exception as e:
+            print(f"[SEQ-GATE] FAIL during C: {type(e).__name__}: {e}", flush=True)
+            _os._exit(1)
+
+        # B: streamed per-chunk CLEAN (no KV reuse) -- strict full of each chunk, new span sliced [P+st:P+en].
+        B_ids = torch.zeros(S, K, dtype=torch.int32)
+        B_lps = torch.zeros(S, K, dtype=torch.float32)
+        for c, st in enumerate(starts):
+            en = min(st + chunk, L)
+            ftid, ftlp, _ = await score(prompt + response[:en], f"seqgate_B_{c}")
+            B_ids[P + st:P + en] = ftid[P + st:P + en]
+            B_lps[P + st:P + en] = ftlp[P + st:P + en]
+
+        # A: final-only clean full -- strict full [S, K] used directly.
+        A_ids, A_lps, _ = await score(prompt + response, "seqgate_A")
+
+        resp_mask = torch.zeros(S, dtype=torch.bool)
+        resp_mask[P:P + L] = True
+        # Per-chunk dummy positions (last of each chunk + final response token): B/C dummy these (the chunk
+        # had no in-sequence next token), A dummies only the final. Exclude all from the loss comparison.
+        dummy_abs = sorted({P + en - 1 for en in [min(st + chunk, L) for st in starts]} | {P + L - 1})
+        out_path = _os.environ.get("OPD_SEQGATE_TENSOR_PATH", "/tmp/seqgate_tensors.pt")
+        torch.save({
+            "input_ids": torch.tensor(prompt + response, dtype=torch.long), "response_mask": resp_mask,
+            "P": P, "L": L, "chunk": chunk, "K": K, "S": S, "starts": starts, "dummy_abs": dummy_abs,
+            "A_ids": A_ids.cpu(), "A_lps": A_lps.cpu(), "B_ids": B_ids.cpu(), "B_lps": B_lps.cpu(),
+            "C_ids": C_ids.cpu(), "C_lps": C_lps.cpu(),
+        }, out_path)
+        rr = slice(P, P + L)
+        print(f"[SEQ-GATE] cached_rising={cached_rising} dummy_abs={dummy_abs}", flush=True)
+        print(f"[SEQ-GATE] label top1 (response region): A-vs-B={(A_ids[rr][:,0]==B_ids[rr][:,0]).float().mean():.4f} "
+              f"A-vs-C={(A_ids[rr][:,0]==C_ids[rr][:,0]).float().mean():.4f} "
+              f"B-vs-C={(B_ids[rr][:,0]==C_ids[rr][:,0]).float().mean():.4f}", flush=True)
+        print(f"[SEQ-GATE] saved tensors -> {out_path}", flush=True)
+        _os._exit(0)
 
     def _create_actor_rollout_classes(self):
         # Skip rollout creation and let agentloop handle it

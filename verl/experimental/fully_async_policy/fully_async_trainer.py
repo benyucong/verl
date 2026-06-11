@@ -466,6 +466,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         complete final-chunk payload rather than lose the parent (no regression vs the old MVP path)."""
         from verl.experimental.fully_async_policy.hybrid_assembler import (
             ParentLabelAccumulator,
+            aggregate_teacher_telemetry,
             fill_carrier_teacher_tensors,
             span_from_chunk,
         )
@@ -495,6 +496,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_len = 0
         dbg_logged_pids: set = set()  # DIAGNOSTIC: one failure line per failing parent (gap vs overlap)
         emitted_pids: set = set()     # responses already emitted this drain (ignore duplicate stragglers)
+        teacher_records: list = []     # per-chunk teacher telemetry (cache-hit proof): (pid, chunk_idx, n_tokens, tel)
+        final_only = os.environ.get("OPD_TEACHER_FINAL_ONLY", "0") not in ("0", "", "false", "False")
         while collected_rows < target_rows:
             result = await self.message_queue_client.get_sample()
             if result is None:
@@ -514,6 +517,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             pid = str(chunk.sample_id)
             if pid in emitted_pids:
                 continue  # this response already emitted -> ignore any duplicate straggler chunk
+            if final_only:
+                # F mode: the teacher scored ONLY the final chunk (full response), so non-final chunks
+                # carry no teacher labels -> skip them; the final chunk's payload is the complete labeled
+                # sample. (No accumulator/stitch; one teacher call per parent, amplification ~1.)
+                if not chunk.is_final:
+                    continue
+                _tel = chunk.meta.get("teacher_telemetry") if isinstance(chunk.meta, dict) else None
+                if _tel:
+                    # F mode: the one teacher call supervises the WHOLE response, so the amplification
+                    # denominator is the full response length (token_offset+n_tokens), not the final span.
+                    teacher_records.append((pid, int(chunk.chunk_idx), int(chunk.token_offset) + int(chunk.n_tokens), _tel))
+                rollout_samples.append(RolloutSample(full_batch=chunk.parent_payload, sample_id=chunk.sample_id,
+                                                     epoch=int(chunk.meta.get("epoch", 0) or 0), rollout_status={}))
+                collected_rows += len(chunk.parent_payload)
+                emitted_pids.add(pid)
+                if len(rollout_samples) % 16 == 0:
+                    print(f"[FullyAsyncTrainer][F-ONLY] {collected_rows}/{target_rows} rows; parents={len(emitted_pids)}", flush=True)
+                continue
             acc = accs.get(pid)
             if acc is None:
                 topk = int(chunk.span_teacher_ids.shape[-1]) if span_mode else int(chunk.parent_payload.batch["teacher_ids"].shape[-1])
@@ -540,6 +561,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                           f"n={chunk.n_tokens} tok_off={chunk.token_offset} next_exp={acc.next_expected_offset} :: {e}", flush=True)
                 degraded.add(pid)
             max_in_flight = max(max_in_flight, len(accs))
+            _tel = chunk.meta.get("teacher_telemetry") if isinstance(chunk.meta, dict) else None
+            if _tel:
+                teacher_records.append((pid, int(chunk.chunk_idx), int(chunk.n_tokens), _tel))
 
             # Resolve the parent: emit when coverage is COMPLETE (reorder-safe), else fall back / drop only
             # if it is BOTH degraded (a real error, not mere reordering) AND its final length is known.
@@ -602,7 +626,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         m["fully_async/hybrid/queue_depth_p95"] = qstats.get("queue_depth_p95", 0)
         m["fully_async/hybrid/queue_depth_max"] = qstats.get("queue_depth_max", 0)
         m["fully_async/hybrid/blocked_timeout_drops"] = qstats.get("blocked_timeout_drops", 0)
+        tele = aggregate_teacher_telemetry(teacher_records)
+        m.update(tele)
         print(f"[FullyAsyncTrainer][H-ACC] assembled {len(rollout_samples)} rows; recv={spans_received}; stitched={parents_stitched}; gap={span_gap_count}; fallback={coverage_fallback}; drop={span_drop_count}; blocked_s={qstats.get('producer_blocked_time_s', 0.0):.1f}; qdepth_p95={qstats.get('queue_depth_p95', 0)}; wait {consumer_end - consumer_start:.1f}s", flush=True)
+        if tele:
+            print(f"[FullyAsyncTrainer][TEACHER] cache_hit_ratio={tele.get('teacher/cache_hit_ratio', 0):.3f}; "
+                  f"cached={tele.get('teacher/cached_tokens', 0)}; uncached={tele.get('teacher/uncached_tokens', 0)}; "
+                  f"prefix_amp={tele.get('teacher/prefix_amplification_ratio', 0):.2f} (no_cache={tele.get('teacher/prefix_amplification_no_cache', 0):.2f}); "
+                  f"uniq_replicas/parent={tele.get('teacher/unique_replicas_per_parent', 0):.2f}; "
+                  f"replica_load={tele.get('teacher/replica_load_distribution', {})}; "
+                  f"lat_p50={tele.get('teacher/request_latency_p50', 0):.2f}s", flush=True)
         return 0, batch
 
     def _get_chunk_batch_divisor(self) -> int:
@@ -1713,5 +1746,5 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 }
             )
             for key, value in batch.meta_info.items():
-                if key.startswith("fully_async") or key.startswith("timing_s"):
+                if key.startswith("fully_async") or key.startswith("timing_s") or key.startswith("teacher"):
                     metrics[key] = value
