@@ -692,6 +692,7 @@ class AgentLoopWorker:
                 validate,
                 compute_score=False,
                 compute_teacher_logprobs=(is_final or not _final_only),
+                chunk_is_final=is_final,
                 **sample_kwargs,
             )
             chunk_batch = self._postprocess(
@@ -794,6 +795,7 @@ class AgentLoopWorker:
         validate,
         compute_score: bool = True,
         compute_teacher_logprobs: bool = True,
+        chunk_is_final: Optional[bool] = None,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -910,6 +912,7 @@ class AgentLoopWorker:
                 response_ids=output.response_ids,
                 validate=validate,
                 sample_kwargs=kwargs,
+                chunk_is_final=chunk_is_final,
             )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
@@ -1095,6 +1098,7 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        chunk_is_final: Optional[bool] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
@@ -1128,6 +1132,7 @@ class AgentLoopWorker:
                 span_start=span_start,
                 span_end=span_end,
                 prompt_width=prompt_width,
+                is_final=chunk_is_final,
             )
             if teacher_telemetry.get("incremental"):
                 # Teacher returned ONLY the new span [n, k]. Re-place it into a full-prefix-aligned [S, k]

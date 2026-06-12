@@ -590,9 +590,16 @@ class vLLMHttpServer:
             # first reliably-valid recomputed row is num_cached_tokens + 1. This is safe: the desired
             # span is shifted +1 (next-token), so it always starts at >= num_cached_tokens + 1.
             _start = max(_nct + 1, 1)
-            ids_rows, lp_rows = extract_incremental_prompt_logprobs(
-                final_res, sampling_params.prompt_logprobs, _nct, _start, _flen
-            )
+            if _start >= _flen:
+                # Fully cached (e.g. an identical sibling response already cached this exact sequence):
+                # no valid recomputed rows. Return an EMPTY suffix; the teacher_manager sees the desired
+                # span is uncovered and falls back to a clean recompute. (Do NOT crash the server here.)
+                ids_rows, lp_rows = [], []
+                _start = _flen
+            else:
+                ids_rows, lp_rows = extract_incremental_prompt_logprobs(
+                    final_res, sampling_params.prompt_logprobs, _nct, _start, _flen
+                )
             extra_fields["prompt_ids"] = ids_rows
             extra_fields["prompt_logprobs"] = lp_rows
             extra_fields["valid_suffix_start_abs"] = _start

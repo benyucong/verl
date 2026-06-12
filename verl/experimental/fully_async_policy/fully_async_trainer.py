@@ -633,9 +633,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             print(f"[FullyAsyncTrainer][TEACHER] cache_hit_ratio={tele.get('teacher/cache_hit_ratio', 0):.3f}; "
                   f"cached={tele.get('teacher/cached_tokens', 0)}; uncached={tele.get('teacher/uncached_tokens', 0)}; "
                   f"prefix_amp={tele.get('teacher/prefix_amplification_ratio', 0):.2f} (no_cache={tele.get('teacher/prefix_amplification_no_cache', 0):.2f}); "
+                  f"fallback_clean={tele.get('teacher/fallback_clean_count', 0)}; "
                   f"uniq_replicas/parent={tele.get('teacher/unique_replicas_per_parent', 0):.2f}; "
                   f"replica_load={tele.get('teacher/replica_load_distribution', {})}; "
                   f"lat_p50={tele.get('teacher/request_latency_p50', 0):.2f}s", flush=True)
+            if tele.get("teacher_fifo/enabled"):
+                print(f"[FullyAsyncTrainer][FIFO] active_parents={tele.get('teacher_fifo/active_parents', 0)}; "
+                      f"buffered={tele.get('teacher_fifo/buffered_chunks', 0)}; "
+                      f"max_buffered/parent={tele.get('teacher_fifo/max_buffered_chunks_per_parent', 0)}; "
+                      f"wait_p50={tele.get('teacher_fifo/wait_time_s_p50', 0):.3f}s/p95={tele.get('teacher_fifo/wait_time_s_p95', 0):.3f}s; "
+                      f"score_p50={tele.get('teacher_fifo/score_time_s_p50', 0):.3f}s; "
+                      f"timeouts={tele.get('teacher_fifo/timeout_count', 0)}; errors={tele.get('teacher_fifo/error_count', 0)}; "
+                      f"cleanups={tele.get('teacher_fifo/cleanup_count', 0)}", flush=True)
         return 0, batch
 
     def _get_chunk_batch_divisor(self) -> int:

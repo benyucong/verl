@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import math
 import os
 import time
@@ -21,6 +22,7 @@ import torch
 from omegaconf import DictConfig
 from torch.nn import functional as F
 
+from verl.experimental.teacher_loop.fifo import PerParentFifo, fifo_enabled
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     DistillationConfig,
@@ -52,6 +54,22 @@ def _get_teacher_sampling_params(
         params["skip_reading_prefix_cache"] = False
         params["detokenize"] = False
     return params
+
+
+def _finalize_span_tensors(new_ids, new_lps, n: int, K: int):
+    """Validate exactly-n top-k rows (no silent padding/repair) and build [n, K] int32/float32 tensors."""
+    if len(new_ids) != n or len(new_lps) != n:
+        raise AssertionError(f"span retained {len(new_ids)} rows != requested span length {n}")
+    if n == 0:  # empty span (chunk added no new tokens): well-formed [0, K] tensors
+        return torch.zeros(0, K, dtype=torch.int32), torch.zeros(0, K, dtype=torch.float32)
+    for r, (ids_row, lp_row) in enumerate(zip(new_ids, new_lps)):
+        if len(ids_row) != K or len(lp_row) != K:
+            raise AssertionError(f"span row {r}: top-k width {len(ids_row)}/{len(lp_row)} != {K}")
+        if any((tid is None or int(tid) < 0) for tid in ids_row):
+            raise AssertionError(f"span row {r}: invalid token id")
+        if any((lp is None or not math.isfinite(lp)) for lp in lp_row):
+            raise AssertionError(f"span row {r}: non-finite logprob")
+    return torch.tensor(new_ids, dtype=torch.int32), torch.tensor(new_lps, dtype=torch.float32)
 
 
 def _pad_teacher_outputs(
@@ -93,6 +111,11 @@ class AsyncTeacherLLMServerManager:
                 f"do not match teacher routing keys {sorted(expected)}."
             )
         self.teacher_client: dict[str, LLMServerClient] = teacher_client
+        # Stage 2: per-parent FIFO sequencer for incremental scoring (gated OPD_TEACHER_PER_PARENT_FIFO).
+        # One sequencer per worker (== one asyncio event loop), shared across this worker's chunk tasks.
+        _to = float(os.environ.get("OPD_TEACHER_FIFO_TIMEOUT_S", "120") or 120)
+        self._fifo = PerParentFifo(timeout_s=_to)
+        self._fifo_warned = False
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
@@ -120,6 +143,7 @@ class AsyncTeacherLLMServerManager:
         span_start: Optional[int] = None,
         span_end: Optional[int] = None,
         prompt_width: Optional[int] = None,
+        is_final: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Compute teacher log probabilities for a single unpadded sequence.
 
@@ -142,28 +166,57 @@ class AsyncTeacherLLMServerManager:
         kv_reuse = os.environ.get("OPD_TEACHER_KV_REUSE", "0") not in ("0", "", "false", "False")
         use_stable_routing = (kv_reuse or incremental) and session_id is not None
         routing_request_id = f"teacher::{session_id}" if use_stable_routing else uuid4().hex
-        t0 = time.monotonic()
-        teacher_output = await client.generate(
-            request_id=routing_request_id,
-            prompt_ids=sequence_ids,
-            sampling_params=_get_teacher_sampling_params(
-                teacher_model_config, self.distillation_loss_config, incremental=incremental
-            ),
-            image_data=multi_modal_data.get("images"),
-            video_data=multi_modal_data.get("videos"),
-            audio_data=multi_modal_data.get("audios"),
-            mm_processor_kwargs=mm_processor_kwargs,
+
+        # Stage 2: per-parent FIFO. Serialize this parent's chunk-score calls so the prefix KV is populated
+        # in span order (chunk k completes before k+1 begins); different parents stay concurrent. The
+        # SERVER request id stays unique per call so concurrent CROSS-parent calls never collide.
+        def _generate():
+            return client.generate(
+                request_id=routing_request_id,
+                prompt_ids=sequence_ids,
+                sampling_params=_get_teacher_sampling_params(
+                    teacher_model_config, self.distillation_loss_config, incremental=incremental
+                ),
+                image_data=multi_modal_data.get("images"),
+                video_data=multi_modal_data.get("videos"),
+                audio_data=multi_modal_data.get("audios"),
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+
+        fifo_on = (
+            fifo_enabled(incremental) and session_id is not None and span_start is not None and span_end is not None
         )
+        if os.environ.get("OPD_TEACHER_PER_PARENT_FIFO", "0") not in ("0", "", "false", "False") and not incremental:
+            if not self._fifo_warned:
+                logging.getLogger(__name__).warning(
+                    "OPD_TEACHER_PER_PARENT_FIFO=1 but incremental scoring is off; FIFO is a no-op "
+                    "(clean scoring has no ordering precondition) -- leaving behavior unchanged."
+                )
+                self._fifo_warned = True
+        fifo_wait_s = fifo_score_s = None
+        t0 = time.monotonic()
+        if fifo_on:
+            teacher_output, fifo_wait_s, fifo_score_s = await self._fifo.run(
+                str(session_id), int(span_start), int(span_end), bool(is_final), _generate
+            )
+        else:
+            teacher_output = await _generate()
         latency_s = time.monotonic() - t0
         ef = getattr(teacher_output, "extra_fields", {}) or {}
+        cached = ef.get("num_cached_tokens")
         telemetry = {
-            "cached_tokens": ef.get("num_cached_tokens"),
+            "cached_tokens": cached,
+            "uncached_tokens": (len(sequence_ids) - cached) if cached is not None else None,
             "total_tokens": len(sequence_ids),
             "replica_rank": ef.get("replica_rank"),
             "latency_s": latency_s,
             "queue_wait_s": ef.get("queue_wait_s"),
             "kv_reuse": bool(use_stable_routing),
             "incremental": bool(incremental),
+            "fifo": bool(fifo_on),
+            "fifo_wait_s": fifo_wait_s,
+            "fifo_score_s": fifo_score_s,
+            "fifo_snapshot": self._fifo.snapshot() if fifo_on else None,
         }
 
         if not incremental:
@@ -192,12 +245,51 @@ class AsyncTeacherLLMServerManager:
         shift_end_abs = teacher_span_end_abs + 1
         last_is_dummy = shift_end_abs > valid_suffix_end_abs
         covered_end_abs = min(shift_end_abs, valid_suffix_end_abs)
-        # coverage guards (the shifted span must lie inside the returned valid suffix)
-        if not (valid_suffix_start_abs <= shift_start_abs and covered_end_abs <= valid_suffix_end_abs):
-            raise AssertionError(
-                f"incremental span not covered: shifted [{shift_start_abs},{shift_end_abs}) "
-                f"not within valid suffix [{valid_suffix_start_abs},{valid_suffix_end_abs})"
+        if os.environ.get("OPD_TEACHER_FIFO_DEBUG", "0") not in ("0", "", "false", "False"):
+            logging.getLogger(__name__).warning(
+                "[FIFO-DBG] sid=%s span=[%s,%s) n=%s cached=%s valid_suffix=[%s,%s) shifted=[%s,%s) "
+                "fifo=%s wait=%s score=%s",
+                str(session_id)[-14:], span_start, span_end, n, ef.get("num_cached_tokens"),
+                valid_suffix_start_abs, valid_suffix_end_abs, shift_start_abs, shift_end_abs,
+                fifo_on, None if fifo_wait_s is None else round(fifo_wait_s, 3),
+                None if fifo_score_s is None else round(fifo_score_s, 3),
             )
+        # Cross-response cache sharing: sibling responses to the SAME prompt share the replica's
+        # content-keyed prefix cache, so when siblings share a few early RESPONSE tokens too, num_cached
+        # for this response's chunk can land PAST its span_start -- the span's leading rows are then cached
+        # (not recomputed) and unrecoverable from this request. FIFO cannot fix this (it is cross-response).
+        # Fall back to a CLEAN recompute (skip_reading=True -> APC bypass -> every row recomputed) for this
+        # chunk: correct, and rare (mostly cheap chunk-0s where siblings share a prefix).
+        # Fall back to a clean recompute whenever the valid suffix does not fully cover the shifted span --
+        # cross-response cache interference (num_cached past span_start) OR a fully-cached sequence (empty
+        # suffix). The clean recompute (skip_reading=True) returns every row, so the span is always correct.
+        needs_fallback = not (valid_suffix_start_abs <= shift_start_abs and covered_end_abs <= valid_suffix_end_abs)
+        if needs_fallback:
+            clean_out = await client.generate(
+                request_id=uuid4().hex,
+                prompt_ids=sequence_ids,
+                sampling_params=_get_teacher_sampling_params(
+                    teacher_model_config, self.distillation_loss_config, incremental=False
+                ),
+                image_data=multi_modal_data.get("images"),
+                video_data=multi_modal_data.get("videos"),
+                audio_data=multi_modal_data.get("audios"),
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+            cef = getattr(clean_out, "extra_fields", {}) or {}
+            full_ids = cef["prompt_ids"]  # strict full [S, K]: row j == prompt_logprobs[j+1]
+            full_lps = cef["prompt_logprobs"]
+            new_ids = list(full_ids[teacher_span_start_abs:teacher_span_end_abs])
+            new_lps = list(full_lps[teacher_span_start_abs:teacher_span_end_abs])
+            teacher_ids, teacher_logprobs = _finalize_span_tensors(new_ids, new_lps, n, K)
+            telemetry.update({
+                "fallback_clean": True,
+                "teacher_span_start_abs": teacher_span_start_abs,
+                "teacher_span_end_abs": teacher_span_end_abs,
+                "retained_span_rows": n,
+            })
+            return teacher_ids, teacher_logprobs, telemetry
+
         local_start = shift_start_abs - valid_suffix_start_abs
         local_end = covered_end_abs - valid_suffix_start_abs
         new_ids = list(suffix_ids[local_start:local_end])
@@ -205,18 +297,7 @@ class AsyncTeacherLLMServerManager:
         if last_is_dummy:  # final chunk: pad the last position's missing next-token label with a dummy
             new_ids.append([0] * K)
             new_lps.append([0.0] * K)
-        # hard guards: exact row count, valid top-k width, valid token ids, finite logprobs (no repair)
-        if len(new_ids) != n or len(new_lps) != n:
-            raise AssertionError(f"incremental retained {len(new_ids)} rows != requested span length {n}")
-        for r, (ids_row, lp_row) in enumerate(zip(new_ids, new_lps)):
-            if len(ids_row) != K or len(lp_row) != K:
-                raise AssertionError(f"incremental row {r}: top-k width {len(ids_row)}/{len(lp_row)} != {K}")
-            if any((tid is None or int(tid) < 0) for tid in ids_row):
-                raise AssertionError(f"incremental row {r}: invalid token id")
-            if any((lp is None or not math.isfinite(lp)) for lp in lp_row):
-                raise AssertionError(f"incremental row {r}: non-finite logprob")
-        teacher_ids = torch.tensor(new_ids, dtype=torch.int32)
-        teacher_logprobs = torch.tensor(new_lps, dtype=torch.float32)
+        teacher_ids, teacher_logprobs = _finalize_span_tensors(new_ids, new_lps, n, K)
         telemetry.update({
             "full_prefix_len": full_prefix_len,
             "valid_suffix_start_abs": valid_suffix_start_abs,

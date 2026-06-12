@@ -278,6 +278,8 @@ def aggregate_teacher_telemetry(records: list) -> dict:
     out["teacher/cache_hit_ratio"] = (sum_cached / sum_total) if sum_total else 0.0
     out["teacher/prefix_amplification_ratio"] = (sum_uncached / sum_span) if sum_span else 0.0
     out["teacher/prefix_amplification_no_cache"] = (sum_total / sum_span) if sum_span else 0.0
+    # incremental chunks that fell back to a clean recompute (cross-response cache extended into the span)
+    out["teacher/fallback_clean_count"] = sum(1 for *_, t in records if t.get("fallback_clean"))
 
     by_idx: dict = {}
     per_parent_reqs: dict = {}
@@ -305,4 +307,24 @@ def aggregate_teacher_telemetry(records: list) -> dict:
     if replica_loads:
         loads = list(replica_loads.values())
         out["teacher/replica_load_skew_max_over_mean"] = max(loads) / (sum(loads) / len(loads))
+
+    # Stage 2: per-parent FIFO metrics (teacher_fifo/*). wait/score percentiles from the actual per-call
+    # values aggregated centrally; the cumulative counters/gauges from the per-worker snapshot (max ~=
+    # busiest worker's latest value, since each worker's snapshot is monotonic).
+    fifo_recs = [t for *_, t in records if t.get("fifo")]
+    out["teacher_fifo/enabled"] = 1 if fifo_recs else 0
+    if fifo_recs:
+        _fw = [t.get("fifo_wait_s") for t in fifo_recs if t.get("fifo_wait_s") is not None]
+        _fs = [t.get("fifo_score_s") for t in fifo_recs if t.get("fifo_score_s") is not None]
+        out["teacher_fifo/wait_time_s_p50"] = _pct(_fw, 0.5)
+        out["teacher_fifo/wait_time_s_p95"] = _pct(_fw, 0.95)
+        out["teacher_fifo/score_time_s_p50"] = _pct(_fs, 0.5)
+        out["teacher_fifo/score_time_s_p95"] = _pct(_fs, 0.95)
+        snaps = [t.get("fifo_snapshot") for t in fifo_recs if t.get("fifo_snapshot")]
+        for key in (
+            "active_parents", "buffered_chunks", "max_buffered_chunks_per_parent",
+            "cleanup_count", "error_count", "timeout_count",
+        ):
+            vals = [s.get(key, 0) for s in snaps]
+            out[f"teacher_fifo/{key}"] = max(vals) if vals else 0
     return out
