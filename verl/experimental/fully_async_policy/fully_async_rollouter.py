@@ -748,6 +748,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if not hasattr(self.config, "async_training"):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
+        # Fail closed on the final-only + span-only combo (KeyError: 'teacher_logprobs' at actor update).
+        from verl.experimental.fully_async_policy.hybrid_assembler import assert_payload_flags_compatible
+
+        assert_payload_flags_compatible()
 
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.

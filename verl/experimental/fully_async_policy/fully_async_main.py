@@ -53,6 +53,13 @@ class FullyAsyncTaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
+        # Fail closed on incompatible OPD teacher/payload flags BEFORE any weight download or
+        # init_workers (the trainer loads models in _create_trainer below). final-only + span-only
+        # would otherwise run all the way to the actor update and crash with KeyError: 'teacher_logprobs'.
+        from verl.experimental.fully_async_policy.hybrid_assembler import assert_payload_flags_compatible
+
+        assert_payload_flags_compatible()
+
         print("[ASYNC MAIN] Initializing model and tokenizer...")
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)

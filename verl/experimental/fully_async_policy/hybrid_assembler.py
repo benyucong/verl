@@ -27,6 +27,40 @@ def hybrid_span_payload_enabled() -> bool:
     full = os.environ.get("OPD_HYBRID_FULL_SAMPLE", "0") not in ("0", "", "false", "False")
     return span and full
 
+
+def final_only_teacher_enabled() -> bool:
+    """F mode: the teacher scores ONLY the final chunk (whole response) once, so non-final chunks
+    carry no teacher labels. Default OFF (see agent_loop._publish_streaming_chunk)."""
+    return os.environ.get("OPD_TEACHER_FINAL_ONLY", "0") not in ("0", "", "false", "False")
+
+
+def assert_payload_flags_compatible() -> None:
+    """Fail closed on final-only + span-only, an incoherent combo that crashes the actor update
+    with `KeyError: 'teacher_logprobs'`.
+
+    Final-only (OPD_TEACHER_FINAL_ONLY=1) scores the teacher exactly once, on the final chunk over
+    the whole response; non-final chunks carry no teacher tensors at all. Span-only payloads
+    (OPD_HYBRID_SPAN_PAYLOAD=1 + OPD_HYBRID_FULL_SAMPLE=1) then STRIP that final chunk's
+    whole-response teacher tensors from its carrier, expecting the per-parent accumulator to stitch
+    them back from each chunk's new span -- but the F-mode drain reuses the carrier DIRECTLY (no
+    accumulator, no stitch), so the assembled batch ends up with teacher/* telemetry but no
+    teacher_logprobs/teacher_ids, and the distillation loss dies indexing data["teacher_logprobs"].
+
+    Span-only buys nothing in final-only mode (one teacher call; the single labeled chunk must carry
+    whole-response labels regardless), so the combo is rejected rather than special-cased. Run
+    final-only on the full-sample carrier (OPD_HYBRID_SPAN_PAYLOAD=0), or unset OPD_TEACHER_FINAL_ONLY
+    to use the incremental per-parent span path (which the accumulator/FIFO are built for)."""
+    if final_only_teacher_enabled() and hybrid_span_payload_enabled():
+        raise ValueError(
+            "Incompatible OPD flags: OPD_TEACHER_FINAL_ONLY=1 cannot be combined with span-only "
+            "payloads (OPD_HYBRID_SPAN_PAYLOAD=1 + OPD_HYBRID_FULL_SAMPLE=1). Final-only scores only "
+            "the final chunk, so span-only strips the whole-response teacher labels from the carrier "
+            "and the per-parent stitch never runs -> the actor update crashes with "
+            "KeyError: 'teacher_logprobs'. Fix: set OPD_HYBRID_SPAN_PAYLOAD=0 to run final-only on "
+            "the full-sample carrier, or unset OPD_TEACHER_FINAL_ONLY to use the incremental span path."
+        )
+
+
 # Canonical per-sample fields an upstream completed-sample OPD example carries, so the
 # reconstructed sample is schema-indistinguishable to the existing actor-training path.
 CANONICAL_SAMPLE_KEYS = (

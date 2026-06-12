@@ -467,9 +467,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         from verl.experimental.fully_async_policy.hybrid_assembler import (
             ParentLabelAccumulator,
             aggregate_teacher_telemetry,
+            assert_payload_flags_compatible,
             fill_carrier_teacher_tensors,
             span_from_chunk,
         )
+
+        # Fail closed on final-only + span-only: F mode reuses the (stripped) carrier directly below,
+        # so span-only payloads would leave the assembled batch without teacher_logprobs -> the actor
+        # update dies with KeyError. Reject here too (not just rollouter startup) for trainer-only paths.
+        assert_payload_flags_compatible()
 
         if not hasattr(self, "_hybrid_accumulators"):
             self._hybrid_accumulators: dict[str, ParentLabelAccumulator] = {}

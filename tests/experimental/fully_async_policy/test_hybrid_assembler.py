@@ -268,6 +268,60 @@ def test_aggregate_teacher_telemetry():
     assert aggregate_teacher_telemetry([]) == {}
 
 
+def test_final_only_plus_span_only_is_rejected():
+    """F + span-only is an incoherent combo: final-only scores ONLY the final chunk (whole response),
+    span-only then STRIPS that chunk's whole-response teacher labels from the carrier, and the F-drain
+    reuses the carrier directly with no stitch -> assembled batch has no teacher_logprobs -> the actor
+    update crashes with KeyError. assert_payload_flags_compatible() must reject it; every other flag
+    combination (F on the full carrier, span-only on the incremental path, span-without-full) is fine.
+
+    Regression for repro job 19191849 (opd_mtx_F_4096_19191849.log)."""
+    import os
+
+    from verl.experimental.fully_async_policy.hybrid_assembler import assert_payload_flags_compatible
+
+    keys = ("OPD_TEACHER_FINAL_ONLY", "OPD_HYBRID_SPAN_PAYLOAD", "OPD_HYBRID_FULL_SAMPLE")
+    saved = {k: os.environ.get(k) for k in keys}
+
+    def _set(final_only, span, full):
+        for k, v in zip(keys, (final_only, span, full)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    try:
+        # The crashing combo: must raise ValueError, and the message must name the failing key + the fix.
+        _set("1", "1", "1")
+        raised = None
+        try:
+            assert_payload_flags_compatible()
+        except ValueError as e:
+            raised = e
+        assert raised is not None, "F + span-only must be rejected"
+        msg = str(raised)
+        assert "teacher_logprobs" in msg
+        assert "OPD_HYBRID_SPAN_PAYLOAD=0" in msg  # points at the known-good final-only config
+
+        # F on the full-sample carrier (span payload off) -- the supported final-only path -> OK.
+        _set("1", "0", "1")
+        assert_payload_flags_compatible()
+
+        # span-only on the INCREMENTAL path (final-only off) -- what the accumulator/FIFO are for -> OK.
+        _set("0", "1", "1")
+        assert_payload_flags_compatible()
+
+        # span requested but the hybrid full-sample trainer is off -> span payload not actually enabled -> OK.
+        _set("1", "1", "0")
+        assert_payload_flags_compatible()
+
+        # all default/off -> OK.
+        _set(None, None, None)
+        assert_payload_flags_compatible()
+    finally:
+        _set(saved["OPD_TEACHER_FINAL_ONLY"], saved["OPD_HYBRID_SPAN_PAYLOAD"], saved["OPD_HYBRID_FULL_SAMPLE"])
+
+
 def _raised(fn):
     try:
         fn()
@@ -285,5 +339,7 @@ if __name__ == "__main__":
     test_reorder_tolerant_reassembly()
     test_finalize_is_exactly_once()
     test_aggregate_teacher_telemetry()
-    print("HYBRID ASSEMBLER (A1+H-ACC+SPAN+REORDER+KVTELEM) PASS: stitch==whole; coverage guarded; "
-          "span-slice==carrier; span-only==full; reorder-tolerant; finalize-once; teacher-telemetry-agg")
+    test_final_only_plus_span_only_is_rejected()
+    print("HYBRID ASSEMBLER (A1+H-ACC+SPAN+REORDER+KVTELEM+FFLAGS) PASS: stitch==whole; coverage guarded; "
+          "span-slice==carrier; span-only==full; reorder-tolerant; finalize-once; teacher-telemetry-agg; "
+          "final-only+span-only rejected")
