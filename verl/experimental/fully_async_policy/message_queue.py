@@ -118,9 +118,12 @@ class MessageQueue:
             # Notify waiting consumers
             self._consumer_condition.notify_all()
 
-            if self.total_produced % 100 == 0:
-                print(f"MessageQueue stats: produced={self.total_produced}, queue_size={depth}, "
-                      f"blocked_s={self.producer_blocked_time_s:.1f}, timeout_drops={self.blocked_timeout_drops}")
+            if self.total_produced % 20 == 0:
+                # Observability for steady-state phase analysis: timestamp + produced/consumed/depth so
+                # queue depth can be aligned on wall-clock with the trainer's global_steps timeline.
+                print(f"MQ-TS {time.strftime('%H:%M:%S')} produced={self.total_produced} "
+                      f"consumed={self.total_consumed} queue_size={depth} "
+                      f"blocked_s={self.producer_blocked_time_s:.1f} timeout_drops={self.blocked_timeout_drops}")
             if is_drop:
                 return False
             return True
