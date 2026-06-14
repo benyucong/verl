@@ -218,6 +218,19 @@ class AsyncTeacherLLMServerManager:
             "fifo_score_s": fifo_score_s,
             "fifo_snapshot": self._fifo.snapshot() if fifo_on else None,
         }
+        if os.environ.get("OPD_TAIL_DEBUG", "0") not in ("0", "", "false", "False"):
+            # Tail-latency probe (observability only): per teacher call, the post-generation teacher work.
+            # U-mem path = ONE call/response (incremental=False) -> latency_s is the full-response teacher
+            # tail. OPDFlow = per-chunk; the is_final call's (fifo_wait_s + latency_s) is its tail, earlier
+            # chunks having overlapped with generation. Aligned by wall-clock + session_id offline.
+            logging.getLogger(__name__).warning(
+                "[TAIL] ts=%.3f sid=%s is_final=%s incr=%s total_tok=%s latency_s=%.4f fifo_wait_s=%s "
+                "queue_wait_s=%s span=%s",
+                time.time(), str(session_id)[-16:], is_final, bool(incremental), len(sequence_ids),
+                latency_s, (round(fifo_wait_s, 4) if fifo_wait_s is not None else None),
+                ef.get("queue_wait_s"),
+                f"[{span_start},{span_end})" if span_start is not None else "full",
+            )
 
         if not incremental:
             # Full-sequence labels (shape [S, (1 or K)]).
