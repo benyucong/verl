@@ -66,6 +66,12 @@ class MessageQueue:
         self.producer_blocked_time_s = 0.0
         self.producer_block_events = 0
         self.blocked_timeout_drops = 0
+        # Observability (idle-attribution): cumulative time the CONSUMER (trainer) spends
+        # blocked in get_sample() waiting for input. High => the trainer is STARVED, i.e. the
+        # teacher/rollouter sits on its critical path; ~0 => the queue always has a backlog so
+        # downstream teacher latency is hidden from the trainer. Pure metric, no behavior change.
+        self.consumer_blocked_time_s = 0.0
+        self.consumer_block_events = 0
         self.max_queue_depth = 0
         self._depth_samples: deque = deque(maxlen=4096)  # for p50/p95 depth
 
@@ -123,7 +129,8 @@ class MessageQueue:
                 # queue depth can be aligned on wall-clock with the trainer's global_steps timeline.
                 print(f"MQ-TS {time.strftime('%H:%M:%S')} produced={self.total_produced} "
                       f"consumed={self.total_consumed} queue_size={depth} "
-                      f"blocked_s={self.producer_blocked_time_s:.1f} timeout_drops={self.blocked_timeout_drops}")
+                      f"blocked_s={self.producer_blocked_time_s:.1f} timeout_drops={self.blocked_timeout_drops} "
+                      f"consumer_blocked_s={self.consumer_blocked_time_s:.1f} consumer_block_events={self.consumer_block_events}")
             if is_drop:
                 return False
             return True
@@ -136,8 +143,15 @@ class MessageQueue:
             Any: Single sample data or None if queue is closed
         """
         async with self._lock:
-            while len(self.queue) == 0 and self.running:
-                await self._consumer_condition.wait()
+            if len(self.queue) == 0 and self.running:
+                # Idle-attribution observability: time how long the trainer blocks here waiting
+                # for a sample. Equivalent to the original `while` (if the queue is non-empty the
+                # loop never ran either) -- purely additive timing, no semantic change.
+                _blk_start = time.monotonic()
+                self.consumer_block_events += 1
+                while len(self.queue) == 0 and self.running:
+                    await self._consumer_condition.wait()
+                self.consumer_blocked_time_s += time.monotonic() - _blk_start
 
             # If queue is closed and empty, return None
             if not self.running and len(self.queue) == 0:
@@ -172,6 +186,8 @@ class MessageQueue:
                 "producer_blocked_time_s": self.producer_blocked_time_s,
                 "producer_block_events": self.producer_block_events,
                 "blocked_timeout_drops": self.blocked_timeout_drops,
+                "consumer_blocked_time_s": self.consumer_blocked_time_s,
+                "consumer_block_events": self.consumer_block_events,
                 "queue_depth_p50": _pct(0.50),
                 "queue_depth_p95": _pct(0.95),
                 "queue_depth_max": self.max_queue_depth,
