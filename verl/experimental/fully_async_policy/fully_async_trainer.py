@@ -418,10 +418,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             return None, None
         total_wait_time = consumer_end - consumer_start
 
+        try:
+            _qs = await self.message_queue_client.get_statistics()
+        except Exception:
+            _qs = {}
         print(
             f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
             f"total wait time: {total_wait_time:.2f} seconds. "
-            f"mq_len: {queue_len}"
+            f"mq_len: {queue_len} "
+            f"consumer_blocked_s={_qs.get('consumer_blocked_time_s', 0.0):.1f} "
+            f"consumer_block_events={_qs.get('consumer_block_events', 0)} "
+            f"producer_blocked_s={_qs.get('producer_blocked_time_s', 0.0):.1f}"
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
@@ -634,7 +641,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         m["fully_async/hybrid/blocked_timeout_drops"] = qstats.get("blocked_timeout_drops", 0)
         tele = aggregate_teacher_telemetry(teacher_records)
         m.update(tele)
-        print(f"[FullyAsyncTrainer][H-ACC] assembled {len(rollout_samples)} rows; recv={spans_received}; stitched={parents_stitched}; gap={span_gap_count}; fallback={coverage_fallback}; drop={span_drop_count}; blocked_s={qstats.get('producer_blocked_time_s', 0.0):.1f}; qdepth_p95={qstats.get('queue_depth_p95', 0)}; wait {consumer_end - consumer_start:.1f}s", flush=True)
+        print(f"[FullyAsyncTrainer][H-ACC] assembled {len(rollout_samples)} rows; recv={spans_received}; stitched={parents_stitched}; gap={span_gap_count}; fallback={coverage_fallback}; drop={span_drop_count}; blocked_s={qstats.get('producer_blocked_time_s', 0.0):.1f}; consumer_blocked_s={qstats.get('consumer_blocked_time_s', 0.0):.1f}; consumer_block_events={qstats.get('consumer_block_events', 0)}; qdepth_p95={qstats.get('queue_depth_p95', 0)}; wait {consumer_end - consumer_start:.1f}s", flush=True)
         if tele:
             print(f"[FullyAsyncTrainer][TEACHER] cache_hit_ratio={tele.get('teacher/cache_hit_ratio', 0):.3f}; "
                   f"cached={tele.get('teacher/cached_tokens', 0)}; uncached={tele.get('teacher/uncached_tokens', 0)}; "
