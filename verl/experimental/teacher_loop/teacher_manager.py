@@ -181,6 +181,10 @@ class AsyncTeacherLLMServerManager:
                 video_data=multi_modal_data.get("videos"),
                 audio_data=multi_modal_data.get("audios"),
                 mm_processor_kwargs=mm_processor_kwargs,
+                # Parent-aware routing: account this sticky parent (only when stable routing is on)
+                # and release its parent-debt on the final chunk. No-op under the default policy.
+                track_parent=bool(use_stable_routing),
+                is_final=bool(is_final),
             )
 
         fifo_on = (

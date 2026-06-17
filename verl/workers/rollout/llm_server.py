@@ -57,21 +57,40 @@ class GlobalRequestLoadBalancer:
       for hybrid scaling.
     """
 
-    def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
+    def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
+                 policy: str = "inflight", expected_chunks_per_parent: int = 8):
         if not servers:
             raise ValueError("servers must be non-empty")
 
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        # Parent-aware (OPDFlow) routing. A sticky "parent" (request_id) is a STREAM of future chunk
+        # calls, not one request; least-in-flight is myopic for it (it ignores the assigned-but-not-yet
+        # -arrived chunks). Policies for selecting the replica for a NEW parent:
+        #   inflight    -> least current in-flight chunk-calls (DEFAULT; unchanged behavior)
+        #   parents     -> least active (assigned, not-yet-final) parents
+        #   future_debt -> least (in_flight_chunks + active_parents * expected_chunks_per_parent)
+        # Sticky routing of an already-assigned parent is UNCHANGED (preserves KV reuse +
+        # uniq_replicas/parent=1.00). Parent accounting only happens when the caller opts in via
+        # track_parent=True; non-sticky one-offs (clean-recompute uuid ids) pass track_parent=False
+        # -> inflight select, no accounting -> no leak.
+        self._policy: str = policy if policy in ("inflight", "parents", "future_debt") else "inflight"
+        self._expected_chunks: int = max(1, int(expected_chunks_per_parent))
+        self._active_parents: dict[str, int] = {sid: 0 for sid in servers}
+        self._parent_assigned: dict[str, int] = {sid: 0 for sid in servers}   # cumulative (telemetry)
+        self._parent_completed: dict[str, int] = {sid: 0 for sid in servers}  # cumulative (telemetry)
+        self._assign_log_counter: int = 0
+        logger.info(f"[GlobalLoadBalancer] policy={self._policy} expected_chunks_per_parent={self._expected_chunks}")
 
-    def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
-        """Acquire a server for the given request (sticky + least-loaded).
+    def acquire_server(self, request_id: str, track_parent: bool = False) -> tuple[str, ray.actor.ActorHandle]:
+        """Acquire a server for the given request (sticky + policy-based selection).
 
-        Returns:
-            A tuple of ``(server_id, actor_handle)`` in a single atomic call.
+        track_parent=True opts a sticky parent into parent-aware accounting/selection (OPDFlow
+        teacher chunks). Returns ``(server_id, actor_handle)`` in a single atomic call.
         """
-        # Try sticky session first
+        # Sticky session: an already-assigned parent ALWAYS routes to the same replica (preserves
+        # KV reuse + uniq_replicas/parent=1.00). Policy only affects selection of a NEW parent.
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still in the active pool
@@ -81,21 +100,62 @@ class GlobalRequestLoadBalancer:
             # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
 
-        # Select new server (least-loaded among available)
         if not self._inflight_requests:
             raise RuntimeError("No available servers in load balancer")
 
-        server_id = min(self._inflight_requests, key=self._inflight_requests.get)
+        # New parent/request_id -> select by policy (over LIVE servers = inflight keys).
+        if track_parent and self._policy == "parents":
+            server_id = min(self._inflight_requests, key=lambda s: self._active_parents.get(s, 0))
+        elif track_parent and self._policy == "future_debt":
+            server_id = min(
+                self._inflight_requests,
+                key=lambda s: self._inflight_requests[s] + self._active_parents.get(s, 0) * self._expected_chunks,
+            )
+        else:
+            server_id = min(self._inflight_requests, key=self._inflight_requests.get)
+
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
+        if track_parent:
+            self._active_parents[server_id] = self._active_parents.get(server_id, 0) + 1
+            self._parent_assigned[server_id] = self._parent_assigned.get(server_id, 0) + 1
+            self._maybe_log_lb()
         return server_id, self._servers[server_id]
 
     def release_server(self, server_id: str) -> None:
-        """Release a server after a request completes."""
+        """Release a server after a chunk-call completes (decrement in-flight)."""
         if server_id not in self._inflight_requests:
             return
         if self._inflight_requests[server_id] > 0:
             self._inflight_requests[server_id] -= 1
+
+    def release_parent(self, request_id: str) -> None:
+        """Release a parent's future-debt when its FINAL chunk completes (parent-aware policies).
+
+        Decrements the active-parent count; does NOT evict the sticky cache entry, so any straggler
+        chunk still routes to the same replica (the LRU evicts the entry naturally later)."""
+        server_id = self._request_id_to_server.get(request_id)
+        if server_id is None or server_id not in self._active_parents:
+            return
+        if self._active_parents[server_id] > 0:
+            self._active_parents[server_id] -= 1
+        self._parent_completed[server_id] = self._parent_completed.get(server_id, 0) + 1
+
+    def _maybe_log_lb(self) -> None:
+        """Periodic balance telemetry (every 20 new-parent assignments)."""
+        self._assign_log_counter += 1
+        if self._assign_log_counter % 20 != 0:
+            return
+        ap = dict(sorted(self._active_parents.items()))
+        loads = list(ap.values())
+        eta = ((sum(loads) / len(loads)) / max(loads)) if loads and max(loads) > 0 else 1.0
+        print(
+            f"[TEACHER-LB] policy={self._policy} active_parents={ap} "
+            f"inflight={dict(sorted(self._inflight_requests.items()))} "
+            f"assigned={dict(sorted(self._parent_assigned.items()))} "
+            f"completed={dict(sorted(self._parent_completed.items()))} eta_balance={eta:.3f}",
+            flush=True,
+        )
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         """Atomically add multiple servers to the load balancer pool.
@@ -109,6 +169,9 @@ class GlobalRequestLoadBalancer:
         """
         for sid, handle in servers.items():
             self._inflight_requests[sid] = 0
+            self._active_parents[sid] = 0
+            self._parent_assigned[sid] = 0
+            self._parent_completed[sid] = 0
             self._servers[sid] = handle
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
@@ -166,9 +229,9 @@ class LLMServerClient:
         self.config = config
         self._load_balancer = load_balancer_handle
 
-    async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    async def _acquire_server(self, request_id: str, track_parent: bool = False) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
-        return await self._load_balancer.acquire_server.remote(request_id=request_id)
+        return await self._load_balancer.acquire_server.remote(request_id=request_id, track_parent=track_parent)
 
     def _release_server(self, server_id: str) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
@@ -186,6 +249,8 @@ class LLMServerClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        is_final: bool = False,
+        track_parent: bool = False,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -194,11 +259,13 @@ class LLMServerClient:
             request_id (str): request id for sticky session.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            is_final (bool): OPDFlow -- this is the parent's final chunk; release its parent-debt.
+            track_parent (bool): OPDFlow -- account this sticky parent for parent-aware routing.
 
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        server_id, server = await self._acquire_server(request_id, track_parent=track_parent)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -217,6 +284,10 @@ class LLMServerClient:
             return output
         finally:
             self._release_server(server_id)
+            # OPDFlow: when a tracked parent's final chunk completes, release its parent-debt so the
+            # parent-aware policies see the replica free up. Fire-and-forget (counter decrement).
+            if is_final and track_parent:
+                self._load_balancer.release_parent.remote(request_id=request_id)
 
 
 class LLMServerManager:
