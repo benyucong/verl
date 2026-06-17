@@ -25,6 +25,8 @@ from verl.workers.config import ActorConfig, DistillationConfig, DistillationLos
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
 
+_TOKEN_SELECT_LOG_COUNTER = 0
+
 DistillationLossFn = Callable[
     [
         ActorConfig,  # actor_config
@@ -255,6 +257,118 @@ def _compute_rollout_drift_surrogate(model_output: dict, data: TensorDict) -> di
         return {}
 
 
+def _minmax01_clip(x: torch.Tensor, valid: torch.Tensor, clip_q: float = 0.98) -> torch.Tensor:
+    """Clip the top (1-clip_q) at the batch percentile over valid tokens, then min-max -> [0,1] (0 outside valid).
+
+    Matches TIP's "clip at 98th batch percentile, then min-max normalize" for the Soft-OR inputs.
+    """
+    xv = x[valid].float()
+    if xv.numel() == 0:
+        return torch.zeros_like(x, dtype=torch.float32)
+    hi = torch.quantile(xv, clip_q)
+    xc = torch.minimum(x.float(), hi)
+    lo = xv.min()
+    denom = (torch.minimum(xv, hi).max() - lo).clamp(min=1e-8)
+    out = ((xc - lo) / denom).clamp(0.0, 1.0)
+    return torch.where(valid, out, torch.zeros_like(out))
+
+
+def _token_select_log_metrics(h, delta, score, valid, select) -> dict[str, Any]:
+    """Diagnostic metrics: retained-vs-dropped means + Q1-Q4 retained fractions (median split of h x delta)."""
+    m: dict[str, Any] = {}
+    dropped = valid & (~select)
+
+    def _mean(t, msk):
+        msk = msk & valid
+        return t[msk].float().mean().item() if msk.any() else 0.0
+
+    if h is not None:
+        m["token_select/entropy_retained"] = _mean(h, select)
+        m["token_select/entropy_dropped"] = _mean(h, dropped)
+    m["token_select/divergence_retained"] = _mean(delta, select)
+    m["token_select/divergence_dropped"] = _mean(delta, dropped)
+    m["token_select/score_retained"] = _mean(score, select)
+    m["token_select/score_dropped"] = _mean(score, dropped)
+    if h is not None and valid.any():
+        hmed = h[valid].float().median()
+        dmed = delta[valid].float().median()
+        hi_h, hi_d = (h >= hmed), (delta >= dmed)
+        # Q1 high-h/high-d, Q2 high-h/low-d, Q3 low-h/high-d (TIP blind spot), Q4 low-h/low-d
+        quads = {"Q1": hi_h & hi_d, "Q2": hi_h & (~hi_d), "Q3": (~hi_h) & hi_d, "Q4": (~hi_h) & (~hi_d)}
+        n_valid = valid.sum().clamp(min=1)
+        for name, q in quads.items():
+            qv = q & valid
+            qc = qv.sum()
+            kept = (qv & select).sum()
+            m[f"token_select/{name}_frac_of_valid"] = (qc / n_valid).item()
+            m[f"token_select/{name}_retained_frac"] = (kept / qc.clamp(min=1)).item() if qc > 0 else 0.0
+    return m
+
+
+def _compute_token_selection(distillation_losses, student_entropy, response_mask, loss_config):
+    """TIP-style post-teacher token selection. Returns (select_mask [B,T] float in {0,1}, metrics).
+
+    select_mask is 1 exactly where the token is retained, always 0 outside response_mask. When
+    mode=='none' or retention>=1.0 it returns response_mask itself (=> byte-equivalent loss). The
+    selection signal is detached (never backpropagated through).
+
+    Axes: h_t = full-vocab student entropy (exact, from the processor); delta_t = per-token
+    distillation_losses (forward-KL over teacher top-k support, the in-system divergence analog).
+    """
+    mode = loss_config.token_select_mode
+    rho = float(loss_config.token_retention)
+    scope = loss_config.token_select_scope
+    valid = response_mask.bool()
+    metrics: dict[str, Any] = {}
+    if mode == "none" or rho >= 1.0:
+        return valid.float(), metrics
+
+    delta = distillation_losses.detach().float()
+    if mode == "entropy":
+        if student_entropy is None:
+            raise ValueError(
+                "OPD_TOKEN_SELECT_MODE=entropy requires per-token student_entropy in model_output "
+                "(computed in the forward_kl_topk logits processor); none found. Is the loss_mode "
+                "forward_kl_topk on the FSDP path?"
+            )
+        score = student_entropy.detach().float()
+    else:  # soft_or
+        if student_entropy is None:
+            raise ValueError("OPD_TOKEN_SELECT_MODE=soft_or requires per-token student_entropy in model_output; none found.")
+        h_hat = _minmax01_clip(student_entropy.detach(), valid)
+        d_hat = _minmax01_clip(delta, valid)
+        score = h_hat + d_hat - h_hat * d_hat
+
+    neg = torch.finfo(score.dtype).min
+    score_v = torch.where(valid, score, torch.full_like(score, neg))
+
+    if scope == "response":
+        n_i = valid.sum(dim=1)  # [B]
+        k_i = torch.clamp((rho * n_i.float()).floor().long(), min=1)
+        k_i = torch.minimum(k_i, n_i.long())  # cannot exceed row's valid count
+        order = score_v.argsort(dim=1, descending=True)  # [B,T]
+        ranks = torch.empty_like(order)
+        ranks.scatter_(1, order, torch.arange(score_v.shape[1], device=score_v.device).expand_as(order))
+        select = (ranks < k_i.unsqueeze(1)) & valid
+    else:  # batch (per-micro-batch global top-rho)
+        flat = score_v[valid]
+        n = int(valid.sum().item())
+        if n == 0:
+            return valid.float(), metrics
+        k = max(1, int(rho * n))
+        thresh = torch.topk(flat, k).values.min()
+        select = (score_v >= thresh) & valid
+
+    if loss_config.token_select_log:
+        metrics.update(_token_select_log_metrics(h=student_entropy, delta=delta, score=score, valid=valid, select=select))
+    n_sel, n_val = select.sum(), valid.sum()
+    metrics["token_select/retained_frac"] = (n_sel / n_val.clamp(min=1)).item()
+    metrics["token_select/retained_tokens"] = float(n_sel.item())
+    metrics["token_select/valid_tokens"] = float(n_val.item())
+    metrics["token_select/retention_target"] = rho
+    return select.float(), metrics
+
+
 def distillation_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -326,11 +440,51 @@ def distillation_loss(
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
+        loss_mask = response_mask
+        gbi = config.global_batch_info
+        # --- TIP-style post-teacher token selection (default OFF => the call below is byte-identical) ---
+        if loss_config.token_select_mode != "none" and loss_config.token_retention < 1.0:
+            student_entropy = model_output.get("student_entropy")
+            if student_entropy is not None:
+                student_entropy = no_padding_2_padding(student_entropy, data)
+            select_mask, sel_metrics = _compute_token_selection(
+                distillation_losses=distillation_losses,
+                student_entropy=student_entropy,
+                response_mask=response_mask,
+                loss_config=loss_config,
+            )
+            distillation_metrics.update(sel_metrics)
+            global _TOKEN_SELECT_LOG_COUNTER
+            _TOKEN_SELECT_LOG_COUNTER += 1
+            if _TOKEN_SELECT_LOG_COUNTER % 20 == 1:
+                print(
+                    f"[TOKEN-SELECT] mode={loss_config.token_select_mode} ret={loss_config.token_retention} "
+                    f"scope={loss_config.token_select_scope} "
+                    f"retained_frac={sel_metrics.get('token_select/retained_frac')} "
+                    f"retained_tok={sel_metrics.get('token_select/retained_tokens')} "
+                    f"ent_ret={sel_metrics.get('token_select/entropy_retained')} "
+                    f"ent_drop={sel_metrics.get('token_select/entropy_dropped')} "
+                    f"div_ret={sel_metrics.get('token_select/divergence_retained')} "
+                    f"div_drop={sel_metrics.get('token_select/divergence_dropped')} "
+                    f"Q3_ret={sel_metrics.get('token_select/Q3_retained_frac')}",
+                    flush=True,
+                )
+            loss_mask = response_mask.bool().float() * select_mask
+            # Faithful TIP loss = MEAN over SELECTED tokens (not full-token down-weighting). agg_loss
+            # token-mean divides by the DP-global batch_num_tokens; scale it by the per-rank retained
+            # fraction so the denominator becomes ~the global selected-token count (exact when the
+            # retained fraction is uniform across DP ranks, which holds to high precision for large
+            # micro-batches). Byte-equivalent when retention=1.0 (n_sel==n_val => ratio 1).
+            n_val = response_mask.bool().sum()
+            n_sel = loss_mask.sum()
+            if n_sel > 0 and gbi.get("batch_num_tokens"):
+                gbi = dict(gbi)
+                gbi["batch_num_tokens"] = gbi["batch_num_tokens"] * (n_sel / n_val.clamp(min=1)).item()
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
-            loss_mask=response_mask,
+            loss_mask=loss_mask,
             loss_agg_mode=loss_agg_mode,
-            **config.global_batch_info,
+            **gbi,
         )
 
     return distillation_loss, distillation_metrics
