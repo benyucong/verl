@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -1103,6 +1104,41 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     task_set=self.active_tasks,
                 )
 
+    def _teacher_keep_response(self, key) -> bool:
+        """Response-level teacher-skip decision (default keep_frac=1.0 => always keep / no-op).
+
+        Decided ONCE per rollout group on the stable group key (== the agent_loop streaming gate's
+        parent_sample_id, since rollout_sample.sample_id == xiaoshuai_parent_sample_id), so both gates make
+        the SAME choice. A skipped group emits zero streaming chunks (agent_loop gate) AND skips the fallback
+        publish here -> zero teacher forward, absent from reconstruction (never an H-ACC gap), telemetry only.
+        Policy 'random' = stable md5 subsample.
+        """
+        if not hasattr(self, "_tk_keep_frac"):
+            self._tk_keep_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
+            self._tk_policy = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random")
+            self._tk_log = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_LOG", "1") not in ("0", "", "false", "False")
+            self._tk_kept = 0
+            self._tk_skipped = 0
+            self.total_teacher_skipped_samples = 0
+            if self._tk_keep_frac < 1.0:
+                print(f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy} (rollouter)", flush=True)
+        if self._tk_keep_frac >= 1.0:
+            return True
+        h = int(hashlib.md5(str(key).encode()).hexdigest()[:8], 16) % 10000
+        keep = h < int(self._tk_keep_frac * 10000)
+        if keep:
+            self._tk_kept += 1
+        else:
+            self._tk_skipped += 1
+        if self._tk_log and (self._tk_kept + self._tk_skipped) % 50 == 1:
+            _tot = self._tk_kept + self._tk_skipped
+            print(
+                f"[TEACHER-SKIP] kept={self._tk_kept} skipped={self._tk_skipped} "
+                f"keep_rate={self._tk_kept / max(1, _tot):.3f} target_keep={self._tk_keep_frac}",
+                flush=True,
+            )
+        return keep
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Stage-0 profiling: mark when generation starts for this sample.
@@ -1187,6 +1223,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     rollout_sample=rollout_sample,
                     emitted_chunks=emitted_chunks,
                 )
+                return
+            # teacher_skipped group: it intentionally produced 0 streaming chunks (the agent_loop gate
+            # suppressed the teacher forward + publish). Do NOT fall through to the scored full-ret fallback
+            # -- that re-enters the skipped response into the teacher queue with a 'score' key and a
+            # padded-length chunk, causing the DataProto.concat key-mismatch crash + add_span shape gap.
+            # Emit nothing; count it as a first-class teacher-skip. Default keep_frac=1.0 => always kept
+            # => fallback path unchanged / byte-equivalent.
+            if not self._teacher_keep_response(rollout_sample.sample_id):
+                self.total_teacher_skipped_samples += 1
                 return
             await self._publish_chunk_samples(rollout_sample)
             return
