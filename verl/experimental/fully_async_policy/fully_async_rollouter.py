@@ -499,6 +499,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
+        # Response-level teacher skip (OPD_TEACHER_RESPONSE_KEEP_FRAC<1) drops ~(1-keep) of responses before
+        # the teacher, so only ~keep of generated responses become trainable. Over-generate by 1/keep (capped
+        # by the dataset) so the same number of KEPT responses arrive -> the trainer still forms the same number
+        # of full batches (same gstep count), while the teacher's per-time scoring load drops to ~keep
+        # (de-saturation -> lower R viable). Default keep=1.0 => no-op/byte-equivalent.
+        _ts_keep = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
+        if _ts_keep < 1.0:
+            _ts_cap = len(self.train_dataloader) * self.config.trainer.total_epochs
+            self.total_rollout_steps = min(int(self.total_rollout_steps / _ts_keep), _ts_cap)
+            print(
+                f"[TEACHER-SKIP] over-generate: total_rollout_steps -> {self.total_rollout_steps} "
+                f"(x{1.0 / _ts_keep:.2f} for keep_frac={_ts_keep}, cap={_ts_cap})",
+                flush=True,
+            )
         print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
         self.total_train_steps = None
 
