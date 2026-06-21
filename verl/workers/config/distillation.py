@@ -109,8 +109,10 @@ class DistillationLossConfig(BaseConfig):
         self.token_select_scope = os.environ.get("OPD_TOKEN_SELECT_SCOPE", self.token_select_scope)
         if "OPD_TOKEN_SELECT_LOG" in os.environ:
             self.token_select_log = bool(int(os.environ["OPD_TOKEN_SELECT_LOG"]))
-        if self.token_select_mode not in ("none", "entropy", "soft_or"):
-            raise ValueError(f"OPD_TOKEN_SELECT_MODE must be none|entropy|soft_or, got {self.token_select_mode!r}")
+        if self.token_select_mode not in ("none", "random", "entropy", "soft_or"):
+            raise ValueError(
+                f"OPD_TOKEN_SELECT_MODE must be none|random|entropy|soft_or, got {self.token_select_mode!r}"
+            )
         if not (0.0 < self.token_retention <= 1.0):
             raise ValueError(f"OPD_TOKEN_RETENTION must be in (0, 1], got {self.token_retention}")
         if self.token_select_scope not in ("response", "batch"):

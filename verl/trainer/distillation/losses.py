@@ -324,7 +324,10 @@ def _compute_token_selection(distillation_losses, student_entropy, response_mask
         return valid.float(), metrics
 
     delta = distillation_losses.detach().float()
-    if mode == "entropy":
+    if mode == "random":
+        # Uniform-random selection among valid response tokens (baseline). No teacher/student signal.
+        score = torch.rand_like(delta)
+    elif mode == "entropy":
         if student_entropy is None:
             raise ValueError(
                 "OPD_TOKEN_SELECT_MODE=entropy requires per-token student_entropy in model_output "
