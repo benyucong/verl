@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -657,6 +658,36 @@ class AgentLoopWorker:
             return default
         return AgentLoopWorker._to_python_scalar(values[0])
 
+    def _teacher_keep_response(self, parent_sample_id) -> bool:
+        """Pre-teacher response-level skip decision (default keep_frac=1.0 => always keep).
+
+        Deterministic per parent_sample_id (consistent across a response's chunks; ~keep_frac kept).
+        Policy 'random' = stable hash subsample. Skipped responses are never scored or published, so
+        the teacher never forwards them -> teacher tokens-forwarded drop ~x keep_frac.
+        """
+        if not hasattr(self, "_tk_keep_frac"):
+            self._tk_keep_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
+            self._tk_policy = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random")
+            self._tk_skipped = 0
+            self._tk_kept = 0
+            if self._tk_keep_frac < 1.0:
+                print(f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy}", flush=True)
+        if self._tk_keep_frac >= 1.0:
+            return True
+        h = int(hashlib.md5(str(parent_sample_id).encode()).hexdigest()[:8], 16) % 10000
+        keep = h < int(self._tk_keep_frac * 10000)
+        if keep:
+            self._tk_kept += 1
+        else:
+            self._tk_skipped += 1
+        if (self._tk_kept + self._tk_skipped) % 50 == 1:
+            print(
+                f"[TEACHER-SKIP] policy={self._tk_policy} keep_frac={self._tk_keep_frac} "
+                f"skipped={self._tk_skipped} kept={self._tk_kept}",
+                flush=True,
+            )
+        return keep
+
     async def _publish_streaming_chunk(
         self,
         output: AgentLoopOutput,
@@ -678,6 +709,12 @@ class AgentLoopWorker:
             return False
         parent_sample_id = self._to_python_scalar(sample_kwargs.get("xiaoshuai_parent_sample_id", sample_id))
         epoch = self._to_python_scalar(sample_kwargs.get("xiaoshuai_epoch", -1))
+
+        # Pre-teacher RESPONSE-LEVEL SKIP: drop this whole response from teacher scoring + chunk publish
+        # (deterministic per parent_sample_id). Skips the teacher forward at _agent_loop_postprocess
+        # below -> cuts teacher tokens-forwarded ~x keep_frac. Default keep_frac=1.0 => no-op.
+        if not self._teacher_keep_response(parent_sample_id):
+            return False
 
         from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
         from verl.experimental.fully_async_policy.opd_stage0_trace import trace_chunk_event
