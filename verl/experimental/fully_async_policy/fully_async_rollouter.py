@@ -505,13 +505,27 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # by the dataset) so the same number of KEPT responses arrive -> the trainer still forms the same number
         # of full batches (same gstep count), while the teacher's per-time scoring load drops to ~keep
         # (de-saturation -> lower R viable). Default keep=1.0 => no-op/byte-equivalent.
+        # Two modes via OPD_TEACHER_RESPONSE_OVERGEN (default 1 = Mode A):
+        #   Mode A (overgen=1, constant supervised batch): inflate budget by 1/keep so the same number of
+        #     KEPT responses arrive -> same gstep count; teacher per-time load drops to ~keep (de-saturation,
+        #     lower R viable). Cost: ~1/keep x rollout/wall.
+        #   Mode B (overgen=0, constant rollout budget): do NOT inflate; the trainer still forms full batches
+        #     but does ~keep x fewer updates over the fixed budget, so TOTAL teacher work drops to ~keep at
+        #     the same wall-clock (the "same fixed dataset -> ~half teacher work" mode).
         _ts_keep = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
-        if _ts_keep < 1.0:
+        _ts_overgen = os.environ.get("OPD_TEACHER_RESPONSE_OVERGEN", "1") not in ("0", "", "false", "False")
+        if _ts_keep < 1.0 and _ts_overgen:
             _ts_cap = len(self.train_dataloader) * self.config.trainer.total_epochs
             self.total_rollout_steps = min(int(self.total_rollout_steps / _ts_keep), _ts_cap)
             print(
-                f"[TEACHER-SKIP] over-generate: total_rollout_steps -> {self.total_rollout_steps} "
+                f"[TEACHER-SKIP] mode=A over-generate: total_rollout_steps -> {self.total_rollout_steps} "
                 f"(x{1.0 / _ts_keep:.2f} for keep_frac={_ts_keep}, cap={_ts_cap})",
+                flush=True,
+            )
+        elif _ts_keep < 1.0:
+            print(
+                f"[TEACHER-SKIP] mode=B constant-rollout-budget (no over-gen): keep_frac={_ts_keep} -> "
+                f"~{_ts_keep:.2f}x total teacher work over the fixed budget, ~{_ts_keep:.2f}x updates",
                 flush=True,
             )
         print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
