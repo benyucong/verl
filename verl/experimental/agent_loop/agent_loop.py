@@ -658,34 +658,116 @@ class AgentLoopWorker:
             return default
         return AgentLoopWorker._to_python_scalar(values[0])
 
-    def _teacher_keep_response(self, parent_sample_id) -> bool:
+    def _teacher_keep_response(self, parent_sample_id, surprisal_agg=None) -> bool:
         """Pre-teacher response-level skip decision (default keep_frac=1.0 => always keep).
 
-        Deterministic per parent_sample_id (consistent across a response's chunks; ~keep_frac kept).
-        Policy 'random' = stable hash subsample. Skipped responses are never scored or published, so
-        the teacher never forwards them -> teacher tokens-forwarded drop ~x keep_frac.
+        Decided ONCE per parent_sample_id and cached, so all N responses of a parent group (and every
+        chunk) get the SAME keep/skip -> parent-level all-or-nothing.
+        Policies:
+          'random'           : stable md5(parent_sample_id) subsample (default; teacher-free, content-free).
+          'entropy_surprisal': teacher-free TIP-inspired proxy -- keep if the first-deciding response's
+                               first-chunk STUDENT sampled-token surprisal aggregate (top20%-mean of
+                               -log p_student, passed as surprisal_agg) >= threshold (uncertain student ->
+                               keep; confident -> skip). NOT full TIP: teacher-student divergence is
+                               unavailable before the teacher runs, so surprisal is a pre-teacher proxy.
+                               surprisal_agg=None (signal unreachable, e.g. logprobs off) -> stable md5.
+        Skipped responses are never scored or published -> teacher tokens-forwarded drop ~x keep_frac.
         """
         if not hasattr(self, "_tk_keep_frac"):
             self._tk_keep_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
             self._tk_policy = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random")
+            _thr_env = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_UNCERTAINTY_THRESHOLD", "auto")
+            try:
+                self._tk_threshold = float(_thr_env)  # >0: fixed threshold; <=0/"auto": sliding-window quantile
+            except ValueError:
+                self._tk_threshold = 0.0
+            self._tk_surp_window = []  # recent surprisal aggregates -> auto-quantile threshold (targets keep_frac)
             self._tk_skipped = 0
             self._tk_kept = 0
+            # Group-consistency cache: parent_sample_id -> keep/skip. Relies on the whole parent group
+            # (all N GRPO responses) being dispatched to ONE AgentLoopWorker: the fully-async path uses
+            # generate_sequences_single() -> _select_best_worker(), which sends the full group batch to a
+            # single worker (NO .chunk()), so the N async tasks share this cache and the first arriver's
+            # decision is reused by every sibling + chunk. (If that dispatch ever shards a group across
+            # workers, content-policy group-consistency would need a shared registry instead.)
+            self._tk_decisions = {}  # first arriver decides; siblings reuse
+            self._tk_kept_surp = []
+            self._tk_skip_surp = []
             if self._tk_keep_frac < 1.0:
-                print(f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy}", flush=True)
+                _thr_disp = f"{self._tk_threshold}" if self._tk_threshold > 0 else "auto-quantile"
+                print(
+                    f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy} "
+                    f"threshold={_thr_disp}",
+                    flush=True,
+                )
         if self._tk_keep_frac >= 1.0:
             return True
-        h = int(hashlib.md5(str(parent_sample_id).encode()).hexdigest()[:8], 16) % 10000
-        keep = h < int(self._tk_keep_frac * 10000)
+        if parent_sample_id in self._tk_decisions:
+            return self._tk_decisions[parent_sample_id]
+        if self._tk_policy == "entropy_surprisal" and surprisal_agg is not None:
+            # Keep the most-uncertain ~keep_frac of groups. Default threshold is an auto sliding-window
+            # quantile at (1-keep_frac) -> targets keep_frac for a fair equal-budget comparison vs random;
+            # a positive OPD_TEACHER_RESPONSE_SKIP_UNCERTAINTY_THRESHOLD overrides with a fixed value.
+            if self._tk_threshold > 0:
+                _thr = self._tk_threshold
+            elif len(self._tk_surp_window) >= 8:
+                import numpy as _np
+
+                _thr = float(_np.quantile(self._tk_surp_window, 1.0 - self._tk_keep_frac))
+            else:
+                _thr = None  # cold start -> stable md5 until the window fills
+            self._tk_surp_window.append(float(surprisal_agg))
+            self._tk_surp_window = self._tk_surp_window[-512:]
+            if _thr is not None:
+                keep = surprisal_agg >= _thr
+            else:
+                h = int(hashlib.md5(str(parent_sample_id).encode()).hexdigest()[:8], 16) % 10000
+                keep = h < int(self._tk_keep_frac * 10000)
+            # record surprisal vs decision for the kept-vs-skipped separation telemetry (all decisions)
+            if keep:
+                self._tk_kept_surp.append(float(surprisal_agg))
+                self._tk_kept_surp = self._tk_kept_surp[-2000:]
+            else:
+                self._tk_skip_surp.append(float(surprisal_agg))
+                self._tk_skip_surp = self._tk_skip_surp[-2000:]
+        else:
+            h = int(hashlib.md5(str(parent_sample_id).encode()).hexdigest()[:8], 16) % 10000
+            keep = h < int(self._tk_keep_frac * 10000)
+        self._tk_decisions[parent_sample_id] = keep
+        if len(self._tk_decisions) > 50000:
+            # FIFO-evict oldest entries to bound memory on very long runs. Safe: a parent is queried only
+            # during its own (short) generation, so entries this old are long-completed and never re-queried.
+            for _k in list(self._tk_decisions)[:10000]:
+                del self._tk_decisions[_k]
         if keep:
             self._tk_kept += 1
         else:
             self._tk_skipped += 1
-        if (self._tk_kept + self._tk_skipped) % 50 == 1:
+        _tot = self._tk_kept + self._tk_skipped
+        if _tot % 20 == 1:
             print(
                 f"[TEACHER-SKIP] policy={self._tk_policy} keep_frac={self._tk_keep_frac} "
-                f"skipped={self._tk_skipped} kept={self._tk_kept}",
+                f"kept={self._tk_kept} skipped={self._tk_skipped} keep_rate={self._tk_kept / max(1, _tot):.3f}",
                 flush=True,
             )
+            if self._tk_policy == "entropy_surprisal":
+                import statistics as _st
+
+                _all = self._tk_kept_surp + self._tk_skip_surp
+                if _all:
+                    _s = sorted(_all)
+                    _p = lambda q: _s[min(len(_s) - 1, int(q * len(_s)))]
+                    _km = f"{_st.mean(self._tk_kept_surp):.3f}" if self._tk_kept_surp else "na"
+                    _sm = f"{_st.mean(self._tk_skip_surp):.3f}" if self._tk_skip_surp else "na"
+                    print(
+                        f"[TEACHER-SKIP-SIGNAL] surprisal_mean={_st.mean(_all):.3f} "
+                        f"surprisal_p50={_p(0.5):.3f} surprisal_p95={_p(0.95):.3f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[TEACHER-SKIP-PRIORITY] kept_surprisal_mean={_km} skipped_surprisal_mean={_sm}",
+                        flush=True,
+                    )
         return keep
 
     async def _publish_streaming_chunk(
@@ -710,10 +792,26 @@ class AgentLoopWorker:
         parent_sample_id = self._to_python_scalar(sample_kwargs.get("xiaoshuai_parent_sample_id", sample_id))
         epoch = self._to_python_scalar(sample_kwargs.get("xiaoshuai_epoch", -1))
 
-        # Pre-teacher RESPONSE-LEVEL SKIP: drop this whole response from teacher scoring + chunk publish
-        # (deterministic per parent_sample_id). Skips the teacher forward at _agent_loop_postprocess
-        # below -> cuts teacher tokens-forwarded ~x keep_frac. Default keep_frac=1.0 => no-op.
-        if not self._teacher_keep_response(parent_sample_id):
+        # Pre-teacher RESPONSE-LEVEL SKIP: drop this whole response from teacher scoring + chunk publish.
+        # For the entropy_surprisal policy, compute a teacher-free STUDENT-surprisal proxy from this
+        # (first) chunk's sampled-token logprobs (top20%-mean of -log p); the decision is made once per
+        # parent and cached, so all N group responses agree. Skips the teacher forward at
+        # _agent_loop_postprocess below -> cuts teacher tokens-forwarded ~x keep_frac. keep_frac=1.0 => no-op.
+        _surprisal_agg = None
+        if (
+            os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random") == "entropy_surprisal"
+            and parent_sample_id not in getattr(self, "_tk_decisions", {})
+        ):
+            _lp = getattr(output, "response_logprobs", None)
+            if _lp:
+                import numpy as _np
+
+                _s = -_np.asarray(_lp, dtype=float)
+                _s = _s[_np.isfinite(_s)]
+                if _s.size:
+                    _k = max(1, int(0.2 * _s.size))  # top20%-mean surprisal (captures hard/uncertain spans)
+                    _surprisal_agg = float(_np.sort(_s)[-_k:].mean())
+        if not self._teacher_keep_response(parent_sample_id, surprisal_agg=_surprisal_agg):
             return False
 
         from verl.experimental.fully_async_policy.chunk_sample import ChunkSample

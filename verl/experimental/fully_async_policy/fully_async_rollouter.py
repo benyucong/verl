@@ -1138,6 +1138,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 print(f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy} (rollouter)", flush=True)
         if self._tk_keep_frac >= 1.0:
             return True
+        # Content policies (e.g. entropy_surprisal) make + cache the per-parent decision at the agent_loop
+        # GATE 1 and SUPPRESS chunks for skipped groups; the rollouter cannot recompute a content signal.
+        # This gate is only reached on the fallback path (emitted_chunks==0), which for a content policy
+        # means GATE 1 skipped the group (a kept group emits >=1 chunk). Default to SKIP -> never re-publish
+        # -> no fallback re-entry / missing-score crash. (A degenerate kept group that emitted 0 chunks is
+        # also dropped here, which is safe: it has nothing to score.)
+        if self._tk_policy != "random":
+            self._tk_skipped += 1
+            if self._tk_log and (self._tk_kept + self._tk_skipped) % 50 == 1:
+                _tot = self._tk_kept + self._tk_skipped
+                print(
+                    f"[TEACHER-SKIP] policy={self._tk_policy} (rollouter default-skip) kept={self._tk_kept} "
+                    f"skipped={self._tk_skipped} keep_rate={self._tk_kept / max(1, _tot):.3f} target_keep={self._tk_keep_frac}",
+                    flush=True,
+                )
+            return False
         h = int(hashlib.md5(str(key).encode()).hexdigest()[:8], 16) % 10000
         keep = h < int(self._tk_keep_frac * 10000)
         if keep:
