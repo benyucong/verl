@@ -27,6 +27,12 @@ from verl.workers.utils.padding import no_padding_2_padding
 
 _TOKEN_SELECT_LOG_COUNTER = 0
 _AUDIT_LOG_COUNTER = 0
+# Running (whole-run) accumulators for the Phase-2 audit so the kept-vs-audit aggregate is meaningful even
+# when per-micro-batch audit n is tiny (AUDIT_FRAC << 1). Per-response masses; capped. Per-process (per FSDP rank).
+_AUDIT_KEPT_D: list = []
+_AUDIT_AUD_D: list = []
+_AUDIT_KEPT_S: list = []
+_AUDIT_AUD_S: list = []
 
 DistillationLossFn = Callable[
     [
@@ -499,13 +505,7 @@ def distillation_loss(
             aud = is_audit[:, 0] & has_tok
             kep = (~is_audit[:, 0]) & has_tok
             n_aud, n_kep = int(aud.sum()), int(kep.sum())
-            distillation_metrics["audit/n_kept"] = float(n_kep)
-            distillation_metrics["audit/n_audit"] = float(n_aud)
-            kdm = float(delta_resp[kep].mean()) if n_kep else float("nan")
-            adm = float(delta_resp[aud].mean()) if n_aud else float("nan")
-            distillation_metrics["audit/kept_delta_mass"] = kdm
-            distillation_metrics["audit/audit_skipped_delta_mass"] = adm
-            ksom = asom = float("nan")
+            so_resp = None
             ent = model_output.get("student_entropy")
             if ent is not None:
                 ent = no_padding_2_padding(ent, data)
@@ -513,16 +513,32 @@ def distillation_loss(
                 d_hat = _minmax01_clip(delta, valid)
                 so = h_hat + d_hat - h_hat * d_hat  # Soft-OR per token
                 so_resp = (so * valid).sum(dim=1) / n_tok
-                ksom = float(so_resp[kep].mean()) if n_kep else float("nan")
-                asom = float(so_resp[aud].mean()) if n_aud else float("nan")
-            distillation_metrics["audit/kept_soft_or_mass"] = ksom
-            distillation_metrics["audit/audit_skipped_soft_or_mass"] = asom
-            # Q3 leakage: audited (=low-surprisal skip candidates) whose divergence >= kept median = high
-            # teacher value the policy wrongly skipped (TIP Q3 blind spot).
-            q3 = float("nan")
-            if n_kep and n_aud:
-                q3 = float((delta_resp[aud] >= delta_resp[kep].median()).float().mean())
-            distillation_metrics["audit/q3_leakage_frac"] = q3
+            # PERSIST each response's (label, delta, Soft-OR) to a per-PID CSV under the run trace dir, so the
+            # audit aggregate SURVIVES the FSDP/Ray per-call module reload (module globals reset between loss
+            # calls -> in-memory accumulation does NOT persist). Aggregated post-hoc across all audit_*.csv.
+            import os as _os
+
+            _trace = _os.environ.get("OPD_STAGE0_TRACE_DIR", "")
+            if _trace:
+                try:
+                    _ad = _os.path.join(_trace, "audit")
+                    _os.makedirs(_ad, exist_ok=True)
+                    _dl = delta_resp.tolist()
+                    _sl = so_resp.tolist() if so_resp is not None else None
+                    _isa = is_audit[:, 0].tolist()
+                    _ht = has_tok.tolist()
+                    _rows = [
+                        f"{'a' if _isa[_i] else 'k'},{_dl[_i]:.6f},{(f'{_sl[_i]:.6f}' if _sl is not None else 'nan')}\n"
+                        for _i in range(len(_dl))
+                        if _ht[_i]
+                    ]
+                    if _rows:
+                        with open(_os.path.join(_ad, f"audit_{_os.getpid()}.csv"), "a") as _f:
+                            _f.write("".join(_rows))
+                except Exception:
+                    pass
+            distillation_metrics["audit/n_kept_mb"] = float(n_kep)
+            distillation_metrics["audit/n_audit_mb"] = float(n_aud)
             # exclude audit responses from the gradient (+ rescale token-mean denom to kept tokens)
             loss_mask = loss_mask.float() * (~is_audit).float()
             n_keep_tok = (valid & (~is_audit)).sum()
@@ -532,10 +548,12 @@ def distillation_loss(
             global _AUDIT_LOG_COUNTER
             _AUDIT_LOG_COUNTER += 1
             if _AUDIT_LOG_COUNTER % 20 == 1:
+                _kdm = float(delta_resp[kep].mean()) if n_kep else float("nan")
+                _adm = float(delta_resp[aud].mean()) if n_aud else float("nan")
                 print(
-                    f"[TEACHER-AUDIT] n_kept={n_kep} n_audit={n_aud} "
-                    f"kept_delta_mass={kdm:.4f} audit_skipped_delta_mass={adm:.4f} "
-                    f"kept_soft_or={ksom:.4f} audit_skipped_soft_or={asom:.4f} q3_leakage={q3:.4f}",
+                    f"[TEACHER-AUDIT] this_mb n_kept={n_kep} n_audit={n_aud} "
+                    f"kept_delta_mass={_kdm:.4f} audit_skipped_delta_mass={_adm:.4f} "
+                    f"(full aggregate via <trace>/audit/*.csv post-hoc)",
                     flush=True,
                 )
         distillation_loss = agg_loss(
