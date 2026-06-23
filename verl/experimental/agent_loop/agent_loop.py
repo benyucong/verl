@@ -811,8 +811,32 @@ class AgentLoopWorker:
                 if _s.size:
                     _k = max(1, int(0.2 * _s.size))  # top20%-mean surprisal (captures hard/uncertain spans)
                     _surprisal_agg = float(_np.sort(_s)[-_k:].mean())
-        if not self._teacher_keep_response(parent_sample_id, surprisal_agg=_surprisal_agg):
-            return False
+        _keep = self._teacher_keep_response(parent_sample_id, surprisal_agg=_surprisal_agg)
+        _is_audit = False
+        if not _keep:
+            # Phase 2 AUDIT: a policy-SKIPPED parent is, with prob OPD_TEACHER_RESPONSE_AUDIT_FRAC, still
+            # teacher-scored as an 'audit_scored' sample (reconstructed + delta/Soft-OR computed for
+            # diagnostics, but EXCLUDED from the OPD loss via the is_audit tag). Decision is stable per
+            # parent (group-consistent) so all N responses + chunks agree. AUDIT_FRAC=0 => true skip.
+            if not hasattr(self, "_tk_audit_frac"):
+                self._tk_audit_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_AUDIT_FRAC", "0.0"))
+                self._tk_audit = {}
+                self._tk_audited = 0
+            if self._tk_audit_frac > 0.0:
+                if parent_sample_id not in self._tk_audit:
+                    _ah = int(hashlib.md5((str(parent_sample_id) + "|audit").encode()).hexdigest()[:8], 16) % 10000
+                    _ad = _ah < int(self._tk_audit_frac * 10000)
+                    self._tk_audit[parent_sample_id] = _ad
+                    self._tk_audited += int(_ad)
+                    if _ad and self._tk_audited % 20 == 1:
+                        print(
+                            f"[TEACHER-AUDIT-GATE] audited_parents={self._tk_audited} "
+                            f"audit_frac={self._tk_audit_frac} (of policy-skipped groups)",
+                            flush=True,
+                        )
+                _is_audit = self._tk_audit[parent_sample_id]
+            if not _is_audit:
+                return False  # truly skipped: zero teacher forward, no chunks published
 
         from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
         from verl.experimental.fully_async_policy.opd_stage0_trace import trace_chunk_event
@@ -846,6 +870,8 @@ class AgentLoopWorker:
             chunk_batch.non_tensor_batch["chunk_token_offset"] = np.array([token_offset] * batch_size, dtype=np.int32)
             chunk_batch.non_tensor_batch["chunk_n_tokens"] = np.array([n_tokens] * batch_size, dtype=np.int32)
             chunk_batch.non_tensor_batch["chunk_is_final"] = np.array([is_final] * batch_size, dtype=bool)
+            # Phase 2: per-response audit tag (rides the carrier non_tensor -> assembler -> loss is_audit mask).
+            chunk_batch.non_tensor_batch["is_audit"] = np.array([_is_audit] * batch_size, dtype=bool)
 
             min_global_steps = self._first_non_tensor_value(chunk_batch, "min_global_steps")
             max_global_steps = self._first_non_tensor_value(chunk_batch, "max_global_steps")

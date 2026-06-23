@@ -77,6 +77,10 @@ def compute_forward_kl_topk(
     # TIP-style token selection needs per-token full-vocab student entropy h_t = H(P_S) (nats). We have
     # student_log_probs (full-vocab log-softmax) already materialized above, so this is EXACT (not top-k
     # truncated). Gated on mode + retention<1 so it is zero-overhead and byte-equivalent when disabled.
-    if loss_config.token_select_mode in ("entropy", "soft_or") and loss_config.token_retention < 1.0:
+    # Also needed by the Phase-2 audit (Soft-OR mass diagnostic over audit_scored samples).
+    import os as _os
+
+    _audit_on = float(_os.environ.get("OPD_TEACHER_RESPONSE_AUDIT_FRAC", "0.0") or 0.0) > 0.0
+    if (loss_config.token_select_mode in ("entropy", "soft_or") and loss_config.token_retention < 1.0) or _audit_on:
         out["student_entropy"] = -(student_log_probs.exp() * student_log_probs).sum(dim=-1)
     return out

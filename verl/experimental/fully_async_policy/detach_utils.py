@@ -1505,6 +1505,21 @@ def assemble_batch_from_chunk_samples(
     if "response_mask" not in final_batch.batch.keys():
         final_batch.batch["response_mask"] = compute_response_mask(final_batch)
 
+    # Phase 2 AUDIT: lift the per-response audit tag into a response_mask-shaped .batch tensor so it
+    # travels with the batch (balance/dynamic-bsz/ulysses/micro-batch) into the loss, where audit samples
+    # are excluded from the gradient. Guarded by .any() => byte-equivalent when AUDIT_FRAC=0 (no audit).
+    _ia = final_batch.non_tensor_batch.pop("is_audit", None)  # pop: lift to .batch; never keep key in both
+    if _ia is not None and bool(np.asarray(_ia).any()):
+        import torch as _torch
+
+        _rm = final_batch.batch["response_mask"]
+        final_batch.batch["is_audit"] = (
+            _torch.as_tensor(np.asarray(_ia).astype("bool"), device=_rm.device)
+            .unsqueeze(1)
+            .expand_as(_rm)
+            .contiguous()
+        )
+
     if balance_batch:
         balance_batch(final_batch, metrics={})
 
@@ -1644,6 +1659,21 @@ def assemble_batch_from_rollout_samples(
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():
         final_batch.batch["response_mask"] = compute_response_mask(final_batch)
+
+    # Phase 2 AUDIT: lift the per-response audit tag into a response_mask-shaped .batch tensor so it
+    # travels with the batch (balance/dynamic-bsz/ulysses/micro-batch) into the loss, where audit samples
+    # are excluded from the gradient. Guarded by .any() => byte-equivalent when AUDIT_FRAC=0 (no audit).
+    _ia = final_batch.non_tensor_batch.pop("is_audit", None)  # pop: lift to .batch; never keep key in both
+    if _ia is not None and bool(np.asarray(_ia).any()):
+        import torch as _torch
+
+        _rm = final_batch.batch["response_mask"]
+        final_batch.batch["is_audit"] = (
+            _torch.as_tensor(np.asarray(_ia).astype("bool"), device=_rm.device)
+            .unsqueeze(1)
+            .expand_as(_rm)
+            .contiguous()
+        )
 
     if balance_batch:
         balance_batch(final_batch, metrics={})
