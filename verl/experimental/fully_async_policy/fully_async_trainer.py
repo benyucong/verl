@@ -28,6 +28,7 @@ from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     RolloutSample,
+    apply_chunk_selective_training,
     assemble_batch_from_chunk_samples,
     assemble_batch_from_rollout_samples,
     choose_chunk_actor_mini_batch_size,
@@ -660,6 +661,36 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                       f"cleanups={tele.get('teacher_fifo/cleanup_count', 0)}", flush=True)
         return 0, batch
 
+    def _maybe_compact_chunks(self, batch):
+        """Chunk-level selective training (OPD_CHUNK_SELECTIVE_TRAINING=1).
+
+        Compact each response into shorter interior windows (bounded left context + the top
+        OPD_CHUNK_KEEP_FRAC chunks by OPD_CHUNK_SELECT_POLICY value), with loss only on selected-chunk
+        tokens. Reduces forwarded student tokens (a compute<->supervision tradeoff). Default-off; teacher
+        scoring and H-ACC are untouched; keep_frac>=1.0 is a no-op. Fail-safe: on any error, returns the
+        uncompacted batch so the run never crashes on this experimental path."""
+        if os.environ.get("OPD_CHUNK_SELECTIVE_TRAINING", "0") in ("0", "", "false", "False"):
+            return batch
+        try:
+            keep_frac = float(os.environ.get("OPD_CHUNK_KEEP_FRAC", "0.5"))
+            if keep_frac >= 1.0:
+                return batch
+            return apply_chunk_selective_training(
+                batch,
+                chunk_size=int(os.environ.get("OPD_CHUNK_SIZE", "1024")),
+                keep_frac=keep_frac,
+                context_tokens=int(os.environ.get("OPD_CHUNK_CONTEXT_TOKENS", "2048")),
+                policy=os.environ.get("OPD_CHUNK_SELECT_POLICY", "surprisal_sum"),
+                pad_token_id=int(getattr(self.tokenizer, "pad_token_id", 0) or 0),
+                row_divisor=max(1, int(self._get_chunk_batch_divisor())),
+            )
+        except Exception as exc:
+            import traceback
+
+            print(f"[CHUNK-COMPACT] disabled this step due to error: {exc}", flush=True)
+            traceback.print_exc()
+            return batch
+
     def _get_chunk_batch_divisor(self) -> int:
         """Return the row-count divisor required by trainer-side batch balancing."""
         if not self.config.trainer.balance_batch:
@@ -1244,12 +1275,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 batch = self._fit_compute_critic(batch)
                 batch = self._fit_compute_advantage(batch)
                 batch = self._fit_update_critic(batch)
+                # Chunk-level selective training (OPD_CHUNK_SELECTIVE_TRAINING): compact high-value
+                # chunks + bounded left context into shorter windows before the actor forward/backward.
+                # Default-off (no-op); reward/advantage above ran on the full response (reward needs it).
+                batch = self._maybe_compact_chunks(batch)
                 train_batch = batch
                 self._trace_chunk_train_events(train_batch, "chunk_train_start")
                 if self._optimizer_step_token_budget <= 0:
                     # Control plane OFF (default): one optimizer step + version bump + sync
                     # per fit_step, exactly as before.
+                    _au_t0 = time.time()
+                    _au_nnz = int(train_batch.batch["attention_mask"].sum().item()) if train_batch.batch is not None and "attention_mask" in train_batch.batch else 0
                     batch = self._fit_update_actor(batch)
+                    print(f"[CHUNK-TIMING] actor_update_s={time.time() - _au_t0:.3f} forwarded_tokens={_au_nnz} "
+                          f"train_tokens={self._count_train_tokens(train_batch)} rows={int(train_batch.batch.batch_size[0])}", flush=True)
                     # Apples-to-apples trained-token accounting: emit the response tokens that
                     # got a gradient this step. Covers both completed-sample async (baseline)
                     # and chunk streaming with frequent sync (ctrl).

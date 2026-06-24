@@ -1403,6 +1403,158 @@ def pad_dataproto_to_prompt_response_width(
     )
 
 
+def _build_chunk_window_dataproto(
+    full_batch: DataProto,
+    row: int,
+    seg_start: int,
+    seg_end: int,
+    loss_mask_seg: torch.Tensor | None,
+) -> DataProto:
+    """Single-row compacted training example = prompt + response[seg_start:seg_end), with ABSOLUTE
+    position_ids preserved and response_mask = loss_mask_seg (1 on selected-chunk tokens, 0 on context).
+    All sequence- and response-aligned tensors are sliced to the SAME window so the downstream
+    unpad_input derives one consistent cu_seqlens. This is the INTERIOR-window analogue of
+    _build_chunk_dataproto (which keeps a [0:response_end] prefix only)."""
+    prompt_width = int(full_batch.batch["prompts"].shape[1])
+    response_width = int(full_batch.batch["responses"].shape[1])
+    total_width = prompt_width + response_width
+    seg = int(seg_end - seg_start)
+    out = {}
+    for key, t in full_batch.batch.items():
+        ti = t[row : row + 1]
+        if key == "prompts":
+            out[key] = ti.clone()
+        elif key == "responses":
+            out[key] = ti[:, seg_start:seg_end].clone()
+        elif key == "response_mask":
+            if loss_mask_seg is not None:
+                out[key] = loss_mask_seg.reshape(1, seg).to(device=ti.device, dtype=ti.dtype).clone()
+            else:
+                out[key] = ti[:, seg_start:seg_end].clone()
+        elif key in {
+            "rollout_log_probs", "rm_scores", "token_level_scores",
+            "advantages", "old_log_probs", "returns", "ref_log_prob", "values",
+        }:
+            v = ti[:, seg_start:seg_end].clone()
+            if loss_mask_seg is not None and key in {"rm_scores", "token_level_scores", "advantages", "returns"}:
+                m = (~loss_mask_seg.bool()).reshape(seg).to(v.device)
+                v[:, m] = 0
+            out[key] = v
+        elif key == "position_ids" and ti.shape[-1] == total_width:
+            out[key] = torch.cat(
+                [ti[..., :prompt_width], ti[..., prompt_width + seg_start : prompt_width + seg_end]], dim=-1
+            ).clone()
+        elif ti.dim() >= 2 and ti.shape[1] == total_width:
+            out[key] = torch.cat(
+                [ti[:, :prompt_width], ti[:, prompt_width + seg_start : prompt_width + seg_end]], dim=1
+            ).clone()
+        elif ti.dim() >= 2 and ti.shape[1] == response_width:
+            out[key] = ti[:, seg_start:seg_end].clone()
+        else:
+            out[key] = ti.clone()
+    td = TensorDict(source=out, batch_size=[1])
+    nt = {k: v[row : row + 1] for k, v in full_batch.non_tensor_batch.items()}
+    # Empty meta_info on the per-row pieces: DataProto.concat asserts equality on overlapping meta_info
+    # keys, which is ambiguous for array/list values (e.g. global_token_num). The caller restores the
+    # original meta_info on the concatenated result.
+    return DataProto(batch=td, non_tensor_batch=nt, meta_info={})
+
+
+def apply_chunk_selective_training(
+    batch: DataProto,
+    *,
+    chunk_size: int,
+    keep_frac: float,
+    context_tokens: int,
+    policy: str,
+    pad_token_id: int,
+    row_divisor: int = 1,
+) -> DataProto:
+    """Chunk-level selective training (a compute<->supervision tradeoff, NOT a free reduction).
+
+    For each response: divide it into `chunk_size` chunks, value each chunk by `policy`
+    (surprisal_sum = sum of -rollout_log_probs, a teacher-free PRE-forward signal), keep the top
+    `keep_frac` chunks, and emit shorter INTERIOR windows (`context_tokens` left context + selected
+    chunk), with loss applied ONLY on selected-chunk tokens (context tokens forwarded as causal KV
+    but response_mask=0). Reduces forwarded student tokens via the existing rmpad/varlen path.
+
+    Teacher scoring and H-ACC are untouched. Default-off upstream; `keep_frac>=1.0` returns the batch
+    unchanged (byte-equivalent). Emits ONE bounding window per response so the row count (and thus the
+    actor batch shape / DP x mini-batch divisibility) is preserved. `row_divisor` is accepted for
+    interface stability but unused (row count is invariant)."""
+    if keep_frac >= 1.0 or "responses" not in batch.batch or "attention_mask" not in batch.batch:
+        return batch
+    b = batch.batch
+    prompt_width = int(b["prompts"].shape[1])
+    am = b["attention_mask"]
+    n = int(b.batch_size[0])
+    rlp = b.get("rollout_log_probs", None)
+    nnz_full = int(am.sum().item())
+
+    rows: list[DataProto] = []
+    val_total = 0.0
+    val_kept = 0.0
+    for i in range(n):
+        R_i = int(am[i, prompt_width:].sum().item())
+        if R_i <= chunk_size:
+            rows.append(_build_chunk_window_dataproto(batch, i, 0, max(1, R_i), None))
+            continue
+        nchunks = (R_i + chunk_size - 1) // chunk_size
+        if policy == "surprisal_sum" and rlp is not None:
+            sur = (-rlp[i, :R_i].float()).clamp_min(0)
+            cvals = [float(sur[c * chunk_size : min((c + 1) * chunk_size, R_i)].sum().item()) for c in range(nchunks)]
+        else:
+            cvals = [1.0] * nchunks
+        ksel = max(1, int(round(keep_frac * nchunks)))
+        sel = sorted(sorted(range(nchunks), key=lambda c: cvals[c])[-ksel:])
+        val_total += sum(cvals) or 1.0
+        val_kept += sum(cvals[c] for c in sel)
+        sel_tok = torch.zeros(R_i, dtype=torch.bool, device=am.device)
+        for c in sel:
+            sel_tok[c * chunk_size : min((c + 1) * chunk_size, R_i)] = True
+        # ONE bounding window per response: [first selected chunk start - K, last selected chunk end].
+        # This PRESERVES the row count (= n), so the compacted batch keeps the original batch shape and
+        # stays divisible by DP_size x per_rank_mini_batch (the actor-update constraint). The cost vs
+        # per-segment splitting is that an inter-selected-chunk gap (when selected chunks are >K apart) is
+        # forwarded as extra context; loss is still only on selected-chunk tokens.
+        lo = max(0, min(c * chunk_size for c in sel) - context_tokens)
+        hi = min(R_i, max((c + 1) * chunk_size for c in sel))
+        rows.append(_build_chunk_window_dataproto(batch, i, lo, hi, sel_tok[lo:hi]))
+
+    # One bounding window per response => row count is preserved; the compacted batch keeps the original
+    # (already-valid) shape. Assert it so any future per-segment change can't silently break batch divisibility.
+    assert len(rows) == n, f"chunk compaction changed row count {n}->{len(rows)} (breaks actor batch divisibility)"
+
+    target_rw = max(int(r.batch["responses"].shape[1]) for r in rows)
+    padded = []
+    for r in rows:
+        op = r.batch["position_ids"]
+        rp = int(r.batch["prompts"].shape[1])
+        rr = int(r.batch["responses"].shape[1])
+        pr = pad_dataproto_to_prompt_response_width(r, prompt_width, target_rw, pad_token_id)
+        # pad_dataproto rebases position_ids from the mask; restore ABSOLUTE positions (pad slots masked).
+        if op.dim() >= 2 and op.shape[-1] == rp + rr:
+            pr.batch["position_ids"] = _split_pad_seq(op, rp, prompt_width, target_rw, 0)
+        padded.append(pr)
+    out = DataProto.concat(padded)
+    out.meta_info = dict(batch.meta_info)  # restore original meta_info (per-row pieces carried none)
+
+    nnz_comp = int(out.batch["attention_mask"].sum().item())
+    out.meta_info["global_token_num"] = torch.sum(out.batch["attention_mask"], dim=-1).tolist()
+    ratio = (nnz_comp / nnz_full) if nnz_full else 1.0
+    rmass = (val_kept / val_total) if val_total else 1.0
+    out.meta_info["chunk_compact"] = {
+        "rows_in": n, "rows_out": len(rows), "nnz_full": nnz_full, "nnz_comp": nnz_comp,
+        "compaction_ratio": ratio, "retained_value_mass": rmass,
+    }
+    print(
+        f"[CHUNK-COMPACT] policy={policy} keep_frac={keep_frac} K={context_tokens} chunk={chunk_size} "
+        f"rows {n}->{len(rows)} nnz {nnz_full}->{nnz_comp} ratio={ratio:.3f} retained_value={rmass:.3f}",
+        flush=True,
+    )
+    return out
+
+
 def create_chunk_samples_from_rollout_sample(
     rollout_sample: RolloutSample,
     chunk_tokens: int,
