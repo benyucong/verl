@@ -1489,22 +1489,45 @@ def apply_chunk_selective_training(
     am = b["attention_mask"]
     n = int(b.batch_size[0])
     rlp = b.get("rollout_log_probs", None)
+    tids = b.get("teacher_ids", None)        # [N, P+R, K] teacher top-k token ids (for delta_sampled_sum)
+    tlps = b.get("teacher_logprobs", None)   # [N, P+R, K] teacher top-k logprobs
     nnz_full = int(am.sum().item())
 
     rows: list[DataProto] = []
     val_total = 0.0
     val_kept = 0.0
+    cov_found = 0            # delta_sampled_sum: # sampled response tokens found in the teacher top-k
+    cov_total = 0
+    all_chunk_vals: list[float] = []   # for chunk-score-distribution logging
     for i in range(n):
         R_i = int(am[i, prompt_width:].sum().item())
         if R_i <= chunk_size:
             rows.append(_build_chunk_window_dataproto(batch, i, 0, max(1, R_i), None))
             continue
         nchunks = (R_i + chunk_size - 1) // chunk_size
-        if policy == "surprisal_sum" and rlp is not None:
-            sur = (-rlp[i, :R_i].float()).clamp_min(0)
-            cvals = [float(sur[c * chunk_size : min((c + 1) * chunk_size, R_i)].sum().item()) for c in range(nchunks)]
+        # Per-response-token value vector `pertok` by selection policy, then segment-sum per chunk.
+        if policy == "delta_sampled_sum" and rlp is not None and tids is not None and tlps is not None:
+            # Teacher-aware sampled-token gap = max(0, teacher_logprob(sampled) - student_logprob(sampled)) per
+            # response token -- a PRE-FORWARD proxy for TIP divergence (NOT full Soft-OR/delta over the vocab).
+            # teacher_logprob is looked up in the teacher top-k at the same absolute position; the min top-k
+            # logprob is the fallback when the sampled token is outside the top-k (=> ~0 positive gap). Reuses
+            # the already-computed teacher tensors -> no extra teacher or student forward.
+            samp = b["input_ids"][i, prompt_width : prompt_width + R_i].unsqueeze(1)   # [R_i, 1]
+            t_ids = tids[i, prompt_width : prompt_width + R_i].long()                   # [R_i, K]
+            t_lps = tlps[i, prompt_width : prompt_width + R_i].float()                  # [R_i, K]
+            match = t_ids == samp                                                       # [R_i, K]
+            found = match.any(dim=1)                                                     # [R_i]
+            matched_lp = (t_lps * match.float()).sum(dim=1)                              # matched logprob (0 if miss)
+            teacher_lp = torch.where(found, matched_lp, t_lps.min(dim=1).values)         # [R_i]
+            pertok = (teacher_lp - rlp[i, :R_i].float()).clamp_min(0)                    # positive teacher-student gap
+            cov_found += int(found.sum().item())
+            cov_total += int(R_i)
+        elif policy == "surprisal_sum" and rlp is not None:
+            pertok = (-rlp[i, :R_i].float()).clamp_min(0)
         else:
-            cvals = [1.0] * nchunks
+            pertok = torch.ones(R_i, device=am.device)   # uniform fallback (arbitrary selection)
+        cvals = [float(pertok[c * chunk_size : min((c + 1) * chunk_size, R_i)].sum().item()) for c in range(nchunks)]
+        all_chunk_vals.extend(cvals)
         ksel = max(1, int(round(keep_frac * nchunks)))
         sel = sorted(sorted(range(nchunks), key=lambda c: cvals[c])[-ksel:])
         val_total += sum(cvals) or 1.0
@@ -1543,13 +1566,24 @@ def apply_chunk_selective_training(
     out.meta_info["global_token_num"] = torch.sum(out.batch["attention_mask"], dim=-1).tolist()
     ratio = (nnz_comp / nnz_full) if nnz_full else 1.0
     rmass = (val_kept / val_total) if val_total else 1.0
+    coverage = (cov_found / cov_total) if cov_total else float("nan")   # frac sampled tokens in teacher top-k
+    # chunk-score distribution (over all chunks this batch)
+    if all_chunk_vals:
+        _m = sum(all_chunk_vals) / len(all_chunk_vals)
+        _sd = (sum((x - _m) ** 2 for x in all_chunk_vals) / len(all_chunk_vals)) ** 0.5
+        _cv = (_sd / _m) if _m else 0.0
+        _lo, _hi = min(all_chunk_vals), max(all_chunk_vals)
+    else:
+        _m = _cv = _lo = _hi = 0.0
     out.meta_info["chunk_compact"] = {
         "rows_in": n, "rows_out": len(rows), "nnz_full": nnz_full, "nnz_comp": nnz_comp,
         "compaction_ratio": ratio, "retained_value_mass": rmass,
+        "topk_coverage": coverage, "chunk_score_mean": _m, "chunk_score_cv": _cv,
     }
     print(
         f"[CHUNK-COMPACT] policy={policy} keep_frac={keep_frac} K={context_tokens} chunk={chunk_size} "
-        f"rows {n}->{len(rows)} nnz {nnz_full}->{nnz_comp} ratio={ratio:.3f} retained_value={rmass:.3f}",
+        f"rows {n}->{len(rows)} nnz {nnz_full}->{nnz_comp} ratio={ratio:.3f} retained_value={rmass:.3f} "
+        f"topk_coverage={coverage:.3f} score[mean={_m:.3f} cv={_cv:.2f} min={_lo:.3f} max={_hi:.3f}]",
         flush=True,
     )
     return out
