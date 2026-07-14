@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -23,6 +24,13 @@ import numpy as np
 import ray
 import torch
 from omegaconf import DictConfig
+
+# --- OPD: graceful internal runtime limit (fixed-budget allocation sweep) ---------------------
+# When OPD_MAX_RUNTIME_S > 0, the rollouter stops ADMITTING new samples after that many seconds
+# (measured from process start) and drains/flushes via the normal shutdown path, so the job exits
+# cleanly BEFORE the SLURM wall. Unset/0 => disabled (no behaviour change for other experiments).
+_OPD_MAX_RUNTIME_S = float(os.environ.get("OPD_MAX_RUNTIME_S", "0") or 0)
+_OPD_PROC_T0 = time.time()
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -421,7 +429,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         return worker
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
+# max_restarts=0: a transparent actor restart would reset the module-import runtime timer
+# and silently extend the admission window; the validity gate also rejects actor restarts.
+@ray.remote(num_cpus=10, max_concurrency=100, max_restarts=0)
 class FullyAsyncRollouter(SeparateRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples
@@ -499,6 +509,34 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
+        # Response-level teacher skip (OPD_TEACHER_RESPONSE_KEEP_FRAC<1) drops ~(1-keep) of responses before
+        # the teacher, so only ~keep of generated responses become trainable. Over-generate by 1/keep (capped
+        # by the dataset) so the same number of KEPT responses arrive -> the trainer still forms the same number
+        # of full batches (same gstep count), while the teacher's per-time scoring load drops to ~keep
+        # (de-saturation -> lower R viable). Default keep=1.0 => no-op/byte-equivalent.
+        # Two modes via OPD_TEACHER_RESPONSE_OVERGEN (default 1 = Mode A):
+        #   Mode A (overgen=1, constant supervised batch): inflate budget by 1/keep so the same number of
+        #     KEPT responses arrive -> same gstep count; teacher per-time load drops to ~keep (de-saturation,
+        #     lower R viable). Cost: ~1/keep x rollout/wall.
+        #   Mode B (overgen=0, constant rollout budget): do NOT inflate; the trainer still forms full batches
+        #     but does ~keep x fewer updates over the fixed budget, so TOTAL teacher work drops to ~keep at
+        #     the same wall-clock (the "same fixed dataset -> ~half teacher work" mode).
+        _ts_keep = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
+        _ts_overgen = os.environ.get("OPD_TEACHER_RESPONSE_OVERGEN", "1") not in ("0", "", "false", "False")
+        if _ts_keep < 1.0 and _ts_overgen:
+            _ts_cap = len(self.train_dataloader) * self.config.trainer.total_epochs
+            self.total_rollout_steps = min(int(self.total_rollout_steps / _ts_keep), _ts_cap)
+            print(
+                f"[TEACHER-SKIP] mode=A over-generate: total_rollout_steps -> {self.total_rollout_steps} "
+                f"(x{1.0 / _ts_keep:.2f} for keep_frac={_ts_keep}, cap={_ts_cap})",
+                flush=True,
+            )
+        elif _ts_keep < 1.0:
+            print(
+                f"[TEACHER-SKIP] mode=B constant-rollout-budget (no over-gen): keep_frac={_ts_keep} -> "
+                f"~{_ts_keep:.2f}x total teacher work over the fixed budget, ~{_ts_keep:.2f}x updates",
+                flush=True,
+            )
         print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
         self.total_train_steps = None
 
@@ -748,6 +786,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if not hasattr(self.config, "async_training"):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
+        # Fail closed on the final-only + span-only combo (KeyError: 'teacher_logprobs' at actor update).
+        from verl.experimental.fully_async_policy.hybrid_assembler import assert_payload_flags_compatible
+
+        assert_payload_flags_compatible()
 
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -760,6 +802,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._create_worker_classes()
         await self._create_reward_loop_manager()
         await self._create_teacher_model_manager()
+        if os.environ.get("OPD_TEACHER_SEQ_GATE", "0") not in ("0", "", "false", "False"):
+            await self._run_teacher_sequential_gate()  # exits the process when done
         await self._init_async_rollout_manager()
 
     async def _create_reward_loop_manager(self):
@@ -814,6 +858,90 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 None,
                 lambda: MultiTeacherModelManager(config=self.config, resource_pool=teacher_resource_pool),
             )
+
+    async def _run_teacher_sequential_gate(self):
+        """Stage-1 sequential real-server gate (gated OPD_TEACHER_SEQ_GATE + OPD_TEACHER_INCREMENTAL_SCORE=1).
+        Scores a fixed parent STRICTLY SEQUENTIALLY and builds three teacher-label sources as full [S, K]
+        tensors (A=final-only clean full; B=streamed per-chunk clean, no KV reuse; C=incremental streamed
+        with KV reuse), then saves them + input_ids + response mask + the per-chunk dummy positions for the
+        offline forward-KL loss/gradient comparison. Exits when done."""
+        import os as _os
+        import random as _random
+
+        import torch
+
+        from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+        if self.teacher_model_manager is None:
+            print("[SEQ-GATE] no teacher manager configured; skipping", flush=True)
+            _os._exit(2)
+        mgr = AsyncTeacherLLMServerManager(self.config, self.teacher_model_manager.get_client())
+        K = mgr.distillation_loss_config.topk if mgr.distillation_loss_config.loss_settings.use_topk else 1
+        rng = _random.Random(0)
+        P, L, chunk = 8, 1024, 256
+        prompt = [rng.randint(100, 30000) for _ in range(P)]
+        response = [rng.randint(100, 30000) for _ in range(L)]
+        S = P + L
+        starts = list(range(0, L, chunk))
+        print(f"[SEQ-GATE] K={K} P={P} L={L} chunk={chunk} S={S}", flush=True)
+
+        async def score(seq, sid, sstart=None, send=None):
+            return await mgr.compute_teacher_logprobs_single(
+                sequence_ids=seq, routing_key=None, session_id=sid,
+                span_start=sstart, span_end=send, prompt_width=(P if sstart is not None else None))
+
+        # C: incremental streamed (sequential, KV reuse). Build response region of a full [S, K] tensor.
+        C_ids = torch.zeros(S, K, dtype=torch.int32)
+        C_lps = torch.zeros(S, K, dtype=torch.float32)
+        prev_cached, cached_rising = -1, True
+        try:
+            for c, st in enumerate(starts):
+                en = min(st + chunk, L)
+                tid, tlp, tel = await score(prompt + response[:en], "seqgate_C", st, en)
+                nc = tel.get("cached_tokens") or 0
+                print(f"[SEQ-GATE] C chunk {c}: full_prefix_len={tel.get('full_prefix_len')} num_cached={nc} "
+                      f"valid_suffix=[{tel.get('valid_suffix_start_abs')},{tel.get('valid_suffix_end_abs')}) "
+                      f"retained={tel.get('retained_span_rows')} lat={tel.get('latency_s'):.3f}s "
+                      f"replica={tel.get('replica_rank')}", flush=True)
+                cached_rising = cached_rising and nc >= prev_cached
+                prev_cached = nc
+                C_ids[P + st:P + en] = tid
+                C_lps[P + st:P + en] = tlp
+        except Exception as e:
+            print(f"[SEQ-GATE] FAIL during C: {type(e).__name__}: {e}", flush=True)
+            _os._exit(1)
+
+        # B: streamed per-chunk CLEAN (no KV reuse) -- strict full of each chunk, new span sliced [P+st:P+en].
+        B_ids = torch.zeros(S, K, dtype=torch.int32)
+        B_lps = torch.zeros(S, K, dtype=torch.float32)
+        for c, st in enumerate(starts):
+            en = min(st + chunk, L)
+            ftid, ftlp, _ = await score(prompt + response[:en], f"seqgate_B_{c}")
+            B_ids[P + st:P + en] = ftid[P + st:P + en]
+            B_lps[P + st:P + en] = ftlp[P + st:P + en]
+
+        # A: final-only clean full -- strict full [S, K] used directly.
+        A_ids, A_lps, _ = await score(prompt + response, "seqgate_A")
+
+        resp_mask = torch.zeros(S, dtype=torch.bool)
+        resp_mask[P:P + L] = True
+        # Per-chunk dummy positions (last of each chunk + final response token): B/C dummy these (the chunk
+        # had no in-sequence next token), A dummies only the final. Exclude all from the loss comparison.
+        dummy_abs = sorted({P + en - 1 for en in [min(st + chunk, L) for st in starts]} | {P + L - 1})
+        out_path = _os.environ.get("OPD_SEQGATE_TENSOR_PATH", "/tmp/seqgate_tensors.pt")
+        torch.save({
+            "input_ids": torch.tensor(prompt + response, dtype=torch.long), "response_mask": resp_mask,
+            "P": P, "L": L, "chunk": chunk, "K": K, "S": S, "starts": starts, "dummy_abs": dummy_abs,
+            "A_ids": A_ids.cpu(), "A_lps": A_lps.cpu(), "B_ids": B_ids.cpu(), "B_lps": B_lps.cpu(),
+            "C_ids": C_ids.cpu(), "C_lps": C_lps.cpu(),
+        }, out_path)
+        rr = slice(P, P + L)
+        print(f"[SEQ-GATE] cached_rising={cached_rising} dummy_abs={dummy_abs}", flush=True)
+        print(f"[SEQ-GATE] label top1 (response region): A-vs-B={(A_ids[rr][:,0]==B_ids[rr][:,0]).float().mean():.4f} "
+              f"A-vs-C={(A_ids[rr][:,0]==C_ids[rr][:,0]).float().mean():.4f} "
+              f"B-vs-C={(B_ids[rr][:,0]==C_ids[rr][:,0]).float().mean():.4f}", flush=True)
+        print(f"[SEQ-GATE] saved tensors -> {out_path}", flush=True)
+        _os._exit(0)
 
     def _create_actor_rollout_classes(self):
         # Skip rollout creation and let agentloop handle it
@@ -875,6 +1003,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
+        # Fail-fast: report the RESOLVED limit inside the actor. A container-env propagation break
+        # (e.g. a var missing from the profile SINGULARITYENV_* allowlist) then shows up in minutes
+        # as timer_enabled=false, instead of an hour later as a run that never stops.
+        try:
+            _stage0_trace(
+                "runtime_limit_config",
+                "runtime_limit_config",
+                role="rollouter",
+                OPD_MAX_RUNTIME_S=_OPD_MAX_RUNTIME_S,
+                timer_enabled=bool(_OPD_MAX_RUNTIME_S > 0),
+                timer_start_ts=_OPD_PROC_T0,
+                deadline_ts=(_OPD_PROC_T0 + _OPD_MAX_RUNTIME_S) if _OPD_MAX_RUNTIME_S > 0 else None,
+            )
+            print(
+                f"[FullyAsyncRollouter][Feed] runtime_limit_config: OPD_MAX_RUNTIME_S={_OPD_MAX_RUNTIME_S} "
+                f"timer_enabled={_OPD_MAX_RUNTIME_S > 0}",
+                flush=True,
+            )
+        except Exception:
+            pass
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
@@ -896,7 +1044,101 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 rollout_status={},
             )
 
-            await self.pending_queue.put(rollout_sample)
+            # Deadline-aware admission. A FULL pending_queue must never be able to defer the
+            # deadline check (measured: the queue sat at 128/128 and delayed the stop by 24.6s).
+            _opd_deadline_hit = False
+            if _OPD_MAX_RUNTIME_S > 0:
+                _remaining = (_OPD_PROC_T0 + _OPD_MAX_RUNTIME_S) - time.time()
+                if _remaining <= 0:
+                    _opd_deadline_hit = True
+                else:
+                    try:
+                        await asyncio.wait_for(self.pending_queue.put(rollout_sample), timeout=_remaining)
+                    except asyncio.TimeoutError:
+                        # Deadline expired while blocked on a full queue: this sample was NEVER queued,
+                        # so it is never recorded as admitted (no ambiguous parent state).
+                        _opd_deadline_hit = True
+            else:
+                await self.pending_queue.put(rollout_sample)
+
+            if not _opd_deadline_hit:
+                # Traced only AFTER a successful put: the parent is genuinely in flight.
+                try:
+                    _stage0_trace("parent_admitted", sample_id, role="rollouter", global_steps=self.global_steps)
+                except Exception:
+                    pass
+
+            # Graceful internal runtime limit: stop admitting, snapshot the UNSTARTED backlog, then
+            # fall through to the same drain path as the step limit below.
+            if _opd_deadline_hit:
+                _stop_ts = time.time()
+                # SNAPSHOT: parents still sitting in pending_queue were never picked up by the
+                # processor => generation never started. Remove them so the drain is BOUNDED (only
+                # actively-generating parents finish). Recorded as deliberate shutdown cancellation,
+                # NOT as failures/drops.
+                _queued_at_stop = self.pending_queue.qsize()
+                _cancelled_unstarted = 0
+                while True:
+                    try:
+                        _item = self.pending_queue.get_nowait()
+                    except Exception:
+                        break
+                    try:
+                        self.pending_queue.task_done()
+                    except Exception:
+                        pass
+                    if _item is not None:
+                        _cancelled_unstarted += 1
+                        try:
+                            _stage0_trace(
+                                "shutdown_cancelled_unstarted",
+                                getattr(_item, "sample_id", "unknown"),
+                                role="rollouter",
+                                _trace_ts=_stop_ts,
+                                status="SHUTDOWN_CANCELLED_UNSTARTED",
+                            )
+                        except Exception:
+                            pass
+                self._opd_cancelled_unstarted = _cancelled_unstarted
+                # Record outstanding work at the admission stop so the drain phase is observable and
+                # the aggregator can bound window_end <= admission_stop. Never let tracing block the stop.
+                try:
+                    try:
+                        _mq_size = (
+                            await self.message_queue_client.get_queue_size()
+                            if self.message_queue_client is not None
+                            else -1
+                        )
+                    except Exception:
+                        _mq_size = -1
+                    _stage0_trace(
+                        "admission_stop",
+                        "admission_stop",
+                        role="rollouter",
+                        _trace_ts=_stop_ts,
+                        reason="internal_runtime_limit",
+                        elapsed_s=round(_stop_ts - _OPD_PROC_T0, 1),
+                        limit_s=_OPD_MAX_RUNTIME_S,
+                        global_steps=self.global_steps,
+                        queued_at_stop=_queued_at_stop,
+                        cancelled_unstarted_at_stop=_cancelled_unstarted,
+                        outstanding_pending_queue=self.pending_queue.qsize(),
+                        outstanding_message_queue=_mq_size,
+                    )
+                    self._opd_admission_stop_ts = _stop_ts
+                except Exception as _trace_err:
+                    print(
+                        f"[FullyAsyncRollouter][Feed] admission_stop trace failed (non-fatal): {_trace_err}",
+                        flush=True,
+                    )
+                print(
+                    f"[FullyAsyncRollouter][Feed] internal runtime limit reached "
+                    f"({_stop_ts - _OPD_PROC_T0:.0f}s >= {_OPD_MAX_RUNTIME_S:.0f}s); "
+                    f"stop admitting new samples at global_steps={self.global_steps}; "
+                    f"outstanding pending_queue={self.pending_queue.qsize()}",
+                    flush=True,
+                )
+                break
 
             # Check if have reached the last step
             if self.global_steps >= self.total_rollout_steps:
@@ -962,6 +1204,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 continue
             # Get sample from appropriate queue and immediately mark task as done
             rollout_sample = await self.pending_queue.get()
+            # Invariant probe: NO parent may be dequeued after admission_stop. Traced at the true
+            # dequeue point (gen_start is weaker: setup can happen between dequeue and gen tracing).
+            if rollout_sample is not None:
+                try:
+                    _stage0_trace(
+                        "parent_dequeued",
+                        getattr(rollout_sample, "sample_id", "unknown"),
+                        role="rollouter",
+                    )
+                except Exception:
+                    pass
             self.pending_queue.task_done()
             self.staleness_samples += 1
 
@@ -998,6 +1251,57 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks,
                 )
+
+    def _teacher_keep_response(self, key) -> bool:
+        """Response-level teacher-skip decision (default keep_frac=1.0 => always keep / no-op).
+
+        Decided ONCE per rollout group on the stable group key (== the agent_loop streaming gate's
+        parent_sample_id, since rollout_sample.sample_id == xiaoshuai_parent_sample_id), so both gates make
+        the SAME choice. A skipped group emits zero streaming chunks (agent_loop gate) AND skips the fallback
+        publish here -> zero teacher forward, absent from reconstruction (never an H-ACC gap), telemetry only.
+        Policy 'random' = stable md5 subsample.
+        """
+        if not hasattr(self, "_tk_keep_frac"):
+            self._tk_keep_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
+            self._tk_policy = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random")
+            self._tk_log = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_LOG", "1") not in ("0", "", "false", "False")
+            self._tk_kept = 0
+            self._tk_skipped = 0
+            self.total_teacher_skipped_samples = 0
+            if self._tk_keep_frac < 1.0:
+                print(f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy} (rollouter)", flush=True)
+        if self._tk_keep_frac >= 1.0:
+            return True
+        # Content policies (e.g. entropy_surprisal) make + cache the per-parent decision at the agent_loop
+        # GATE 1 and SUPPRESS chunks for skipped groups; the rollouter cannot recompute a content signal.
+        # This gate is only reached on the fallback path (emitted_chunks==0), which for a content policy
+        # means GATE 1 skipped the group (a kept group emits >=1 chunk). Default to SKIP -> never re-publish
+        # -> no fallback re-entry / missing-score crash. (A degenerate kept group that emitted 0 chunks is
+        # also dropped here, which is safe: it has nothing to score.)
+        if self._tk_policy != "random":
+            self._tk_skipped += 1
+            if self._tk_log and (self._tk_kept + self._tk_skipped) % 50 == 1:
+                _tot = self._tk_kept + self._tk_skipped
+                print(
+                    f"[TEACHER-SKIP] policy={self._tk_policy} (rollouter default-skip) kept={self._tk_kept} "
+                    f"skipped={self._tk_skipped} keep_rate={self._tk_kept / max(1, _tot):.3f} target_keep={self._tk_keep_frac}",
+                    flush=True,
+                )
+            return False
+        h = int(hashlib.md5(str(key).encode()).hexdigest()[:8], 16) % 10000
+        keep = h < int(self._tk_keep_frac * 10000)
+        if keep:
+            self._tk_kept += 1
+        else:
+            self._tk_skipped += 1
+        if self._tk_log and (self._tk_kept + self._tk_skipped) % 50 == 1:
+            _tot = self._tk_kept + self._tk_skipped
+            print(
+                f"[TEACHER-SKIP] kept={self._tk_kept} skipped={self._tk_skipped} "
+                f"keep_rate={self._tk_kept / max(1, _tot):.3f} target_keep={self._tk_keep_frac}",
+                flush=True,
+            )
+        return keep
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
@@ -1083,6 +1387,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     rollout_sample=rollout_sample,
                     emitted_chunks=emitted_chunks,
                 )
+                return
+            # teacher_skipped group: it intentionally produced 0 streaming chunks (the agent_loop gate
+            # suppressed the teacher forward + publish). Do NOT fall through to the scored full-ret fallback
+            # -- that re-enters the skipped response into the teacher queue with a 'score' key and a
+            # padded-length chunk, causing the DataProto.concat key-mismatch crash + add_span shape gap.
+            # Emit nothing; count it as a first-class teacher-skip. Default keep_frac=1.0 => always kept
+            # => fallback path unchanged / byte-equivalent.
+            if not self._teacher_keep_response(rollout_sample.sample_id):
+                self.total_teacher_skipped_samples += 1
                 return
             await self._publish_chunk_samples(rollout_sample)
             return
@@ -1292,6 +1605,37 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             await self.pending_queue.join()
             print("[FullyAsyncRollouter] pending_queue joined")
+
+            # Real drain boundary: feed stopped admitting, processor finished, queue fully joined.
+            # Clean completion is asserted from THIS event, never inferred from the last trace ts.
+            try:
+                _stop_ts = getattr(self, "_opd_admission_stop_ts", None)
+                _done_ts = time.time()
+                try:
+                    _mq_final = (
+                        await self.message_queue_client.get_queue_size()
+                        if self.message_queue_client is not None
+                        else -1
+                    )
+                except Exception:
+                    _mq_final = -1
+                # ROLLOUT-LOCAL only: processor finished + local queue joined. The downstream
+                # end-of-stream is sent AFTER this, so teacher/assembler/trainer completion is NOT
+                # proven here. Deliberately carries no `clean` flag.
+                _stage0_trace(
+                    "rollout_drain_complete",
+                    "rollout_drain_complete",
+                    role="rollouter",
+                    _trace_ts=_done_ts,
+                    rollout_drain_duration_s=(round(_done_ts - _stop_ts, 1) if _stop_ts else None),
+                    admission_stop_ts=_stop_ts,
+                    cancelled_unstarted=getattr(self, "_opd_cancelled_unstarted", None),
+                    final_pending_queue=self.pending_queue.qsize(),
+                    final_message_queue=_mq_final,
+                    global_steps=self.global_steps,
+                )
+            except Exception as _e:
+                print(f"[FullyAsyncRollouter] drain_complete trace failed (non-fatal): {_e}", flush=True)
 
         except Exception as e:
             print(f"[FullyAsyncRollouter] Streaming process exception: {e}")

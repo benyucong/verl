@@ -69,6 +69,16 @@ class DistillationLossConfig(BaseConfig):
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
+    # --- TIP-style post-teacher token selection (loss masking). Default OFF => byte-equivalent. ---
+    # token_select_mode: "none" | "entropy" | "soft_or"; token_retention in (0,1]; token_select_scope:
+    # "response" (per-rollout top-rho, paper-faithful) | "batch" (per-micro-batch global top-rho).
+    # Env-overridable via OPD_TOKEN_SELECT_MODE / OPD_TOKEN_RETENTION / OPD_TOKEN_SELECT_SCOPE /
+    # OPD_TOKEN_SELECT_LOG (read in __post_init__).
+    token_select_mode: str = "none"
+    token_retention: float = 1.0
+    token_select_scope: str = "response"
+    token_select_log: bool = False
+
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
@@ -90,6 +100,29 @@ class DistillationLossConfig(BaseConfig):
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+
+        # --- TIP-style token-selection env overrides (default OFF => byte-equivalent) ---
+        for _f in ("token_select_mode", "token_retention", "token_select_scope", "token_select_log"):
+            self._mutable_fields.add(_f)
+        self.token_select_mode = os.environ.get("OPD_TOKEN_SELECT_MODE", self.token_select_mode)
+        self.token_retention = float(os.environ.get("OPD_TOKEN_RETENTION", self.token_retention))
+        self.token_select_scope = os.environ.get("OPD_TOKEN_SELECT_SCOPE", self.token_select_scope)
+        if "OPD_TOKEN_SELECT_LOG" in os.environ:
+            self.token_select_log = bool(int(os.environ["OPD_TOKEN_SELECT_LOG"]))
+        if self.token_select_mode not in ("none", "random", "entropy", "soft_or"):
+            raise ValueError(
+                f"OPD_TOKEN_SELECT_MODE must be none|random|entropy|soft_or, got {self.token_select_mode!r}"
+            )
+        if not (0.0 < self.token_retention <= 1.0):
+            raise ValueError(f"OPD_TOKEN_RETENTION must be in (0, 1], got {self.token_retention}")
+        if self.token_select_scope not in ("response", "batch"):
+            raise ValueError(f"OPD_TOKEN_SELECT_SCOPE must be response|batch, got {self.token_select_scope!r}")
+        if self.token_select_mode != "none":
+            print(
+                f"[TOKEN-SELECT-CFG] resolved mode={self.token_select_mode} retention={self.token_retention} "
+                f"scope={self.token_select_scope} log={self.token_select_log}",
+                flush=True,
+            )
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(

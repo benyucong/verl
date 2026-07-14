@@ -75,6 +75,13 @@ class ChunkSample:
     policy_version: int
     parent_payload: Any = None
     meta: dict[str, Any] = field(default_factory=dict)
+    # H-ACC-SPAN (span-only payload mode): teacher top-k labels for ONLY this chunk's new span
+    # [token_offset : token_offset+n_tokens], shape [n_tokens, k]. When set, non-final chunks carry
+    # parent_payload=None (the full-prefix labels are NOT serialized onto the queue); the final chunk
+    # keeps a structural parent_payload with its full-width teacher tensors stripped, and the trainer
+    # writes the stitched labels back in. None = legacy full-payload mode.
+    span_teacher_ids: Any = None
+    span_teacher_logprobs: Any = None
 
     def is_stale(self, current_version: int, sigma: int | float) -> bool:
         """Return True iff this chunk should be dropped by the staleness gate."""
