@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -71,6 +72,66 @@ from verl.workers.config import (
 from verl.workers.rollout.llm_server import LLMServerClient
 
 logger = logging.getLogger(__file__)
+
+# --- OPD: substitutive-streaming support -------------------------------------------------------
+# Counts whole-response teacher rescans that fired as a RECOVERY path (chunk reconstruction failed).
+# A healthy OPDFlow run must end with 0. Surfaced via the [OPD_RESCAN_FALLBACK] log marker.
+_OPD_RESCAN_FALLBACKS = 0
+
+
+def _force_additive_rescan() -> bool:
+    """Reinstate the OLD additive behaviour (chunk calls PLUS a whole-response rescan).
+
+    Exists solely so the redundant path can be characterised as a labelled mode against the corrected
+    mode in the same binary/config -- a controlled measurement rather than a comparison with
+    historical runs that differ in many other ways. Default OFF. Never set this in a production run;
+    check_teacher_invariants.py fails any run where rescans appear without a recorded fallback.
+    """
+    return os.environ.get("OPD_FORCE_ADDITIVE_RESCAN", "0") not in ("0", "", "false", "False")
+
+
+def _streamed_coverage_complete(state: dict) -> tuple:
+    """(complete, reason). Complete iff the published chunk spans tile [0, final_end) EXACTLY.
+
+    A published FINAL chunk is not sufficient evidence: an earlier chunk can fail to publish while the
+    final one succeeds, leaving a hole. Skipping the whole-response rescan then silently drops
+    supervision for the missing span. So we verify the actual covered interval instead of trusting a
+    flag: start at 0, strictly contiguous (no gap, no overlap), ending at the final chunk's end.
+    """
+    if state.get("failures"):
+        return False, "publish_failures=%d" % state["failures"]
+    if not state.get("final_emitted"):
+        return False, "final_chunk_not_published"
+    spans = sorted(state.get("spans") or [])
+    if not spans:
+        return False, "no_spans_published"
+    if spans[0][0] != 0:
+        return False, "coverage_starts_at_%d_not_0" % spans[0][0]
+    cursor = 0
+    for off, n in spans:
+        if off > cursor:
+            return False, "gap_at_%d_expected_%d" % (off, cursor)
+        if off < cursor:
+            return False, "overlap_at_%d_expected_%d" % (off, cursor)
+        cursor = off + n
+    final_end = state.get("final_end")
+    if final_end is not None and cursor != final_end:
+        return False, "coverage_end_%d_ne_final_end_%d" % (cursor, final_end)
+    return True, "complete[0,%d)" % cursor
+
+
+def _hybrid_span_payload_enabled_safe() -> bool:
+    """True only in the mode where per-chunk labels are stitched per parent and the whole-response
+    teacher tensors are stripped -- i.e. where a final rescan is provably discarded work. Imported
+    lazily and fail-closed: if the gate cannot be read we keep the old (additive) behaviour rather
+    than risk removing supervision a path might rely on."""
+    try:
+        from verl.experimental.fully_async_policy.hybrid_assembler import hybrid_span_payload_enabled
+
+        return bool(hybrid_span_payload_enabled())
+    except Exception:
+        return False
+
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
@@ -579,17 +640,57 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             run_kwargs = dict(kwargs)
+            stream_state = None
             if self._should_stream_chunks(agent_name=agent_name, validate=trajectory["validate"]):
+                stream_state = {"emitted": 0, "final_emitted": False, "failures": 0,
+                                "spans": [], "final_end": None}
                 run_kwargs["_chunk_callback"] = self._make_chunk_callback(
                     sample_kwargs=kwargs,
                     validate=trajectory["validate"],
+                    stream_state=stream_state,
                 )
 
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **run_kwargs)
             for key in ("xiaoshuai_sample_id", "xiaoshuai_parent_sample_id", "xiaoshuai_epoch"):
                 if key in kwargs:
                     output.extra_fields[key] = self._to_python_scalar(kwargs[key])
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+            # Chunk streaming is SUBSTITUTIVE, not additive. When the chunks already carry this
+            # response's teacher labels, recomputing them over the whole response here is pure waste:
+            # under span-only payloads the trainer strips these tensors and restitches the labels from
+            # each chunk's new span (hybrid_assembler), and the trace confirms it -- the trainer's
+            # `get` count is 0 in the streaming arm. Before this fix every response paid for exactly
+            # 1.00 duplicate whole-response call (is_final=None over the final chunk's own span).
+            #
+            # Gated on span-payload mode: that is the configuration where the rescan's output is
+            # PROVABLY discarded. Other modes keep the old behaviour rather than be changed untested.
+            compute_final_teacher = True
+            if (stream_state is not None and _hybrid_span_payload_enabled_safe()
+                    and not _force_additive_rescan()):
+                _complete, _why = _streamed_coverage_complete(stream_state)
+                if _complete:
+                    compute_final_teacher = False
+                else:
+                    # Streamed labels are NOT provably complete (gap/overlap/failure/missing final):
+                    # recover via whole-response scoring rather than train on a hole -- but never
+                    # silently. This marker is what the run-validity invariant counts.
+                    global _OPD_RESCAN_FALLBACKS
+                    _OPD_RESCAN_FALLBACKS += 1
+                    logger.warning(
+                        "[OPD_RESCAN_FALLBACK] sample_id=%s emitted=%d failures=%d "
+                        "reason=%s total_fallbacks=%d",
+                        self._to_python_scalar(kwargs.get("xiaoshuai_sample_id")),
+                        stream_state["emitted"],
+                        stream_state["failures"],
+                        _why,
+                        _OPD_RESCAN_FALLBACKS,
+                    )
+            return await self._agent_loop_postprocess(
+                output,
+                trajectory["validate"],
+                compute_teacher_logprobs=compute_final_teacher,
+                **kwargs,
+            )
 
     def _should_stream_chunks(self, *, agent_name: str, validate: bool) -> bool:
         """Return True when this worker can publish trainer-visible chunks during generation."""
@@ -608,7 +709,7 @@ class AgentLoopWorker:
 
         return get_chunk_token_size(self.config) > 0
 
-    def _make_chunk_callback(self, *, sample_kwargs: dict[str, Any], validate: bool):
+    def _make_chunk_callback(self, *, sample_kwargs: dict[str, Any], validate: bool, stream_state: Optional[dict] = None):
         async def _chunk_callback(
             output: AgentLoopOutput,
             *,
@@ -617,7 +718,7 @@ class AgentLoopWorker:
             n_tokens: int,
             is_final: bool,
         ) -> bool:
-            return await self._publish_streaming_chunk(
+            published = await self._publish_streaming_chunk(
                 output,
                 sample_kwargs=sample_kwargs,
                 validate=validate,
@@ -626,6 +727,21 @@ class AgentLoopWorker:
                 n_tokens=n_tokens,
                 is_final=is_final,
             )
+            # Record what streaming ACTUALLY delivered, so the caller can distinguish "labels already
+            # produced by chunks" from "reconstruction failed". Without this the whole-response rescan
+            # below fires unconditionally.
+            if stream_state is not None:
+                if published:
+                    stream_state["emitted"] += 1
+                    # record the ACTUAL interval this chunk got labels for, so the caller can verify
+                    # exact [0, L) coverage rather than trust that a final chunk implies completeness
+                    stream_state["spans"].append((int(token_offset), int(n_tokens)))
+                    if is_final:
+                        stream_state["final_emitted"] = True
+                        stream_state["final_end"] = int(token_offset) + int(n_tokens)
+                else:
+                    stream_state["failures"] += 1
+            return published
 
         return _chunk_callback
 
@@ -657,6 +773,118 @@ class AgentLoopWorker:
             return default
         return AgentLoopWorker._to_python_scalar(values[0])
 
+    def _teacher_keep_response(self, parent_sample_id, surprisal_agg=None) -> bool:
+        """Pre-teacher response-level skip decision (default keep_frac=1.0 => always keep).
+
+        Decided ONCE per parent_sample_id and cached, so all N responses of a parent group (and every
+        chunk) get the SAME keep/skip -> parent-level all-or-nothing.
+        Policies:
+          'random'           : stable md5(parent_sample_id) subsample (default; teacher-free, content-free).
+          'entropy_surprisal': teacher-free TIP-inspired proxy -- keep if the first-deciding response's
+                               first-chunk STUDENT sampled-token surprisal aggregate (top20%-mean of
+                               -log p_student, passed as surprisal_agg) >= threshold (uncertain student ->
+                               keep; confident -> skip). NOT full TIP: teacher-student divergence is
+                               unavailable before the teacher runs, so surprisal is a pre-teacher proxy.
+                               surprisal_agg=None (signal unreachable, e.g. logprobs off) -> stable md5.
+        Skipped responses are never scored or published -> teacher tokens-forwarded drop ~x keep_frac.
+        """
+        if not hasattr(self, "_tk_keep_frac"):
+            self._tk_keep_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_KEEP_FRAC", "1.0"))
+            self._tk_policy = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random")
+            _thr_env = os.environ.get("OPD_TEACHER_RESPONSE_SKIP_UNCERTAINTY_THRESHOLD", "auto")
+            try:
+                self._tk_threshold = float(_thr_env)  # >0: fixed threshold; <=0/"auto": sliding-window quantile
+            except ValueError:
+                self._tk_threshold = 0.0
+            self._tk_surp_window = []  # recent surprisal aggregates -> auto-quantile threshold (targets keep_frac)
+            self._tk_skipped = 0
+            self._tk_kept = 0
+            # Group-consistency cache: parent_sample_id -> keep/skip. Relies on the whole parent group
+            # (all N GRPO responses) being dispatched to ONE AgentLoopWorker: the fully-async path uses
+            # generate_sequences_single() -> _select_best_worker(), which sends the full group batch to a
+            # single worker (NO .chunk()), so the N async tasks share this cache and the first arriver's
+            # decision is reused by every sibling + chunk. (If that dispatch ever shards a group across
+            # workers, content-policy group-consistency would need a shared registry instead.)
+            self._tk_decisions = {}  # first arriver decides; siblings reuse
+            self._tk_kept_surp = []
+            self._tk_skip_surp = []
+            if self._tk_keep_frac < 1.0:
+                _thr_disp = f"{self._tk_threshold}" if self._tk_threshold > 0 else "auto-quantile"
+                print(
+                    f"[TEACHER-SKIP-CFG] keep_frac={self._tk_keep_frac} policy={self._tk_policy} "
+                    f"threshold={_thr_disp}",
+                    flush=True,
+                )
+        if self._tk_keep_frac >= 1.0:
+            return True
+        if parent_sample_id in self._tk_decisions:
+            return self._tk_decisions[parent_sample_id]
+        if self._tk_policy == "entropy_surprisal" and surprisal_agg is not None:
+            # Keep the most-uncertain ~keep_frac of groups. Default threshold is an auto sliding-window
+            # quantile at (1-keep_frac) -> targets keep_frac for a fair equal-budget comparison vs random;
+            # a positive OPD_TEACHER_RESPONSE_SKIP_UNCERTAINTY_THRESHOLD overrides with a fixed value.
+            if self._tk_threshold > 0:
+                _thr = self._tk_threshold
+            elif len(self._tk_surp_window) >= 8:
+                import numpy as _np
+
+                _thr = float(_np.quantile(self._tk_surp_window, 1.0 - self._tk_keep_frac))
+            else:
+                _thr = None  # cold start -> stable md5 until the window fills
+            self._tk_surp_window.append(float(surprisal_agg))
+            self._tk_surp_window = self._tk_surp_window[-512:]
+            if _thr is not None:
+                keep = surprisal_agg >= _thr
+            else:
+                h = int(hashlib.md5(str(parent_sample_id).encode()).hexdigest()[:8], 16) % 10000
+                keep = h < int(self._tk_keep_frac * 10000)
+            # record surprisal vs decision for the kept-vs-skipped separation telemetry (all decisions)
+            if keep:
+                self._tk_kept_surp.append(float(surprisal_agg))
+                self._tk_kept_surp = self._tk_kept_surp[-2000:]
+            else:
+                self._tk_skip_surp.append(float(surprisal_agg))
+                self._tk_skip_surp = self._tk_skip_surp[-2000:]
+        else:
+            h = int(hashlib.md5(str(parent_sample_id).encode()).hexdigest()[:8], 16) % 10000
+            keep = h < int(self._tk_keep_frac * 10000)
+        self._tk_decisions[parent_sample_id] = keep
+        if len(self._tk_decisions) > 50000:
+            # FIFO-evict oldest entries to bound memory on very long runs. Safe: a parent is queried only
+            # during its own (short) generation, so entries this old are long-completed and never re-queried.
+            for _k in list(self._tk_decisions)[:10000]:
+                del self._tk_decisions[_k]
+        if keep:
+            self._tk_kept += 1
+        else:
+            self._tk_skipped += 1
+        _tot = self._tk_kept + self._tk_skipped
+        if _tot % 20 == 1:
+            print(
+                f"[TEACHER-SKIP] policy={self._tk_policy} keep_frac={self._tk_keep_frac} "
+                f"kept={self._tk_kept} skipped={self._tk_skipped} keep_rate={self._tk_kept / max(1, _tot):.3f}",
+                flush=True,
+            )
+            if self._tk_policy == "entropy_surprisal":
+                import statistics as _st
+
+                _all = self._tk_kept_surp + self._tk_skip_surp
+                if _all:
+                    _s = sorted(_all)
+                    _p = lambda q: _s[min(len(_s) - 1, int(q * len(_s)))]
+                    _km = f"{_st.mean(self._tk_kept_surp):.3f}" if self._tk_kept_surp else "na"
+                    _sm = f"{_st.mean(self._tk_skip_surp):.3f}" if self._tk_skip_surp else "na"
+                    print(
+                        f"[TEACHER-SKIP-SIGNAL] surprisal_mean={_st.mean(_all):.3f} "
+                        f"surprisal_p50={_p(0.5):.3f} surprisal_p95={_p(0.95):.3f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[TEACHER-SKIP-PRIORITY] kept_surprisal_mean={_km} skipped_surprisal_mean={_sm}",
+                        flush=True,
+                    )
+        return keep
+
     async def _publish_streaming_chunk(
         self,
         output: AgentLoopOutput,
@@ -679,16 +907,66 @@ class AgentLoopWorker:
         parent_sample_id = self._to_python_scalar(sample_kwargs.get("xiaoshuai_parent_sample_id", sample_id))
         epoch = self._to_python_scalar(sample_kwargs.get("xiaoshuai_epoch", -1))
 
+        # Pre-teacher RESPONSE-LEVEL SKIP: drop this whole response from teacher scoring + chunk publish.
+        # For the entropy_surprisal policy, compute a teacher-free STUDENT-surprisal proxy from this
+        # (first) chunk's sampled-token logprobs (top20%-mean of -log p); the decision is made once per
+        # parent and cached, so all N group responses agree. Skips the teacher forward at
+        # _agent_loop_postprocess below -> cuts teacher tokens-forwarded ~x keep_frac. keep_frac=1.0 => no-op.
+        _surprisal_agg = None
+        if (
+            os.environ.get("OPD_TEACHER_RESPONSE_SKIP_POLICY", "random") == "entropy_surprisal"
+            and parent_sample_id not in getattr(self, "_tk_decisions", {})
+        ):
+            _lp = getattr(output, "response_logprobs", None)
+            if _lp:
+                import numpy as _np
+
+                _s = -_np.asarray(_lp, dtype=float)
+                _s = _s[_np.isfinite(_s)]
+                if _s.size:
+                    _k = max(1, int(0.2 * _s.size))  # top20%-mean surprisal (captures hard/uncertain spans)
+                    _surprisal_agg = float(_np.sort(_s)[-_k:].mean())
+        _keep = self._teacher_keep_response(parent_sample_id, surprisal_agg=_surprisal_agg)
+        _is_audit = False
+        if not _keep:
+            # Phase 2 AUDIT: a policy-SKIPPED parent is, with prob OPD_TEACHER_RESPONSE_AUDIT_FRAC, still
+            # teacher-scored as an 'audit_scored' sample (reconstructed + delta/Soft-OR computed for
+            # diagnostics, but EXCLUDED from the OPD loss via the is_audit tag). Decision is stable per
+            # parent (group-consistent) so all N responses + chunks agree. AUDIT_FRAC=0 => true skip.
+            if not hasattr(self, "_tk_audit_frac"):
+                self._tk_audit_frac = float(os.environ.get("OPD_TEACHER_RESPONSE_AUDIT_FRAC", "0.0"))
+                self._tk_audit = {}
+                self._tk_audited = 0
+            if self._tk_audit_frac > 0.0:
+                if parent_sample_id not in self._tk_audit:
+                    _ah = int(hashlib.md5((str(parent_sample_id) + "|audit").encode()).hexdigest()[:8], 16) % 10000
+                    _ad = _ah < int(self._tk_audit_frac * 10000)
+                    self._tk_audit[parent_sample_id] = _ad
+                    self._tk_audited += int(_ad)
+                    if _ad and self._tk_audited % 20 == 1:
+                        print(
+                            f"[TEACHER-AUDIT-GATE] audited_parents={self._tk_audited} "
+                            f"audit_frac={self._tk_audit_frac} (of policy-skipped groups)",
+                            flush=True,
+                        )
+                _is_audit = self._tk_audit[parent_sample_id]
+            if not _is_audit:
+                return False  # truly skipped: zero teacher forward, no chunks published
+
         from verl.experimental.fully_async_policy.chunk_sample import ChunkSample
         from verl.experimental.fully_async_policy.opd_stage0_trace import trace_chunk_event
 
         try:
             output.reward_score = 0.0
+            # Final-only teacher scoring (F mode, gated): skip the teacher call on non-final chunks; only
+            # the final chunk scores the full response once -> no per-chunk prefix amplification. Default off.
+            _final_only = os.environ.get("OPD_TEACHER_FINAL_ONLY", "0") not in ("0", "", "false", "False")
             internal = await self._agent_loop_postprocess(
                 output,
                 validate,
                 compute_score=False,
-                compute_teacher_logprobs=True,
+                compute_teacher_logprobs=(is_final or not _final_only),
+                chunk_is_final=is_final,
                 **sample_kwargs,
             )
             chunk_batch = self._postprocess(
@@ -707,6 +985,8 @@ class AgentLoopWorker:
             chunk_batch.non_tensor_batch["chunk_token_offset"] = np.array([token_offset] * batch_size, dtype=np.int32)
             chunk_batch.non_tensor_batch["chunk_n_tokens"] = np.array([n_tokens] * batch_size, dtype=np.int32)
             chunk_batch.non_tensor_batch["chunk_is_final"] = np.array([is_final] * batch_size, dtype=bool)
+            # Phase 2: per-response audit tag (rides the carrier non_tensor -> assembler -> loss is_audit mask).
+            chunk_batch.non_tensor_batch["is_audit"] = np.array([_is_audit] * batch_size, dtype=bool)
 
             min_global_steps = self._first_non_tensor_value(chunk_batch, "min_global_steps")
             max_global_steps = self._first_non_tensor_value(chunk_batch, "max_global_steps")
@@ -716,6 +996,28 @@ class AgentLoopWorker:
                 [policy_version] * batch_size, dtype=np.int32
             )
 
+            # H-ACC-SPAN: ship only THIS chunk's new-span teacher labels. Non-final chunks carry NO
+            # parent_payload (the full-prefix [P+R, k] labels are never serialized); the final chunk
+            # carries a structural carrier with those big tensors stripped, and the trainer rebuilds
+            # them from the accumulated spans. Off -> legacy full-prefix payload per chunk.
+            from verl.experimental.fully_async_policy.hybrid_assembler import hybrid_span_payload_enabled
+
+            span_teacher_ids = None
+            span_teacher_logprobs = None
+            chunk_parent_payload = chunk_batch
+            if hybrid_span_payload_enabled() and "teacher_ids" in chunk_batch.batch.keys():
+                P = int(chunk_batch.batch["prompts"].shape[1])
+                lo, hi = P + token_offset, P + token_offset + n_tokens
+                span_teacher_ids = chunk_batch.batch["teacher_ids"][0, lo:hi, :].detach().cpu().clone()
+                span_teacher_logprobs = chunk_batch.batch["teacher_logprobs"][0, lo:hi, :].detach().cpu().clone()
+                if is_final:
+                    for _k in ("teacher_ids", "teacher_logprobs"):
+                        if _k in chunk_batch.batch.keys():
+                            del chunk_batch.batch[_k]
+                    chunk_parent_payload = chunk_batch  # structural carrier (no big teacher tensors)
+                else:
+                    chunk_parent_payload = None
+
             chunk = ChunkSample(
                 sample_id=str(sample_id),
                 chunk_idx=int(chunk_idx),
@@ -724,7 +1026,9 @@ class AgentLoopWorker:
                 tokens=list(output.response_ids[token_offset : token_offset + n_tokens]),
                 is_final=bool(is_final),
                 policy_version=policy_version,
-                parent_payload=chunk_batch,
+                parent_payload=chunk_parent_payload,
+                span_teacher_ids=span_teacher_ids,
+                span_teacher_logprobs=span_teacher_logprobs,
                 meta={
                     "epoch": epoch,
                     "parent_sample_id": parent_sample_id,
@@ -733,6 +1037,8 @@ class AgentLoopWorker:
                     "source": "streaming",
                     "response_end": token_offset + n_tokens,
                     "response_width": self.rollout_config.response_length,
+                    # Teacher KV-reuse telemetry for this chunk (cached/total tokens, replica, latency).
+                    "teacher_telemetry": output.extra_fields.get("teacher_telemetry"),
                 },
             )
             success = await self.chunk_message_queue_client.put_sample(ray.cloudpickle.dumps(chunk))
@@ -765,6 +1071,7 @@ class AgentLoopWorker:
         validate,
         compute_score: bool = True,
         compute_teacher_logprobs: bool = True,
+        chunk_is_final: Optional[bool] = None,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -881,6 +1188,7 @@ class AgentLoopWorker:
                 response_ids=output.response_ids,
                 validate=validate,
                 sample_kwargs=kwargs,
+                chunk_is_final=chunk_is_final,
             )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
@@ -1066,23 +1374,58 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        chunk_is_final: Optional[bool] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
             routing_key = None
+            session_id = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                # Per-RESPONSE id pins this response's chunks to one teacher replica (KV reuse, gated).
+                sid = sample_kwargs.get("xiaoshuai_sample_id")
+                if sid is not None:
+                    session_id = sid.item() if hasattr(sid, "item") else sid
+            # Incremental-scoring span coordinates, derived from this chunk's response_mask
+            # ([0]*token_offset + [1]*n_new_tokens, single_turn_agent_loop.py:390): span_start = first 1,
+            # n_tokens = sum. The teacher then re-scores only this span (gated OPD_TEACHER_INCREMENTAL_SCORE).
+            span_start = span_end = prompt_width = None
+            rm = output.response_mask
+            if rm is not None and any(rm):
+                span_start = list(rm).index(1)
+                n_tokens = int(sum(rm))
+                span_end = span_start + n_tokens
+                prompt_width = len(prompt_ids)
+            teacher_ids, teacher_logprobs, teacher_telemetry = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
+                session_id=session_id,
+                span_start=span_start,
+                span_end=span_end,
+                prompt_width=prompt_width,
+                is_final=chunk_is_final,
             )
+            if teacher_telemetry.get("incremental"):
+                # Teacher returned ONLY the new span [n, k]. Re-place it into a full-prefix-aligned [S, k]
+                # tensor (zeros for the cached prefix we did not re-score), so the existing span-only slice
+                # and every downstream consumer are byte-for-byte unchanged. The span-only emission strips
+                # the zeros back to [n, k] on the wire; compute was still incremental.
+                S = len(prompt_ids) + len(response_ids)
+                k = teacher_ids.shape[1]
+                full_ids = torch.zeros(S, k, dtype=torch.int32)
+                full_lps = torch.zeros(S, k, dtype=torch.float32)
+                ss = prompt_width + span_start
+                full_ids[ss:ss + (span_end - span_start)] = teacher_ids
+                full_lps[ss:ss + (span_end - span_start)] = teacher_logprobs
+                teacher_ids, teacher_logprobs = full_ids, full_lps
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            output.extra_fields["teacher_telemetry"] = teacher_telemetry
 
     def _postprocess(
         self,
@@ -1104,6 +1447,19 @@ class AgentLoopWorker:
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+            # A per-sample teacher call can time out under teacher SATURATION and return None (its
+            # scoring latency exceeds the FIFO window; TAIL shows is_final=None, latency_s>>timeout).
+            # The old guard checked only inputs[0], so a None in a LATER input crashed torch.cat with a
+            # cryptic "expected Tensor ... got NoneType". Fail LOUDLY and actionably instead -- this is a
+            # provisioning signal (rollout:teacher chunk-arrival rate too high), not a code bug. The
+            # healthy path (all inputs labelled) is unchanged.
+            _missing = [i for i, x in enumerate(inputs) if x.teacher_logprobs is None or x.teacher_ids is None]
+            if _missing:
+                raise RuntimeError(
+                    f"[agent_loop._postprocess] teacher saturation: {len(_missing)}/{len(inputs)} samples have "
+                    f"None teacher labels (idx {_missing[:8]}); a teacher call exceeded its window and returned "
+                    f"None. Lower the rollout:teacher chunk rate (fewer rollout GPUs, larger c_stream, or more "
+                    f"teacher replicas).")
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
         batch = TensorDict(
