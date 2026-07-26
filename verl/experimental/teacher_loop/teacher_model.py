@@ -144,10 +144,16 @@ class TeacherModelManager:
                 )
 
     def _initialize_load_balancer_handle(self):
+        import os
+
         from verl.workers.rollout.llm_server import GlobalRequestLoadBalancer
 
+        # Teacher-only parent-aware routing knob (default "inflight" = unchanged behavior). The
+        # student rollout's balancer is constructed elsewhere and does not pass policy -> inflight.
         self.load_balancer_handle = GlobalRequestLoadBalancer.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True))
+            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
+            policy=os.environ.get("TEACHER_LB_POLICY", "inflight"),
+            expected_chunks_per_parent=int(os.environ.get("TEACHER_LB_EXPECTED_CHUNKS", "8")),
         )
 
 

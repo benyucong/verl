@@ -359,3 +359,53 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def extract_incremental_prompt_logprobs(
+    output, num_prompt_logprobs: int, num_cached_tokens: int, span_start_abs: int, span_end_abs: int
+):
+    """Teacher-incremental prompt-logprob parser for APC-reusing requests (does NOT touch the strict
+    extract_prompt_logprobs above).
+
+    A `prompt_logprobs` request with `skip_reading_prefix_cache=False` reuses the cached prefix KV and
+    only recomputes the suffix, but vLLM still returns a FULL-length list whose CACHED-prefix rows are
+    GARBAGE (variable top-k width) -- the strict parser asserts a fixed width per row and crashes on
+    them. This helper works in ABSOLUTE positions: it never touches the cached rows, parses only the
+    desired `[span_start_abs, span_end_abs)` rows, validates each row, and FAILS LOUDLY if the span is
+    not fully covered by valid recomputed rows (rather than silently misaligning). `prompt_logprobs[p]`
+    scores absolute token p (entry 0 is None). Proven on vLLM 0.15.1/V1: top-1/top-5 == clean full
+    re-score (1.0000), top-64 set IoU ~0.96 (loss-irrelevant tail drift).
+
+    Returns (ids_rows, logprob_rows): top-k ids + logprobs for exactly the new span, each of length
+    span_end_abs - span_start_abs.
+    """
+    plp = output.prompt_logprobs
+    full_prefix_len = len(plp)
+    K = num_prompt_logprobs
+    if not (0 <= span_start_abs < span_end_abs <= full_prefix_len):
+        raise ValueError(f"span [{span_start_abs},{span_end_abs}) out of range [0,{full_prefix_len})")
+    if span_start_abs < num_cached_tokens:
+        raise ValueError(
+            f"span_start_abs {span_start_abs} < num_cached_tokens {num_cached_tokens}: span overlaps "
+            f"cached/garbage rows -- not covered by valid recompute"
+        )
+    ids_rows, lp_rows = [], []
+    for p in range(span_start_abs, span_end_abs):
+        d = plp[p]
+        if d is None:
+            raise ValueError(f"prompt position {p}: None (uncomputed) -- incremental span not fully covered")
+        if len(d) not in (K, K + 1):
+            raise ValueError(f"prompt position {p}: {len(d)} top-k entries (expected {K}/{K + 1}) -- garbage row in span")
+        ids = [None] * K
+        lps = [None] * K
+        for token_id_str, token_logprob in d.items():
+            rank = token_logprob.rank
+            if rank > K:
+                continue
+            ids[rank - 1] = int(token_id_str)
+            lps[rank - 1] = token_logprob.logprob
+        if any(x is None for x in ids) or any(x is None for x in lps):
+            raise ValueError(f"prompt position {p}: incomplete top-{K} (missing a rank)")
+        ids_rows.append(ids)
+        lp_rows.append(lps)
+    return ids_rows, lp_rows
