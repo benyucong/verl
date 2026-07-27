@@ -633,7 +633,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
+            # Per-replica in-flight sample cap. Was a hardcoded 16, which silently made
+            # rollout.max_num_seqs > 16 a no-op: the engine can never see more sequences
+            # than the rollouter admits. On an MI250X GCD 16 was about right, but an H200
+            # decodes 3.1x faster at 64 concurrent than at 16, so the literal left most of
+            # the GPU idle. Default stays 16 -- LUMI behaviour is bit-for-bit unchanged.
+            _per_replica = int(os.environ.get("OPD_CONCURRENT_SAMPLES_PER_REPLICA", "16") or 16)
+            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * _per_replica
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             # Admission pacer: bypass the delay while the engine's running set is not full, so
             # pacing can never reduce generation throughput. Floor = parents needed to fill every
