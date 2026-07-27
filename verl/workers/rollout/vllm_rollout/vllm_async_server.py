@@ -1078,13 +1078,22 @@ class vLLMReplica(RolloutReplica):
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self) -> dict[str, Any]:
+    async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.
+
+        Args:
+            reset_prefix_cache: forwarded to each server. The checkpoint engine
+                passes this at parameter sync to optionally KEEP the prefix cache
+                (OPD_KEEP_PREFIX_CACHE), so resumed partial rollouts do not have
+                to re-prefill. This wrapper previously swallowed **kwargs by not
+                declaring them, so the call raised TypeError at the first sync.
 
         Returns:
             dict[str, Any]: Combined abort results from all servers.
         """
-        results = await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
+        results = await asyncio.gather(
+            *[server.abort_all_requests.remote(reset_prefix_cache=reset_prefix_cache) for server in self.servers]
+        )
 
         total_aborted = sum(r.get("aborted_count", 0) for r in results)
         all_request_ids = []

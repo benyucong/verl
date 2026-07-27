@@ -431,7 +431,14 @@ class CheckpointEngineManager:
         change: validate on quality, not just throughput. Default 0 = previous behaviour."""
         import os as _os
         _keep = _os.environ.get("OPD_KEEP_PREFIX_CACHE", "0") not in ("0", "", "false", "False")
-        await asyncio.gather(*[r.abort_all_requests(reset_prefix_cache=not _keep) for r in self.replicas])
+        if _keep:
+            # Only the vLLM replica accepts this kwarg; the base RolloutReplica and the
+            # SGLang one take no arguments. Passing it unconditionally raised
+            # TypeError at the FIRST parameter sync and killed 9 LUMI jobs, so the
+            # default path must call exactly the same 0-arg method it always did.
+            await asyncio.gather(*[r.abort_all_requests(reset_prefix_cache=False) for r in self.replicas])
+        else:
+            await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
 
     @auto_await
     async def resume_generation_replicas(self):
