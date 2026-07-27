@@ -420,8 +420,18 @@ class CheckpointEngineManager:
 
     @auto_await
     async def abort_replicas(self):
-        """Abort all in-flight requests on every replica."""
-        await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
+        """Abort all in-flight requests on every replica.
+
+        OPD_KEEP_PREFIX_CACHE=1 retains the vLLM prefix cache across the weight update. Measured:
+        ~3.5s of OPDFlow's 7.3s post-sync tax is the cold re-prefill of the resumed requests' prompts
+        (16 seqs x ~3945 tokens per replica). Retained blocks hold KV computed under the PREVIOUS
+        weight version -- partial rollout already accepts that the prefix TOKENS were sampled under
+        old weights (min/max_global_steps are tracked per sample), so reusing the matching old-weight
+        KV is arguably more self-consistent than recomputing it under new weights. Still a semantic
+        change: validate on quality, not just throughput. Default 0 = previous behaviour."""
+        import os as _os
+        _keep = _os.environ.get("OPD_KEEP_PREFIX_CACHE", "0") not in ("0", "", "false", "False")
+        await asyncio.gather(*[r.abort_all_requests(reset_prefix_cache=not _keep) for r in self.replicas])
 
     @auto_await
     async def resume_generation_replicas(self):

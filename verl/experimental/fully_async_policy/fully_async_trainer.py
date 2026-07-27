@@ -711,8 +711,22 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 print(f"[FullyAsyncTrainer][H-ACC] {collected_rows}/{target_rows} rows; recv={spans_received}; stitched={parents_stitched}; gap={span_gap_count}; fallback={coverage_fallback}; drop={span_drop_count}; in_flight={len(accs)}; mq_len={queue_len}")
         consumer_end = time.time()
         if collected_rows < target_rows:
-            print(f"[FullyAsyncTrainer][H-ACC] not enough rows collected ({collected_rows}/{target_rows})")
-            return None, None
+            # A parent reclaimed as stranded leaves the batch a few rows short, and discarding the
+            # WHOLE batch costs a full optimizer update: measured 119 updates vs the baseline's 120
+            # on a 3840-step run (~0.83%). OPD_ALLOW_SHORT_FINAL_BATCH=1 emits the short batch instead
+            # when it is at least OPD_SHORT_BATCH_MIN_FRAC of target (default 0.75) AND divides evenly
+            # into the actor mini-batch, so no downstream shape assumption breaks. Default 0 = previous
+            # behaviour (discard).
+            import os as _os
+            _allow = _os.environ.get("OPD_ALLOW_SHORT_FINAL_BATCH", "0") not in ("0", "", "false", "False")
+            _minfrac = float(_os.environ.get("OPD_SHORT_BATCH_MIN_FRAC", "0.75") or 0.75)
+            _div = max(1, int(self._get_chunk_batch_divisor())) if hasattr(self, "_get_chunk_batch_divisor") else 1
+            if _allow and collected_rows >= max(_div, int(_minfrac * target_rows)) and collected_rows % _div == 0:
+                print(f"[FullyAsyncTrainer][H-ACC] SHORT-BATCH emit {collected_rows}/{target_rows} rows "
+                      f"(divisor={_div}) instead of discarding the update", flush=True)
+            else:
+                print(f"[FullyAsyncTrainer][H-ACC] not enough rows collected ({collected_rows}/{target_rows})")
+                return None, None
         try:
             qstats = await self.message_queue_client.get_statistics()
         except Exception:
