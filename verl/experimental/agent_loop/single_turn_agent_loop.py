@@ -294,6 +294,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
         chunk_idx = 0
         stream_start = time.time()
         last_delta_ts = stream_start
+        # Tokens received but not yet cut into a chunk. This buffer is what makes chunk boundaries
+        # survive a weight-sync abort -- see the comment on the cutting loop below.
+        buf_ids: list[int] = []
+        buf_lps: list[float] = []
 
         def _emit(entry: tuple, *, is_final: bool) -> None:
             entry_idx, token_offset, n_new_tokens, snapshot_len, extra_fields, gen_s = entry
@@ -323,6 +327,33 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     )
                 )
             )
+
+        def _stage(tok_ids: list, lps: list) -> bool:
+            """Turn one cut chunk into the pending entry, emitting whatever was pending before it.
+
+            Returns False once response_length is reached so the caller stops cutting. `pending`
+            carries the one-delta lookahead: is_final has to be set at emit time, and a chunk is
+            only known to be last once the stream ends.
+            """
+            nonlocal pending, chunk_idx, last_delta_ts
+            remaining = self.response_length - len(response_ids)
+            if remaining <= 0:
+                return False
+            if len(tok_ids) > remaining:
+                tok_ids, lps = tok_ids[:remaining], lps[:remaining]
+            token_offset = len(response_ids)
+            n = len(tok_ids)
+            response_ids.extend(tok_ids)
+            if len(lps) >= n:
+                response_logprobs.extend(lps[:n])
+            _now = time.time()
+            entry = (chunk_idx, token_offset, n, len(response_ids), last_extra_fields, _now - last_delta_ts)
+            last_delta_ts = _now
+            chunk_idx += 1
+            if pending is not None:
+                _emit(pending, is_final=False)
+            pending = entry
+            return True
 
         async for delta in self.server_manager.generate_stream(
             request_id=request_id,
@@ -355,29 +386,31 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 )
 
             new_token_ids = list(delta.token_ids or [])
-            remaining_slots = self.response_length - len(response_ids)
-            if remaining_slots <= 0:
-                break
-            if len(new_token_ids) > remaining_slots:
-                new_token_ids = new_token_ids[:remaining_slots]
             if not new_token_ids:
                 continue
-
-            token_offset = len(response_ids)
-            n_new_tokens = len(new_token_ids)
-            response_ids.extend(new_token_ids)
+            buf_ids.extend(new_token_ids)
             if delta.log_probs is not None:
-                response_logprobs.extend(list(delta.log_probs[:n_new_tokens]))
+                buf_lps.extend(list(delta.log_probs[: len(new_token_ids)]))
 
-            _now = time.time()
-            entry = (chunk_idx, token_offset, n_new_tokens, len(response_ids), last_extra_fields, _now - last_delta_ts)
-            last_delta_ts = _now
-            chunk_idx += 1
+            # Cut chunks at EXACT chunk_tokens boundaries, ACROSS aborts.
+            #
+            # The server sees one engine call at a time, so on an abort its terminal delta is a
+            # partial. Emitting that partial as a chunk in its own right is what fragmented the
+            # stream: at chunk 4096 the mean emitted chunk came out 2437 tokens with 44% of them
+            # under half size, and the arm issued 64% more teacher calls than the split arm for
+            # identical token totals. The split path never had this problem because its abort is
+            # absorbed inside the chunk request's own resume loop, so a boundary only ever lands
+            # at max_tokens. Buffering here spans the resume, so a weight sync can no longer move
+            # a chunk boundary.
+            while len(buf_ids) >= chunk_tokens:
+                if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens]):
+                    break  # response_length reached; drop the rest
+                del buf_ids[:chunk_tokens]
+                del buf_lps[: min(chunk_tokens, len(buf_lps))]
 
-            if pending is not None:
-                _emit(pending, is_final=False)
-            pending = entry
-
+        # Flush the tail. Only here is it genuinely the last chunk of the response.
+        if buf_ids:
+            _stage(buf_ids, buf_lps)
         if pending is not None:
             _emit(pending, is_final=True)
 
