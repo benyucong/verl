@@ -227,15 +227,23 @@ class AsyncTeacherLLMServerManager:
             # U-mem path = ONE call/response (incremental=False) -> latency_s is the full-response teacher
             # tail. OPDFlow = per-chunk; the is_final call's (fifo_wait_s + latency_s) is its tail, earlier
             # chunks having overlapped with generation. Aligned by wall-clock + session_id offline.
-            logging.getLogger(__name__).warning(
+            # print(), NOT logging: this runs inside a Ray actor, and only STDOUT is
+            # forwarded to the driver log. The logging call went to stderr and was
+            # silently dropped on BSC MN5 -- zero [TAIL] lines in any acc run, which
+            # is why teacher tail latency (and therefore alpha) could not be measured
+            # there at all. Same "[TAIL] " prefix and field names, so existing LUMI
+            # extractors keep matching.
+            print(
                 "[TAIL] ts=%.3f sid=%s is_final=%s incr=%s total_tok=%s cached_tok=%s uncached_tok=%s "
-                "latency_s=%.4f fifo_wait_s=%s "
-                "queue_wait_s=%s span=%s",
-                time.time(), str(session_id)[-16:], is_final, bool(incremental), len(sequence_ids),
-                telemetry["cached_tokens"], telemetry["uncached_tokens"],
-                latency_s, (round(fifo_wait_s, 4) if fifo_wait_s is not None else None),
-                ef.get("queue_wait_s"),
-                f"[{span_start},{span_end})" if span_start is not None else "full",
+                "latency_s=%.4f fifo_wait_s=%s queue_wait_s=%s span=%s"
+                % (
+                    time.time(), str(session_id)[-16:], is_final, bool(incremental), len(sequence_ids),
+                    telemetry["cached_tokens"], telemetry["uncached_tokens"],
+                    latency_s, (round(fifo_wait_s, 4) if fifo_wait_s is not None else None),
+                    ef.get("queue_wait_s"),
+                    f"[{span_start},{span_end})" if span_start is not None else "full",
+                ),
+                flush=True,
             )
 
         if not incremental:
