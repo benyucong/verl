@@ -218,6 +218,89 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["max_global_steps"] = max_global_steps
         return final_output
 
+    async def generate_stream(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        chunk_tokens: int,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ):
+        """Continuous chunk stream with partial-rollout resume (OPD_CONTINUOUS_STREAM).
+
+        Same contract as generate(): aborts are invisible to the AgentLoop. The difference is that
+        between aborts there is ONE engine request rather than one per chunk, so a weight sync --
+        not a chunk boundary -- is the only thing that ends a request.
+
+        Note what this makes visible: the split path discards whatever the engine decoded before an
+        abort (vllm_async_server.generate returns an empty TokenOutput when outputs are empty).
+        Here those tokens have already been yielded and are counted in `produced`, so the resume
+        starts from them instead of regenerating them.
+        """
+        prompt_ids = normalize_token_ids(prompt_ids)
+
+        limit_key = None
+        if "max_tokens" in sampling_params:
+            limit_key = "max_tokens"
+        elif "max_new_tokens" in sampling_params:
+            limit_key = "max_new_tokens"
+        original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+
+        produced: list[int] = []
+        while True:
+            stop_reason = None
+            global_steps = None
+            async for delta in super().generate_stream(
+                request_id=request_id,
+                prompt_ids=prompt_ids + produced,
+                sampling_params=sampling_params,
+                chunk_tokens=chunk_tokens,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                **kwargs,
+            ):
+                produced.extend(delta.token_ids)
+                stop_reason = delta.stop_reason
+                if delta.extra_fields:
+                    global_steps = delta.extra_fields.get("global_steps", global_steps)
+                yield delta
+
+            if original_max_tokens is not None:
+                if len(produced) >= original_max_tokens:
+                    break
+                sampling_params[limit_key] = original_max_tokens - len(produced)
+
+            if stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
+                break
+
+            _abort_ts = time.time()
+            await asyncio.sleep(_partial_rollout_abort_retry_delay_s())
+            _resume_ts = time.time()
+            try:
+                _stage0_trace(
+                    "partial_rollout_resume",
+                    str(request_id),
+                    role="rollouter",
+                    global_steps=int(global_steps) if global_steps is not None else None,
+                    tokens_so_far=int(len(produced)),
+                    context_tokens=int(len(prompt_ids) + len(produced)),
+                    prompt_tokens=int(len(prompt_ids)),
+                    continuous_stream=True,
+                    abort_ts=_abort_ts,
+                    resume_ts=_resume_ts,
+                    resume_delay_s=float(_resume_ts - _abort_ts),
+                    _trace_ts=_resume_ts,
+                )
+            except Exception:
+                pass
+
 
 class FullyAsyncLLMServerManager(LLMServerManager):
     """Extension of :class:`LLMServerManager` for fully async training with hybrid scaling."""

@@ -641,6 +641,162 @@ class vLLMHttpServer:
             extra_fields=extra_fields,
         )
 
+    def _delta_token_output(self, res, sampling_params, start: int, end: int, stop_reason) -> TokenOutput:
+        """Slice [start, end) out of a CUMULATIVE RequestOutput into a delta TokenOutput.
+
+        vLLM's async generator yields cumulative outputs (generate() above relies on that: it keeps
+        only the last one and reads the whole response off it). So a chunk is a slice, not a
+        separate request.
+        """
+        out = res.outputs[0]
+        log_probs = None
+        if sampling_params.logprobs is not None and out.logprobs is not None:
+            log_probs = [out.logprobs[i][out.token_ids[i]].logprob for i in range(start, end)]
+        extra_fields = {
+            "global_steps": self.global_steps,
+            "finish_reason": out.finish_reason,
+            "replica_rank": self.replica_rank,
+            "num_cached_tokens": getattr(res, "num_cached_tokens", None),
+            # Lets the trainer/analysis tell a continuous-stream chunk from a split-request one.
+            "continuous_stream": True,
+        }
+        return TokenOutput(
+            token_ids=list(out.token_ids[start:end]),
+            log_probs=log_probs,
+            routed_experts=None,
+            stop_reason=stop_reason,
+            num_preempted=getattr(out, "num_preempted", None),
+            extra_fields=extra_fields,
+        )
+
+    async def generate_stream(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        chunk_tokens: int,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        priority: int = 0,
+    ):
+        """OPDFlow continuous streaming: ONE engine request, chunk deltas yielded as they decode.
+
+        The split-request path (single_turn_agent_loop._generate_streaming_chunks) gets its chunk
+        boundaries by ENDING the vLLM request every `chunk_tokens` tokens and resubmitting
+        prompt + everything-generated-so-far. Streaming never required that: vLLM's generate() is
+        already an async generator, and vLLM commits finalized KV blocks mid-decode
+        (vllm/v1/core/kv_cache_manager.py, cache_blocks in allocate_slots), so KV is durable across
+        an abort WITHOUT any request boundary.
+
+        Two concrete savings over splitting:
+          - N-1 fewer engine requests per response, each of which resubmits a prefix growing toward
+            prompt+response_length and pays a fresh admission/schedule.
+          - Tokens decoded before an abort are YIELDED, not discarded. generate() above returns an
+            empty TokenOutput when the abort leaves `final_res.outputs` empty, so the split path
+            regenerates them.
+
+        The prep below is duplicated from generate() ON PURPOSE. generate() serves the veRL
+        baseline arm; perturbing it would invalidate every A/B against it.
+        """
+        assert not self.config.enable_rollout_routing_replay, (
+            "OPD_CONTINUOUS_STREAM does not support enable_rollout_routing_replay: per-chunk "
+            "routed_experts alignment is unverified under a single continuous request."
+        )
+        prompt_ids = normalize_token_ids(prompt_ids)
+
+        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
+                f"({self.config.max_model_len})."
+            )
+        if "max_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_tokens")
+        elif "max_new_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_new_tokens")
+        else:
+            max_tokens = min(
+                self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
+            )
+        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+
+        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        multi_modal_data = {}
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        if video_data is not None:
+            multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        if mm_processor_kwargs:
+            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        try:
+            prompt = TokensPrompt(**prompt_kwargs)
+        except TypeError:
+            prompt = prompt_kwargs
+
+        lora_request = None
+        if self.lora_as_adapter:
+            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if lora_loaded:
+                lora_request = LoRARequest(
+                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                )
+
+        generator = self.engine.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            lora_request=lora_request,
+            priority=priority,
+        )
+
+        n_emitted = 0
+        last_res: Optional[RequestOutput] = None
+        async for output in generator:
+            last_res = output
+            if not output.outputs:
+                continue
+            # Emit whole chunks as they accumulate; the remainder rides the next yield. The final
+            # partial chunk is emitted by the terminal yield below.
+            while len(output.outputs[0].token_ids) - n_emitted >= chunk_tokens:
+                end = n_emitted + chunk_tokens
+                yield self._delta_token_output(output, sampling_params, n_emitted, end, stop_reason=None)
+                n_emitted = end
+
+        if last_res is None or not last_res.outputs:
+            # Aborted before anything was returned. Everything decoded earlier was already yielded.
+            yield TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+                extra_fields={
+                    "global_steps": self.global_steps,
+                    "finish_reason": "abort",
+                    "replica_rank": self.replica_rank,
+                    "continuous_stream": True,
+                },
+            )
+            return
+
+        finish_reason = last_res.outputs[0].finish_reason
+        if finish_reason == "abort":
+            stop_reason = "aborted"
+        elif finish_reason in ("stop", "length"):
+            stop_reason = "completed"
+        else:
+            stop_reason = finish_reason
+        yield self._delta_token_output(
+            last_res, sampling_params, n_emitted, len(last_res.outputs[0].token_ids), stop_reason=stop_reason
+        )
+
     async def wake_up(self):
         if self.node_rank != 0:
             return

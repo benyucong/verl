@@ -48,6 +48,20 @@ def _resolve_streaming_chunk_tokens(config) -> int:
     return max(0, chunk_tokens)
 
 
+def _continuous_stream_enabled() -> bool:
+    """OPD_CONTINUOUS_STREAM=1: stream chunks out of ONE engine request (default off).
+
+    The default path below obtains chunk boundaries by ENDING the vLLM request every chunk_tokens
+    tokens (see chunk_sampling_params[limit_key] = chunk_limit) and resubmitting prompt +
+    everything-so-far. That was never necessary for streaming, and it costs: N engine requests per
+    response instead of 1, each resubmitting a prefix growing toward prompt+response_length, plus
+    the loss of whatever the engine had decoded when an abort lands.
+
+    Off by default so the published split-path arms stay byte-identical and the two can be A/B'd.
+    """
+    return os.environ.get("OPD_CONTINUOUS_STREAM", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _rollout_lease_max_tokens() -> int:
     """Rollout-lease refresh knob (prototype for the Q3 'pinned suffix' problem).
 
@@ -156,7 +170,19 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 3. generate sequences
         chunk_tokens = _resolve_streaming_chunk_tokens(self.config) if chunk_callback is not None else 0
-        if chunk_tokens > 0:
+        if chunk_tokens > 0 and _continuous_stream_enabled():
+            output = await self._generate_continuous_stream(
+                sampling_params=sampling_params,
+                prompt_ids=prompt_ids,
+                multi_modal_data=multi_modal_data,
+                images=images,
+                videos=videos,
+                audios=audios,
+                mm_processor_kwargs=mm_processor_kwargs,
+                chunk_tokens=chunk_tokens,
+                chunk_callback=chunk_callback,
+            )
+        elif chunk_tokens > 0:
             output = await self._generate_streaming_chunks(
                 sampling_params=sampling_params,
                 prompt_ids=prompt_ids,
@@ -228,6 +254,147 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         return output
+
+    async def _generate_continuous_stream(
+        self,
+        *,
+        sampling_params: dict[str, Any],
+        prompt_ids: list[int],
+        multi_modal_data: dict[str, Any],
+        images,
+        videos,
+        audios,
+        mm_processor_kwargs: dict[str, Any],
+        chunk_tokens: int,
+        chunk_callback,
+    ) -> AgentLoopOutput:
+        """OPD_CONTINUOUS_STREAM: the same chunk stream, out of ONE engine request.
+
+        The callback contract is identical to _generate_streaming_chunks -- same chunk_agent_output
+        shape, same (chunk_idx, token_offset, n_tokens, is_final) -- so the trainer's per-parent
+        [0, L) coverage check in _get_hybrid_full_samples_from_chunks is unaffected. Only the
+        rollout side changes: no max_tokens injection, so nothing ends the request at a chunk
+        boundary; the engine is left to decode the whole response and deltas are sliced off it.
+
+        ONE-DELTA LOOKAHEAD. `is_final` has to be set when the chunk is emitted, but whether a
+        delta is the last one is only known once the stream ends. So each delta is buffered and
+        emitted when its successor arrives; whatever is left over at the end is emitted final.
+        Empty deltas (an abort can yield one) are never buffered, so they cannot become a zero-token
+        final chunk and break the coverage check.
+        """
+        request_id = uuid4().hex
+        response_ids: list[int] = []
+        response_logprobs: list[float] = []
+        total_num_preempted = 0
+        emitted_chunks = 0
+        chunk_emit_tasks: list[asyncio.Task] = []
+        last_extra_fields: dict[str, Any] = {}
+        last_stop_reason = None
+        pending: tuple | None = None
+        chunk_idx = 0
+        stream_start = time.time()
+        last_delta_ts = stream_start
+
+        def _emit(entry: tuple, *, is_final: bool) -> None:
+            entry_idx, token_offset, n_new_tokens, snapshot_len, extra_fields, gen_s = entry
+            chunk_agent_output = AgentLoopOutput(
+                prompt_ids=prompt_ids,
+                response_ids=response_ids[:snapshot_len][: self.response_length],
+                response_mask=([0] * token_offset + [1] * n_new_tokens)[: self.response_length],
+                response_logprobs=(
+                    response_logprobs[:snapshot_len][: self.response_length] if response_logprobs else None
+                ),
+                routed_experts=None,
+                multi_modal_data=multi_modal_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                num_turns=2,
+                metrics=AgentLoopMetrics(**{"generate_sequences": gen_s, "num_preempted": -1}),
+                reward_score=0.0,
+                extra_fields={**extra_fields, "turn_scores": [], "tool_rewards": []},
+            )
+            chunk_emit_tasks.append(
+                asyncio.create_task(
+                    chunk_callback(
+                        chunk_agent_output,
+                        chunk_idx=entry_idx,
+                        token_offset=token_offset,
+                        n_tokens=n_new_tokens,
+                        is_final=is_final,
+                    )
+                )
+            )
+
+        async for delta in self.server_manager.generate_stream(
+            request_id=request_id,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            chunk_tokens=chunk_tokens,
+            image_data=images,
+            video_data=videos,
+            audio_data=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
+        ):
+            last_extra_fields = dict(delta.extra_fields or {})
+            last_stop_reason = delta.stop_reason
+            if delta.num_preempted is not None:
+                total_num_preempted += int(delta.num_preempted)
+
+            new_token_ids = list(delta.token_ids or [])
+            remaining_slots = self.response_length - len(response_ids)
+            if remaining_slots <= 0:
+                break
+            if len(new_token_ids) > remaining_slots:
+                new_token_ids = new_token_ids[:remaining_slots]
+            if not new_token_ids:
+                continue
+
+            token_offset = len(response_ids)
+            n_new_tokens = len(new_token_ids)
+            response_ids.extend(new_token_ids)
+            if delta.log_probs is not None:
+                response_logprobs.extend(list(delta.log_probs[:n_new_tokens]))
+
+            _now = time.time()
+            entry = (chunk_idx, token_offset, n_new_tokens, len(response_ids), last_extra_fields, _now - last_delta_ts)
+            last_delta_ts = _now
+            chunk_idx += 1
+
+            if pending is not None:
+                _emit(pending, is_final=False)
+            pending = entry
+
+        if pending is not None:
+            _emit(pending, is_final=True)
+
+        if chunk_emit_tasks:
+            emit_results = await asyncio.gather(*chunk_emit_tasks, return_exceptions=True)
+            for result in emit_results:
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "Continuous-stream chunk callback failed",
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                elif result:
+                    emitted_chunks += 1
+
+        metrics = {"generate_sequences": time.time() - stream_start, "num_preempted": total_num_preempted}
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids[: self.response_length],
+            response_mask=([1] * len(response_ids))[: self.response_length],
+            response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
+            routed_experts=None,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            num_turns=2,
+            metrics=AgentLoopMetrics(**metrics),
+            extra_fields={
+                **last_extra_fields,
+                "stop_reason": last_stop_reason,
+                "streaming_chunks_emitted": emitted_chunks,
+                "continuous_stream": True,
+            },
+        )
 
     async def _generate_streaming_chunks(
         self,

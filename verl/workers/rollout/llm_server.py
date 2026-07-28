@@ -305,6 +305,55 @@ class LLMServerClient:
             if is_final and track_parent:
                 self._load_balancer.release_parent.remote(request_id=request_id)
 
+    async def generate_stream(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        chunk_tokens: int,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        track_parent: bool = False,
+        **kwargs: Any,
+    ):
+        """Stream chunk deltas from ONE engine request (OPDFlow OPD_CONTINUOUS_STREAM).
+
+        Differences from generate() that are deliberate, not oversights:
+          - No @rollout_trace_op: the decorator awaits the wrapped coroutine and does not compose
+            with an async generator.
+          - The server lease is acquired ONCE and held for the whole response. The split path
+            acquires and releases per chunk, so a parent could migrate replicas mid-response and
+            lose its prefix cache; here it cannot.
+          - The parent-debt release fires when the generator is exhausted, which is the real end of
+            the parent -- there is no per-chunk `is_final` to key off.
+        """
+        server_id, server = await self._acquire_server(request_id, track_parent=track_parent)
+        try:
+            multimodal_kwargs = {}
+            if audio_data is not None:
+                multimodal_kwargs["audio_data"] = audio_data
+            if mm_processor_kwargs:
+                multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+            stream = server.generate_stream.options(num_returns="streaming").remote(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                chunk_tokens=chunk_tokens,
+                image_data=image_data,
+                video_data=video_data,
+                **multimodal_kwargs,
+                **kwargs,
+            )
+            async for ref in stream:
+                yield await ref
+        finally:
+            self._release_server(server_id)
+            if track_parent:
+                self._load_balancer.release_parent.remote(request_id=request_id)
+
 
 class LLMServerManager:
     """LLMServerManager is responsible for:
