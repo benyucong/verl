@@ -339,6 +339,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
             if delta.num_preempted is not None:
                 total_num_preempted += int(delta.num_preempted)
 
+            if chunk_idx == 0:
+                # Fail loudly, by name, on the first chunk. A version field missing from a delta does
+                # not degrade gracefully: it surfaces ~7 minutes later as "unsupported operand
+                # type(s) for -: 'NoneType' and 'NoneType'" out of
+                # detach_utils.assemble_batch_from_rollout_samples, which names neither the field nor
+                # this code path. (That is exactly how job 43924137 died.)
+                _missing = [
+                    k for k in ("global_steps", "min_global_steps", "max_global_steps")
+                    if last_extra_fields.get(k) is None
+                ]
+                assert not _missing, (
+                    f"continuous-stream delta missing required extra_fields {_missing}; the trainer's "
+                    f"param-version accounting needs them on every chunk (present: {sorted(last_extra_fields)})"
+                )
+
             new_token_ids = list(delta.token_ids or [])
             remaining_slots = self.response_length - len(response_ids)
             if remaining_slots <= 0:

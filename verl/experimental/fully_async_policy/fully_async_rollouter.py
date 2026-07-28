@@ -255,6 +255,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         while True:
             stop_reason = None
             global_steps = None
+            # Weight-version window of the CURRENT engine call, reset per call so each delta reports
+            # the window it was actually decoded under -- the same granularity the split path gets
+            # for free by making every chunk its own generate() call.
+            call_min_gs, call_max_gs = None, None
             async for delta in super().generate_stream(
                 request_id=request_id,
                 prompt_ids=prompt_ids + produced,
@@ -268,8 +272,19 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             ):
                 produced.extend(delta.token_ids)
                 stop_reason = delta.stop_reason
-                if delta.extra_fields:
-                    global_steps = delta.extra_fields.get("global_steps", global_steps)
+                if delta.extra_fields is None:
+                    delta.extra_fields = {}
+                global_steps = delta.extra_fields.get("global_steps", global_steps)
+                if global_steps is not None:
+                    if call_min_gs is None:
+                        call_min_gs = global_steps
+                    call_max_gs = global_steps
+                # generate() stamps these once on the assembled TokenOutput (see the tail of that
+                # method); a stream has no single assembled output, so every delta carries them.
+                # NOT optional: assemble_batch_from_rollout_samples computes abs(max - min)
+                # unconditionally (detach_utils.py:1893) and dies on None.
+                delta.extra_fields["min_global_steps"] = call_min_gs
+                delta.extra_fields["max_global_steps"] = call_max_gs
                 yield delta
 
             if original_max_tokens is not None:
