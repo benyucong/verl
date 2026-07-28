@@ -193,6 +193,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     role="rollouter",
                     global_steps=int(global_steps) if global_steps is not None else None,
                     tokens_so_far=int(len(final_output.token_ids)),
+                    # MEASURE the re-prefill instead of inferring it. tokens_so_far counts tokens
+                    # PRODUCED, not tokens RECOMPUTED -- the whole OPDFlow-vs-veRL mechanism claim
+                    # rests on the latter and has never been observed. On resume the context is
+                    # prompt_ids + everything generated so far; num_cached_tokens says how much of
+                    # that vLLM served from the prefix cache, so context_tokens - num_cached_tokens
+                    # IS the recompute.
+                    context_tokens=int(len(prompt_ids) + len(final_output.token_ids)),
+                    prompt_tokens=int(len(prompt_ids)),
+                    num_cached_tokens=(
+                        int((output.extra_fields or {}).get('num_cached_tokens'))
+                        if (output.extra_fields or {}).get('num_cached_tokens') is not None else None
+                    ),
                     abort_ts=_abort_ts,
                     resume_ts=_resume_ts,
                     resume_delay_s=float(_resume_ts - _abort_ts),
