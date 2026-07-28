@@ -1059,6 +1059,10 @@ class AgentLoopWorker:
                 finish_reason=output.extra_fields.get("finish_reason"),
                 # Q3 per-replica attribution: which engine replica decoded this slice.
                 replica_rank=output.extra_fields.get("replica_rank"),
+                # Which side of the split-vs-continuous A/B produced this chunk. `streaming=True`
+                # above is set for BOTH, so without this the two arms are indistinguishable from
+                # trace data alone -- the exact blind spot that let six acc cells run A/A.
+                continuous_stream=bool(output.extra_fields.get("continuous_stream", False)),
             )
             return bool(success)
         except Exception:
