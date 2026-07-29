@@ -1007,7 +1007,9 @@ class AgentLoopWorker:
             chunk_parent_payload = chunk_batch
             if hybrid_span_payload_enabled() and "teacher_ids" in chunk_batch.batch.keys():
                 P = int(chunk_batch.batch["prompts"].shape[1])
-                lo, hi = P + token_offset, P + token_offset + n_tokens
+                # -1: index i holds the prediction for token i+1, so response token j lives at
+                # P+j-1. Must match `ss` below, which writes the span at the same offset.
+                lo, hi = P + token_offset - 1, P + token_offset - 1 + n_tokens
                 span_teacher_ids = chunk_batch.batch["teacher_ids"][0, lo:hi, :].detach().cpu().clone()
                 span_teacher_logprobs = chunk_batch.batch["teacher_logprobs"][0, lo:hi, :].detach().cpu().clone()
                 if is_final:
@@ -1423,7 +1425,9 @@ class AgentLoopWorker:
                 k = teacher_ids.shape[1]
                 full_ids = torch.zeros(S, k, dtype=torch.int32)
                 full_lps = torch.zeros(S, k, dtype=torch.float32)
-                ss = prompt_width + span_start
+                # -1: see the convention note in teacher_manager. A chunk owning response tokens
+                # [s, e) fills teacher indices [P+s-1, P+e-1).
+                ss = prompt_width + span_start - 1
                 full_ids[ss:ss + (span_end - span_start)] = teacher_ids
                 full_lps[ss:ss + (span_end - span_start)] = teacher_logprobs
                 teacher_ids, teacher_logprobs = full_ids, full_lps

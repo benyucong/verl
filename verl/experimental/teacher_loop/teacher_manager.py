@@ -264,13 +264,27 @@ class AsyncTeacherLLMServerManager:
         teacher_span_end_abs = prompt_width + span_end
         n = span_end - span_start
         K = self.distillation_loss_config.topk if self.distillation_loss_config.loss_settings.use_topk else 1
-        # Next-token convention: the teacher label supervising student position p is the prediction for
-        # token p+1 = prompt_logprobs[p+1] (the strict parser achieves this by iterating prompt_logprobs[1:]).
-        # So shift the extraction window +1. The FINAL response position has no in-sequence next token, so
-        # its label is a dummy (exactly as the strict parser pads a dummy last row).
-        shift_start_abs = teacher_span_start_abs + 1
-        shift_end_abs = teacher_span_end_abs + 1
-        last_is_dummy = shift_end_abs > valid_suffix_end_abs
+        # Next-token convention: teacher tensor index i holds the prediction for token i+1 (the strict
+        # parser gets this by iterating prompt_logprobs[1:]). So the label for response token t sits at
+        # index P+t-1, and a chunk owning response tokens [s, e) fills indices [P+s-1, P+e-1) with the
+        # predictions for tokens [P+s, P+e) -- i.e. prompt_logprobs rows [P+s, P+e), every one of which
+        # THIS request already has (its prompt is prompt + response[:e], length P+e).
+        #
+        # This previously read [P+s+1, P+e+1) and wrote at [P+s, P+e), which made a chunk responsible for
+        # the prediction of token P+e -- the FIRST TOKEN OF THE NEXT CHUNK, not yet generated when this
+        # request was scored. So last_is_dummy (which compares against valid_suffix_end_abs = P+span_end)
+        # was unconditionally TRUE for every chunk, not just the final one as its comment claimed, and a
+        # [0]*K row was appended each time. Under the student's left shift that dummy landed on a real
+        # trained position: one all-zero teacher row per chunk, which exp() reads as uniform mass K.
+        # Confirmed by actor/distillation/teacher_mass tracking 1 + (K-1)*ceil(R/c)/R exactly --
+        # umem 0.99986, c4096 1.0155, c1024 1.0613, c256 1.2512.
+        #
+        # With the window realigned no dummy is ever needed: index P+R-1 (the prediction for the token
+        # after the response) is simply never written, exactly as the strict parser's trailing dummy is
+        # never read.
+        shift_start_abs = teacher_span_start_abs
+        shift_end_abs = teacher_span_end_abs
+        last_is_dummy = False
         covered_end_abs = min(shift_end_abs, valid_suffix_end_abs)
         if os.environ.get("OPD_TEACHER_FIFO_DEBUG", "0") not in ("0", "", "false", "False"):
             logging.getLogger(__name__).warning(

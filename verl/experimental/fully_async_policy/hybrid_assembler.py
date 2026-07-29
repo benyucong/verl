@@ -243,8 +243,9 @@ def fill_carrier_teacher_tensors(carrier, assembled: dict) -> None:
     t_ids = torch.zeros(1, P + RW, k, dtype=torch.int32)
     t_lps = torch.zeros(1, P + RW, k, dtype=torch.float32)
     if L:
-        t_ids[0, P:P + L] = torch.tensor(ids, dtype=torch.int32)
-        t_lps[0, P:P + L] = torch.tensor(lps, dtype=torch.float32)
+        # P-1: index i holds the prediction for token i+1, so response token j lands at P+j-1.
+        t_ids[0, P - 1:P - 1 + L] = torch.tensor(ids, dtype=torch.int32)
+        t_lps[0, P - 1:P - 1 + L] = torch.tensor(lps, dtype=torch.float32)
     b["teacher_ids"] = t_ids
     b["teacher_logprobs"] = t_lps
 
