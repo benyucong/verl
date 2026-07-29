@@ -221,6 +221,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
         audios,
         mm_processor_kwargs: dict[str, Any],
     ) -> AgentLoopOutput:
+        # Cap the request at response_length. No caller sets max_tokens (agent_loop builds
+        # sampling_params without it), so the server falls back to
+        #   min(response_length, prompt_length + response_length - len(prompt_ids))
+        # and on a partial-rollout resume prompt_ids already contains everything generated so far
+        # -- so that fallback is computed against the MODEL budget rather than the REMAINING one.
+        # Measured on the veRL baseline arm: 17.0-17.4% of resumes ran past response_length, peak
+        # tokens_so_far 10,148 against a cap of 8,192, all of it discarded below by the
+        # [:self.response_length] slice. The chunk-streaming path is immune only because it sets
+        # the key explicitly per chunk, so leaving this unfixed handicaps the BASELINE and inflates
+        # every OPDFlow-vs-veRL number. Setting it also revives the rollouter's resume budget,
+        # which is dead code while limit_key resolves to None.
+        sampling_params = dict(sampling_params)
+        _limit_key = "max_new_tokens" if "max_new_tokens" in sampling_params else "max_tokens"
+        sampling_params[_limit_key] = self.response_length
+
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
