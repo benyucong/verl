@@ -298,6 +298,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # survive a weight-sync abort -- see the comment on the cutting loop below.
         buf_ids: list[int] = []
         buf_lps: list[float] = []
+        # Version window accumulated since the last chunk cut; consumed and reset by _stage.
+        cut_min_gs: int | None = None
+        cut_max_gs: int | None = None
 
         def _emit(entry: tuple, *, is_final: bool) -> None:
             entry_idx, token_offset, n_new_tokens, snapshot_len, extra_fields, gen_s = entry
@@ -344,7 +347,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             stop_reason, and only an abort is followed by a resume, so finality is known when the
             chunk is cut. The response_length cap is also terminal, hence the promotion below.
             """
-            nonlocal chunk_idx, last_delta_ts
+            nonlocal chunk_idx, last_delta_ts, cut_min_gs, cut_max_gs
             remaining = self.response_length - len(response_ids)
             if remaining <= 0:
                 return False
@@ -356,7 +359,19 @@ class SingleTurnAgentLoop(AgentLoopBase):
             if len(lps) >= n:
                 response_logprobs.extend(lps[:n])
             _now = time.time()
-            entry = (chunk_idx, token_offset, n, len(response_ids), last_extra_fields, _now - last_delta_ts)
+            # Weight-version window scoped to THIS CHUNK, matching split -- where each chunk is its
+            # own request, so generate() naturally reports the versions that decoded that chunk.
+            # Scoping it to the response instead made every continuous chunk carry the
+            # response-START version: measured spread of 0 across all 3732 multi-chunk parents,
+            # against split's {0: 713, 1: 2967, 2: 35}. That is not cosmetic -- chunk_policy_version
+            # feeds ChunkSample.is_stale and the trainer's _drop_stale_chunk gate, so it biases the
+            # staleness accounting one-sidedly against continuous.
+            chunk_extra = dict(last_extra_fields)
+            if cut_min_gs is not None:
+                chunk_extra["min_global_steps"] = cut_min_gs
+                chunk_extra["max_global_steps"] = cut_max_gs
+            cut_min_gs, cut_max_gs = None, None
+            entry = (chunk_idx, token_offset, n, len(response_ids), chunk_extra, _now - last_delta_ts)
             last_delta_ts = _now
             chunk_idx += 1
             # Hitting response_length ends the response just as surely as a terminal stop_reason,
@@ -396,6 +411,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
             last_stop_reason = delta.stop_reason
             if delta.num_preempted is not None:
                 total_num_preempted += int(delta.num_preempted)
+
+            _gs = last_extra_fields.get("global_steps")
+            if _gs is not None:
+                _gs = int(_gs)
+                cut_min_gs = _gs if cut_min_gs is None else min(cut_min_gs, _gs)
+                cut_max_gs = _gs if cut_max_gs is None else max(cut_max_gs, _gs)
 
             if chunk_idx == 0:
                 # Fail loudly, by name, on the first chunk. A version field missing from a delta does

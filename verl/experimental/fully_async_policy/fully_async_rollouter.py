@@ -261,6 +261,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # partial-rollout telemetry outright -- partial_ratio 0.0 against split's 0.885 and veRL's
         # 1.0, with total_partial_num 0 against 85 and 96.
         call_min_gs, call_max_gs = None, None
+        last_num_cached = None
         while True:
             stop_reason = None
             global_steps = None
@@ -280,6 +281,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 if delta.extra_fields is None:
                     delta.extra_fields = {}
                 global_steps = delta.extra_fields.get("global_steps", global_steps)
+                # Carry the engine's prefix-cache hit count to the resume trace below. Without it
+                # `context_tokens - num_cached_tokens` -- the ACTUAL re-prefill, and the leading
+                # remaining hypothesis for this arm's deficit -- is unmeasurable on exactly the arm
+                # under investigation, while the split path has recorded it since :204.
+                if delta.extra_fields.get("num_cached_tokens") is not None:
+                    last_num_cached = int(delta.extra_fields["num_cached_tokens"])
                 if global_steps is not None:
                     if call_min_gs is None:
                         call_min_gs = global_steps
@@ -312,6 +319,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     tokens_so_far=int(len(produced)),
                     context_tokens=int(len(prompt_ids) + len(produced)),
                     prompt_tokens=int(len(prompt_ids)),
+                    num_cached_tokens=last_num_cached,
                     continuous_stream=True,
                     abort_ts=_abort_ts,
                     resume_ts=_resume_ts,

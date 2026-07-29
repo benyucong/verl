@@ -660,6 +660,15 @@ class vLLMHttpServer:
             # Lets the trainer/analysis tell a continuous-stream chunk from a split-request one.
             "continuous_stream": True,
         }
+        # Engine queue wait, mirroring generate(). Absent here, the continuous arm cannot be
+        # compared against the split arm on the one axis where an engine-side difference would
+        # show up as scheduling delay rather than decode cost.
+        _rm = getattr(res, "metrics", None)
+        if _rm is not None:
+            _arr = getattr(_rm, "arrival_time", None)
+            _sched = getattr(_rm, "first_scheduled_time", None)
+            if _arr is not None and _sched is not None:
+                extra_fields["queue_wait_s"] = max(0.0, float(_sched) - float(_arr))
         return TokenOutput(
             token_ids=list(out.token_ids[start:end]),
             log_probs=log_probs,
