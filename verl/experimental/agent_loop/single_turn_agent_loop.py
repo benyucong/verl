@@ -290,7 +290,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         chunk_emit_tasks: list[asyncio.Task] = []
         last_extra_fields: dict[str, Any] = {}
         last_stop_reason = None
-        pending: tuple | None = None
+        final_emitted = False
         chunk_idx = 0
         stream_start = time.time()
         last_delta_ts = stream_start
@@ -328,14 +328,23 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 )
             )
 
-        def _stage(tok_ids: list, lps: list) -> bool:
-            """Turn one cut chunk into the pending entry, emitting whatever was pending before it.
+        def _stage(tok_ids: list, lps: list, is_final: bool) -> bool:
+            """Emit one cut chunk IMMEDIATELY. Returns False once response_length is reached.
 
-            Returns False once response_length is reached so the caller stops cutting. `pending`
-            carries the one-delta lookahead: is_final has to be set at emit time, and a chunk is
-            only known to be last once the stream ends.
+            This used to buffer a chunk and release it only when its successor arrived, because
+            is_final has to be set at emit time. That one-delta lookahead was catastrophic at large
+            chunk sizes: with 2 chunks per response, chunk 0 was held until chunk 1 staged, and
+            chunk 1 only stages at the post-stream flush -- so BOTH fired at the end. Measured at
+            chunk 4096, a parent emitted its whole response within 3.5 s of a 177 s generation
+            (emit-span / gen-span = 0.021, against the split path's 0.502). That is not streaming,
+            it is a batch dump, which is exactly veRL-baseline behaviour -- and it is why the arm
+            reproduced veRL's throughput to 0.5%.
+
+            No lookahead is needed: the server marks its terminal delta with a non-abort
+            stop_reason, and only an abort is followed by a resume, so finality is known when the
+            chunk is cut. The response_length cap is also terminal, hence the promotion below.
             """
-            nonlocal pending, chunk_idx, last_delta_ts
+            nonlocal chunk_idx, last_delta_ts
             remaining = self.response_length - len(response_ids)
             if remaining <= 0:
                 return False
@@ -350,9 +359,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
             entry = (chunk_idx, token_offset, n, len(response_ids), last_extra_fields, _now - last_delta_ts)
             last_delta_ts = _now
             chunk_idx += 1
-            if pending is not None:
-                _emit(pending, is_final=False)
-            pending = entry
+            # Hitting response_length ends the response just as surely as a terminal stop_reason,
+            # and the trainer's coverage check requires exactly one is_final per parent.
+            final = is_final or len(response_ids) >= self.response_length
+            if final:
+                nonlocal final_emitted
+                final_emitted = True
+            _emit(entry, is_final=final)
             return True
 
         async for delta in self.server_manager.generate_stream(
@@ -385,12 +398,18 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     f"param-version accounting needs them on every chunk (present: {sorted(last_extra_fields)})"
                 )
 
+            # Evaluate finality BEFORE the empty-delta shortcut. A terminal delta legitimately
+            # carries zero tokens when the response ends on an exact chunk boundary -- and the
+            # median response here is exactly response_length -- so skipping it would lose the only
+            # signal that the stream is over.
+            stream_done = delta.stop_reason not in (None, "aborted", "abort")
             new_token_ids = list(delta.token_ids or [])
-            if not new_token_ids:
+            if not new_token_ids and not stream_done:
                 continue
-            buf_ids.extend(new_token_ids)
-            if delta.log_probs is not None:
-                buf_lps.extend(list(delta.log_probs[: len(new_token_ids)]))
+            if new_token_ids:
+                buf_ids.extend(new_token_ids)
+                if delta.log_probs is not None:
+                    buf_lps.extend(list(delta.log_probs[: len(new_token_ids)]))
 
             # Cut chunks at EXACT chunk_tokens boundaries, ACROSS aborts.
             #
@@ -402,17 +421,32 @@ class SingleTurnAgentLoop(AgentLoopBase):
             # absorbed inside the chunk request's own resume loop, so a boundary only ever lands
             # at max_tokens. Buffering here spans the resume, so a weight sync can no longer move
             # a chunk boundary.
-            while len(buf_ids) >= chunk_tokens:
-                if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens]):
+            # When the stream is over, hold back the tail so the LAST emission carries is_final.
+            keep = chunk_tokens if stream_done else chunk_tokens - 1
+            while len(buf_ids) > keep:
+                if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens], False):
                     break  # response_length reached; drop the rest
                 del buf_ids[:chunk_tokens]
                 del buf_lps[: min(chunk_tokens, len(buf_lps))]
+            if stream_done and buf_ids:
+                _stage(buf_ids, buf_lps, True)
+                buf_ids.clear()
+                buf_lps.clear()
 
-        # Flush the tail. Only here is it genuinely the last chunk of the response.
+        # Defensive tail flush: the generator can in principle end without ever yielding a terminal
+        # stop_reason. Losing this would leave the parent with no is_final and stall its assembly.
         if buf_ids:
-            _stage(buf_ids, buf_lps)
-        if pending is not None:
-            _emit(pending, is_final=True)
+            _stage(buf_ids, buf_lps, True)
+        if chunk_idx > 0 and not final_emitted:
+            # A response ending exactly on a chunk boundary leaves the buffer empty when the
+            # terminal delta arrives, so no cut chunk can carry is_final. Log it rather than let
+            # the parent stall in the assembler waiting for a final chunk that never comes. If this
+            # ever fires at scale the emit granularity needs decoupling from the chunk size.
+            logger.error(
+                "continuous-stream parent produced %d chunks with no is_final (response_ids=%d, "
+                "chunk_tokens=%d); the assembler will not finalize it",
+                chunk_idx, len(response_ids), chunk_tokens,
+            )
 
         if chunk_emit_tasks:
             emit_results = await asyncio.gather(*chunk_emit_tasks, return_exceptions=True)
