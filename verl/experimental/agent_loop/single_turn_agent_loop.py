@@ -368,10 +368,24 @@ class SingleTurnAgentLoop(AgentLoopBase):
             _emit(entry, is_final=final)
             return True
 
+        # Cap the request at response_length, exactly as the split path caps each chunk at
+        # chunk_limit. No caller sets max_tokens for the rollout, so leaving it unset makes the
+        # server fall back to min(response_length, prompt_length + response_length - len(prompt_ids))
+        # -- and on a partial-rollout resume prompt_ids already contains everything generated so
+        # far, so that fallback is computed against the MODEL budget rather than the REMAINING one.
+        # Measured: 26-27% of resumed parents overran response_length by ~970 tokens (peak 10,153
+        # against a cap of 8,192), all of it decoded at the longest, most expensive KV lengths and
+        # then discarded by the response_length clamp below. The split arm overshoots on 0% of
+        # parents because it always sets the key. Setting it here also revives the rollouter's
+        # resume budget, which was dead code while limit_key resolved to None.
+        stream_sampling_params = dict(sampling_params)
+        _limit_key = "max_new_tokens" if "max_new_tokens" in stream_sampling_params else "max_tokens"
+        stream_sampling_params[_limit_key] = self.response_length
+
         async for delta in self.server_manager.generate_stream(
             request_id=request_id,
             prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
+            sampling_params=stream_sampling_params,
             chunk_tokens=chunk_tokens,
             image_data=images,
             video_data=videos,
