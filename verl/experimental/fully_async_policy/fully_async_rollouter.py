@@ -252,13 +252,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
 
         produced: list[int] = []
+        # Weight-version window for the WHOLE response, NOT per engine call.
+        #
+        # generate() tracks min/max across its entire resume loop, so a sample that survives a
+        # weight sync records max > min. I originally reset this per engine call, reasoning that it
+        # matched the split path's per-chunk granularity. It does not: resetting made every
+        # continuous sample report min == max, i.e. "never crossed a sync", which zeroed the
+        # partial-rollout telemetry outright -- partial_ratio 0.0 against split's 0.885 and veRL's
+        # 1.0, with total_partial_num 0 against 85 and 96.
+        call_min_gs, call_max_gs = None, None
         while True:
             stop_reason = None
             global_steps = None
-            # Weight-version window of the CURRENT engine call, reset per call so each delta reports
-            # the window it was actually decoded under -- the same granularity the split path gets
-            # for free by making every chunk its own generate() call.
-            call_min_gs, call_max_gs = None, None
             async for delta in super().generate_stream(
                 request_id=request_id,
                 prompt_ids=prompt_ids + produced,
