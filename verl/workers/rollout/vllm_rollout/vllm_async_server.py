@@ -684,6 +684,7 @@ class vLLMHttpServer:
         sampling_params: dict[str, Any],
         request_id: str,
         chunk_tokens: int,
+        first_chunk_tokens: int = 0,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
@@ -766,7 +767,13 @@ class vLLMHttpServer:
             priority=priority,
         )
 
+        # Where to cut the FIRST delta of this engine call. On a partial-rollout resume the
+        # consumer's buffer already holds a partial chunk (the carry), so waiting for a full
+        # chunk_tokens of NEW decode pushes every subsequent boundary late for the rest of the
+        # response. Measured before this: continuous emitted its first chunk at 71% of generation
+        # (p90 94%) against split's 49%, because n_emitted reset to 0 on every resume.
         n_emitted = 0
+        next_cut = first_chunk_tokens if first_chunk_tokens and first_chunk_tokens > 0 else chunk_tokens
         last_res: Optional[RequestOutput] = None
         async for output in generator:
             last_res = output
@@ -774,10 +781,10 @@ class vLLMHttpServer:
                 continue
             # Emit whole chunks as they accumulate; the remainder rides the next yield. The final
             # partial chunk is emitted by the terminal yield below.
-            while len(output.outputs[0].token_ids) - n_emitted >= chunk_tokens:
-                end = n_emitted + chunk_tokens
-                yield self._delta_token_output(output, sampling_params, n_emitted, end, stop_reason=None)
-                n_emitted = end
+            while len(output.outputs[0].token_ids) >= next_cut:
+                yield self._delta_token_output(output, sampling_params, n_emitted, next_cut, stop_reason=None)
+                n_emitted = next_cut
+                next_cut += chunk_tokens
 
         if last_res is None or not last_res.outputs:
             # Aborted before anything was returned. Everything decoded earlier was already yielded.

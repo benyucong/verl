@@ -270,6 +270,13 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 prompt_ids=prompt_ids + produced,
                 sampling_params=sampling_params,
                 chunk_tokens=chunk_tokens,
+                # Where the NEXT chunk boundary falls, given what the consumer already holds.
+                # The server counts only tokens IT produced, so after a resume it would otherwise
+                # wait a full chunk_tokens before yielding, even though the consumer is already
+                # part-way through a chunk -- pushing every later boundary late for the rest of the
+                # response. Measured before this: first chunk emitted at 71% of generation (p90 94%)
+                # against the split path's 49%.
+                first_chunk_tokens=(chunk_tokens - (len(produced) % chunk_tokens)) if chunk_tokens else 0,
                 image_data=image_data,
                 video_data=video_data,
                 audio_data=audio_data,
