@@ -126,6 +126,8 @@ def test_span_from_chunk_payload_stitches_to_carrier():
     responses = torch.randint(0, 50000, (1, R), generator=g)
     teacher_ids = torch.randint(0, 50000, (1, P + R, k), generator=g)
     teacher_lps = -torch.rand(1, P + R, k, generator=g)
+    # Strict next-token convention: teacher index i holds the prediction for token i+1, so the
+    # label for response token j sits at index P+j-1 and the response region is [P-1, P+R-1).
     payload = SimpleNamespace(batch={
         "prompts": torch.zeros(1, P, dtype=torch.long),
         "responses": responses,
@@ -143,16 +145,16 @@ def test_span_from_chunk_payload_stitches_to_carrier():
     acc.finalize(R)
     out = acc.assemble()
 
-    # stitched labels == the carrier's response region (response token j is at teacher index P+j)
+    # stitched labels == the carrier's response region (response token j's label is at index P+j-1)
     assert out["response_token_ids"] == responses[0].tolist()
-    assert out["teacher_topk_ids"] == teacher_ids[0, P:P + R].tolist()
-    assert out["teacher_topk_log_probs"] == teacher_lps[0, P:P + R].tolist()
+    assert out["teacher_topk_ids"] == teacher_ids[0, P - 1:P - 1 + R].tolist()
+    assert out["teacher_topk_log_probs"] == teacher_lps[0, P - 1:P - 1 + R].tolist()
     assert out["response_mask"] == [1] * R
 
     # built tensors match the carrier's response region exactly (carrier-overwrite would be a no-op)
     t = build_sample_tensors(out, pad_token_id=0)
-    assert torch.equal(t["teacher_ids"], teacher_ids[0, P:P + R])
-    assert torch.allclose(t["teacher_logprobs"], teacher_lps[0, P:P + R], atol=1e-6)
+    assert torch.equal(t["teacher_ids"], teacher_ids[0, P - 1:P - 1 + R])
+    assert torch.allclose(t["teacher_logprobs"], teacher_lps[0, P - 1:P - 1 + R], atol=1e-6)
     assert torch.equal(t["responses"], responses[0])
 
 
@@ -189,7 +191,8 @@ def test_span_only_payload_reconstructs_full_sample():
     assert out["teacher_topk_ids"] == gt_ids.tolist()
     assert out["teacher_topk_log_probs"] == gt_lps.tolist()
 
-    # fill_carrier rebuilds full-sequence teacher tensors: response token j at index P+j; pad elsewhere
+    # fill_carrier rebuilds full-sequence teacher tensors in the strict next-token convention:
+    # response token j's label at index P+j-1 (the left-shifted read the loss performs); pad elsewhere
     from types import SimpleNamespace
     carrier = SimpleNamespace(batch={
         "prompts": torch.zeros(1, P, dtype=torch.long),
@@ -198,10 +201,10 @@ def test_span_only_payload_reconstructs_full_sample():
     fill_carrier_teacher_tensors(carrier, out)
     assert tuple(carrier.batch["teacher_ids"].shape) == (1, P + RW, k)
     assert carrier.batch["teacher_ids"].dtype == torch.int32  # matches native teacher tensor dtype
-    assert torch.equal(carrier.batch["teacher_ids"][0, P:P + R], gt_ids.to(torch.int32))
-    assert torch.allclose(carrier.batch["teacher_logprobs"][0, P:P + R], gt_lps, atol=1e-6)
-    assert int(torch.count_nonzero(carrier.batch["teacher_ids"][0, :P])) == 0          # prompt region pad
-    assert int(torch.count_nonzero(carrier.batch["teacher_ids"][0, P + R:])) == 0      # response pad region
+    assert torch.equal(carrier.batch["teacher_ids"][0, P - 1:P - 1 + R], gt_ids.to(torch.int32))
+    assert torch.allclose(carrier.batch["teacher_logprobs"][0, P - 1:P - 1 + R], gt_lps, atol=1e-6)
+    assert int(torch.count_nonzero(carrier.batch["teacher_ids"][0, :P - 1])) == 0       # prompt region pad
+    assert int(torch.count_nonzero(carrier.batch["teacher_ids"][0, P - 1 + R:])) == 0   # response pad region
 
 
 def test_reorder_tolerant_reassembly():

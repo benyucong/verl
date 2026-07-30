@@ -206,8 +206,9 @@ def span_from_chunk_payload(chunk, prompt_width=None) -> ChunkLabelSpan:
     `parent_payload` DataProto into a ChunkLabelSpan (stdlib lists, so the accumulator validates them).
 
     Layout (verified): teacher tensors in parent_payload are FULL-SEQUENCE aligned, shape
-    [1, prompt_width + response_width, k] (left-padded prompt + right-padded response), so response
-    token j lives at absolute index prompt_width + j. `responses` is response-only width
+    [1, prompt_width + response_width, k] (left-padded prompt + right-padded response), in the strict
+    next-token convention (index i holds the prediction for token i+1), so the LABEL for response
+    token j lives at absolute index prompt_width + j - 1. `responses` is response-only width
     [1, response_width]. prompt_width is constant per parent (= rollout.prompt_length).
     """
     b = chunk.parent_payload.batch
@@ -218,8 +219,10 @@ def span_from_chunk_payload(chunk, prompt_width=None) -> ChunkLabelSpan:
         span_start=o,
         span_end=o + n,
         response_token_ids=b["responses"][0, o:o + n].tolist(),
-        teacher_topk_ids=b["teacher_ids"][0, P + o:P + o + n, :].tolist(),
-        teacher_topk_log_probs=b["teacher_logprobs"][0, P + o:P + o + n, :].tolist(),
+        # P-1: same offset as the wire slice (agent_loop) and fill_carrier below; slicing at P+o
+        # (the pre-alignment-fix convention) returns every label one token late.
+        teacher_topk_ids=b["teacher_ids"][0, P + o - 1:P + o - 1 + n, :].tolist(),
+        teacher_topk_log_probs=b["teacher_logprobs"][0, P + o - 1:P + o - 1 + n, :].tolist(),
         policy_version=int(getattr(chunk, "policy_version", 0) or 0),
     )
 

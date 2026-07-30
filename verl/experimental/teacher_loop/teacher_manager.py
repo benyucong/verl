@@ -334,8 +334,15 @@ class AsyncTeacherLLMServerManager:
             cef = getattr(clean_out, "extra_fields", {}) or {}
             full_ids = cef["prompt_ids"]  # strict full [S, K]: row j == prompt_logprobs[j+1]
             full_lps = cef["prompt_logprobs"]
-            new_ids = list(full_ids[teacher_span_start_abs:teacher_span_end_abs])
-            new_lps = list(full_lps[teacher_span_start_abs:teacher_span_end_abs])
+            # -1: the strict parser is SHIFTED (row j == prompt_logprobs[j+1], trailing all-zero dummy
+            # at row S-1), while the incremental suffix above is UNSHIFTED (row p scores token p). The
+            # predictions for tokens [P+s, P+e) therefore sit at strict rows [P+s-1, P+e-1). Slicing
+            # [P+s, P+e) here returned every label one token late and ended on the dummy, so a fallback
+            # chunk trained each position against the NEXT token's distribution and its last position
+            # against an all-zero row (uniform mass K) -- the residual teacher_mass_max == K that
+            # appeared in exactly the metric windows where teacher/fallback_clean_count > 0.
+            new_ids = list(full_ids[teacher_span_start_abs - 1:teacher_span_end_abs - 1])
+            new_lps = list(full_lps[teacher_span_start_abs - 1:teacher_span_end_abs - 1])
             teacher_ids, teacher_logprobs = _finalize_span_tensors(new_ids, new_lps, n, K)
             telemetry.update({
                 "fallback_clean": True,
