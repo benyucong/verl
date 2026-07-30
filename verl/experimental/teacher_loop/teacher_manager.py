@@ -46,13 +46,27 @@ def _get_teacher_sampling_params(
         "max_tokens": 1,
         "temperature": teacher_model_config.inference.temperature,
         "prompt_logprobs": num_logprobs,
+        # BOTH ARMS, and it must stay that way. We consume only .logprob/.rank/the token-id keys
+        # (workers/rollout/vllm_rollout/utils.py extract_prompt_logprobs) -- the decoded strings are
+        # never read. But detokenize defaults to True, and in vLLM v1 that flag also decides whether
+        # the LOGPROBS processor gets a tokenizer (v1/engine/output_processor.py: "if not
+        # sampling_params.detokenize: tokenizer = None"), which in turn drives
+        # convert_ids_list_to_tokens over num_prompt_tokens * K ids plus a per-position UTF-8
+        # correction pass. At K=64 over an 8192-token response that is ~533k string conversions per
+        # request -- pure Python, on the engine's output thread.
+        #
+        # This used to be set only on the incremental path, which quietly handicapped the baseline:
+        # at Gt=2 the SAME two teacher GPUs delivered 3224 uncached tok/s/GPU for the one-big-request
+        # baseline versus 7389 for chunk streaming, and baseline teacher latency was 156 s against
+        # 1.13 s. That gap read as an OPDFlow win (+67%) when it was really an arm-specific flag.
+        "detokenize": False,
     }
     if incremental:
-        # Read the cached prefix KV (default would skip it for prompt_logprobs) and skip detokenization
-        # (the cached-prefix rows hold out-of-range garbage ids that crash the detokenizer). The server
-        # then returns only the valid recomputed suffix; we slice the exact new span below.
+        # Incremental-only: read the cached prefix KV (the default skips it for prompt_logprobs), so
+        # the server returns just the recomputed suffix and we slice the exact new span below. This
+        # is also why the arm CANNOT detokenize -- the cached-prefix rows carry out-of-range ids that
+        # crash the detokenizer -- but that is a correctness requirement here, not a speed knob.
         params["skip_reading_prefix_cache"] = False
-        params["detokenize"] = False
     return params
 
 
