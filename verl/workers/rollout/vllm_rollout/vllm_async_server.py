@@ -590,6 +590,21 @@ class vLLMHttpServer:
             # first reliably-valid recomputed row is num_cached_tokens + 1. This is safe: the desired
             # span is shifted +1 (next-token), so it always starts at >= num_cached_tokens + 1.
             _start = max(_nct + 1, 1)
+            # Never parse below the window the caller asked the engine to MATERIALISE. With
+            # prompt_logprobs_range set, rows outside it are None by design, and
+            # extract_incremental_prompt_logprobs raises on a None inside its range -- so without this
+            # clamp every windowed call would die, because num_cached_tokens is block-aligned DOWNWARD
+            # and is therefore normally a little BELOW the window start, not above it.
+            #
+            # Raising _start rather than widening the window is what preserves the existing contract:
+            # valid_suffix_start_abs is published to the caller, whose coverage test
+            # (valid_suffix_start_abs <= shift_start_abs) then behaves exactly as before. In the
+            # cross-response-interference case (num_cached past the span start) _start stays at
+            # _nct + 1 > window start, coverage legitimately fails, and the clean-recompute fallback
+            # fires as it always did.
+            _win = getattr(sampling_params, "prompt_logprobs_range", None)
+            if _win is not None:
+                _start = max(_start, int(_win[0]))
             if _start >= _flen:
                 # Fully cached (e.g. an identical sibling response already cached this exact sequence):
                 # no valid recomputed rows. Return an EMPTY suffix; the teacher_manager sees the desired

@@ -32,10 +32,42 @@ from verl.workers.config import (
 from verl.workers.rollout.llm_server import LLMServerClient
 
 
+def _sampling_params_supports_window() -> bool:
+    """Does the running vLLM have the prompt_logprobs_range patch?
+
+    Cached, because this is consulted per teacher call. If the engine is stock, passing the key would
+    raise TypeError inside SamplingParams(**sampling_params) and take down every teacher request --
+    so an unpatched engine must degrade to the old full-materialisation behaviour, not crash.
+    """
+    if _WINDOW_SUPPORTED[0] is None:
+        from vllm import SamplingParams
+
+        _WINDOW_SUPPORTED[0] = "prompt_logprobs_range" in getattr(SamplingParams, "__struct_fields__", ())
+        if not _WINDOW_SUPPORTED[0]:
+            # FAIL, do not warn. This is only ever reached when the window was EXPLICITLY requested,
+            # and the sweep encodes that request in the run label (_win1). Degrading to unwindowed
+            # would produce a run labelled as the treatment arm that silently received the control --
+            # an arm-asymmetric flag that survives into the analysis unnoticed. That exact failure
+            # mode (detokenize=False on the streaming arm only) manufactured a +67% result here that
+            # collapsed to +0.3% once corrected. A warning in a Ray worker's stdout is not a control:
+            # this project has already lost measurements to log lines nobody read.
+            raise RuntimeError(
+                "OPD_TEACHER_LOGPROBS_WINDOW=1 but this vLLM has no SamplingParams.prompt_logprobs_range. "
+                "Apply patches/vllm-0.15.1-prompt_logprobs_range.patch to the vLLM in use (or put a "
+                "patched source checkout on PYTHONPATH). Refusing to run: the job would be labelled as "
+                "the windowed arm while executing the unwindowed one."
+            )
+    return _WINDOW_SUPPORTED[0]
+
+
+_WINDOW_SUPPORTED: list[Optional[bool]] = [None]
+
+
 def _get_teacher_sampling_params(
     teacher_model_config: DistillationTeacherModelConfig,
     distillation_loss_config: DistillationLossConfig,
     incremental: bool = False,
+    logprobs_window: Optional[tuple[int, int]] = None,
 ) -> dict[str, Any]:
     """Get sampling parameters for teacher model when computing log probabilities for distillation."""
     if teacher_model_config.inference.temperature != 1.0:
@@ -67,6 +99,19 @@ def _get_teacher_sampling_params(
         # is also why the arm CANNOT detokenize -- the cached-prefix rows carry out-of-range ids that
         # crash the detokenizer -- but that is a correctness requirement here, not a speed knob.
         params["skip_reading_prefix_cache"] = False
+        # INCREMENTAL ONLY. Build Logprob objects for just the rows this chunk will actually slice.
+        # Stock vLLM builds K per position over the WHOLE submitted prefix regardless of cache hits --
+        # 8192 x K=64 = 524,288 objects per request -- which is what makes the teacher's cost track
+        # SUBMITTED context (measured 105 us/submitted token, of which ~92% is this construction) and
+        # is therefore what makes chunk streaming pay an (N+1)/2 tax for context it re-sends but never
+        # uses. Windowed, that marginal cost drops to ~8 us/token.
+        #
+        # This must NEVER be set on the clean/fallback arm below: that path is parsed by the STRICT
+        # extract_prompt_logprobs, which iterates prompt_logprobs[1:] and asserts a fixed row width, so
+        # the None rows outside the window would make it raise. The fallback needs every row anyway --
+        # it exists precisely for when the incremental span is not recoverable.
+        if logprobs_window is not None and _sampling_params_supports_window():
+            params["prompt_logprobs_range"] = logprobs_window
     return params
 
 
@@ -184,12 +229,27 @@ class AsyncTeacherLLMServerManager:
         # Stage 2: per-parent FIFO. Serialize this parent's chunk-score calls so the prefix KV is populated
         # in span order (chunk k completes before k+1 begins); different parents stay concurrent. The
         # SERVER request id stays unique per call so concurrent CROSS-parent calls never collide.
+        # The exact rows this call will slice, in ABSOLUTE prompt positions: the shifted span starts at
+        # prompt_width + span_start (see the next-token derivation below, where
+        # shift_start_abs == teacher_span_start_abs), and this request's prompt IS prompt+response[:e],
+        # so its last row is len(sequence_ids) - 1. Asking for anything narrower than
+        # [shift_start, len(sequence_ids)) would strand rows the server still intends to hand back:
+        # it extracts [max(num_cached+1, 1, window_start), full_prefix_len), and a None inside that
+        # range is a hard ValueError in extract_incremental_prompt_logprobs. Widening at the START is
+        # what the server-side clamp does; the END must cover the full submitted length.
+        logprobs_window = None
+        if incremental and os.environ.get("OPD_TEACHER_LOGPROBS_WINDOW", "0") not in ("0", "", "false", "False"):
+            logprobs_window = (int(prompt_width) + int(span_start), len(sequence_ids))
+
         def _generate():
             return client.generate(
                 request_id=routing_request_id,
                 prompt_ids=sequence_ids,
                 sampling_params=_get_teacher_sampling_params(
-                    teacher_model_config, self.distillation_loss_config, incremental=incremental
+                    teacher_model_config,
+                    self.distillation_loss_config,
+                    incremental=incremental,
+                    logprobs_window=logprobs_window,
                 ),
                 image_data=multi_modal_data.get("images"),
                 video_data=multi_modal_data.get("videos"),

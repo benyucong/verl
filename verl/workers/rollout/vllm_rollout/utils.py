@@ -396,6 +396,23 @@ def extract_incremental_prompt_logprobs(
             raise ValueError(f"prompt position {p}: None (uncomputed) -- incremental span not fully covered")
         if len(d) not in (K, K + 1):
             raise ValueError(f"prompt position {p}: {len(d)} top-k entries (expected {K}/{K + 1}) -- garbage row in span")
+        if K == 0:
+            # NON-TOP-K LOSSES (vanilla OPD / k1). num_logprobs is `topk if use_topk else 0`, and only
+            # forward_kl_topk sets use_topk, so every non-top-k loss requests prompt_logprobs=0 -- one
+            # entry per position, the prompt token's OWN logprob. The strict full-span parser above has
+            # an explicit `num_prompt_logprobs == 0` branch for exactly this and emits a width-1 row;
+            # this incremental parser did not, so it fell through to the rank loop below, where
+            # `[None] * 0` is empty and `rank > K` (rank >= 1 > 0) discards every entry. The result was
+            # 0-width rows against a consumer that computes K = topk if use_topk else 1 and asserts
+            # width 1 -- "span row 0: top-k width 0/0 != 1", raised on the very first chunk.
+            #
+            # Consequence worth stating plainly: the streaming/incremental teacher path only ever
+            # worked with a top-k loss. Every OPDFlow streaming measurement predating this fix was
+            # GKD; vanilla OPD could not complete a single optimizer step (job 44473633, global_steps=0).
+            token_id_str = next(iter(d))
+            ids_rows.append([int(token_id_str)])
+            lp_rows.append([d[token_id_str].logprob])
+            continue
         ids = [None] * K
         lps = [None] * K
         for token_id_str, token_logprob in d.items():
