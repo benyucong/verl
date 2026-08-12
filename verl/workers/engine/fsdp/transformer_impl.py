@@ -673,6 +673,20 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
 
+        # Forward-Horizon curriculum: narrow the loss mask BEFORE the token count is taken.
+        #
+        # This has to happen here, not only in the loss. batch_num_tokens is the DENOMINATOR of
+        # the token-mean aggregation, and it is derived from loss_mask. Narrowing the graded span
+        # inside the loss while this count still reflects every response token would shrink the
+        # numerator alone, scaling the loss -- and so the gradient -- by the graded fraction. An
+        # H covering 10% of the trajectory would then act as a 10x learning-rate cut wearing a
+        # curriculum's clothes, and the arm would look like it trained while measuring nothing.
+        from verl.trainer.distillation.losses import apply_forward_horizon
+
+        narrowed, horizon = apply_forward_horizon(data["loss_mask"])
+        if horizon:
+            data["loss_mask"] = narrowed
+
         # compute num_tokens in global batch for loss normalization
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
         torch.distributed.all_reduce(
