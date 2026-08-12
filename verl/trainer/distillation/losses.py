@@ -227,6 +227,36 @@ def distillation_ppo_loss(
     return policy_loss, policy_metrics
 
 
+def apply_forward_horizon(response_mask: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Forward-Horizon curriculum: grade only the first H tokens the policy generated.
+
+    GENERATION IS NOT TRUNCATED -- only the graded span is. Cutting generation at H instead would
+    supervise a span containing no termination, which is exactly the failure this project already
+    measured in prefix-only SFT: 50 steps of loss on text that never ends taught the model not to
+    end, truncation went 3.5% -> 29% within ten steps. Grading a prefix of a COMPLETE rollout is
+    safe; producing only a prefix is not.
+
+    Position is counted by cumsum over the mask, not by column index, so left/right padding and
+    ragged batches all count real generated tokens only.
+
+    The horizon arrives by environment variable because the curriculum runs as a sequence of
+    separate verl invocations, each resuming the previous checkpoint. A per-stage constant needs
+    no hydra schema change and no per-step plumbing into the FSDP workers, which inherit the
+    environment. H <= 0 (or unset) means "grade everything", i.e. vanilla OPD.
+    """
+    raw = os.environ.get("OPD_FH_HORIZON", "")
+    if not raw:
+        return response_mask, 0
+    try:
+        horizon = int(raw)
+    except ValueError:
+        return response_mask, 0
+    if horizon <= 0:
+        return response_mask, 0
+    position = torch.cumsum(response_mask.to(torch.int32), dim=-1)
+    return response_mask * (position <= horizon).to(response_mask.dtype), horizon
+
+
 def distillation_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
