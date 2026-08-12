@@ -1884,11 +1884,25 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
         monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
+        fatal: BaseException | None = None
         try:
-            # Run build and monitoring tasks concurrently
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            # return_exceptions=True so a failure in one task does not leave the other orphaned --
+            # but the results MUST be inspected. Discarding them turned a dead rollouter into a
+            # clean exit: generation aborted on an unhandled FifoDuplicateError, fit() returned
+            # None, ray.get() succeeded, the driver exited 0 and Slurm recorded COMPLETED 0:0.
+            # Three consecutive campaigns were analysed as healthy while every streaming job had
+            # died 8-16 minutes in; only the drain-stripped analyzer noticed, by reporting
+            # "insufficient". A run that dies must FAIL, loudly, at the point it dies.
+            results = await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            for name, r in zip(("generation_task", "monitor_task"), results):
+                if isinstance(r, asyncio.CancelledError):
+                    continue
+                if isinstance(r, BaseException):
+                    fatal = fatal or r
+                    print(f"[FullyAsyncRollouter] {name} FAILED: {type(r).__name__}: {r}", flush=True)
         except Exception as e:
-            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            fatal = fatal or e
+            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}", flush=True)
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -1897,6 +1911,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+
+        if fatal is not None:
+            print("[FullyAsyncRollouter] Rollouter fit ABORTED -- re-raising so the job fails "
+                  "instead of reporting a partial run as complete", flush=True)
+            raise fatal
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 

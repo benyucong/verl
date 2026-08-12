@@ -471,8 +471,23 @@ class SingleTurnAgentLoop(AgentLoopBase):
             # absorbed inside the chunk request's own resume loop, so a boundary only ever lands
             # at max_tokens. Buffering here spans the resume, so a weight sync can no longer move
             # a chunk boundary.
-            # When the stream is over, hold back the tail so the LAST emission carries is_final.
-            keep = chunk_tokens if stream_done else chunk_tokens - 1
+            # Hold back the tail so the LAST emission carries is_final -- and hold back ENOUGH.
+            #
+            # This was `chunk_tokens if stream_done else chunk_tokens - 1`, which cuts as soon as a
+            # full chunk exists (len > 1023 cuts 1024, leaving 0). A response whose length is an
+            # exact multiple of chunk_tokens therefore drains the buffer on its last cut, and when
+            # the terminal delta arrives `if stream_done and buf_ids` finds nothing to stage, so NO
+            # chunk carries is_final. Downstream that is fatal, not cosmetic: the assembler never
+            # finalizes the parent, the substitutive gate falls back to the additive whole-response
+            # rescan, that rescan re-enters the per-parent FIFO with the same session_id and
+            # span_start=0 -- which the FIFO still holds from chunk 0, because parent state is only
+            # cleaned up on is_final -- and the resulting FifoDuplicateError kills the rollouter.
+            # It killed every k1.0cont job in three consecutive campaigns after 8-16 minutes.
+            #
+            # `keep = chunk_tokens` cuts only when MORE than a full chunk is buffered, so at least
+            # one token always survives to be staged as final. It costs one token of emit latency
+            # per chunk and makes the boundary case impossible by construction rather than caught.
+            keep = chunk_tokens
             while len(buf_ids) > keep:
                 if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens], False):
                     break  # response_length reached; drop the rest
