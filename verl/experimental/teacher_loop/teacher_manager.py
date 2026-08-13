@@ -192,6 +192,68 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
+    async def generate_chunk_continuations(
+        self,
+        prefix_ids: list[int],
+        n: int,
+        max_tokens: int,
+        routing_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        seed: Optional[int] = None,
+        is_final: bool = False,
+    ) -> tuple[list[list[int]], dict]:
+        """N teacher continuations of ONE audited chunk's prefix (generative teaching).
+
+        The counterpart to compute_teacher_logprobs_single, and its opposite: that method hands the
+        teacher a COMPLETE sequence and asks how likely the student's tokens were; this hands it a
+        prefix that stops dead before the audited chunk and asks what IT would have written. The
+        teacher must never see the tokens it is being asked to independently produce -- that is
+        checked server-side, where the submitted prompt length is compared against what the engine
+        actually ingested.
+
+        Returns (sequences, telemetry). Sequences are raw token ids; decoding happens where phi is
+        computed, not here, so the hot path never pays for text it may not use.
+
+        STICKY ROUTING IS NOT OPTIONAL HERE. A trajectory's M chunk prefixes are NESTED -- each
+        extends the previous -- so pinning them to one replica lets chunk k+1's prefill reuse chunk
+        k's KV. Scattered across replicas, every chunk re-ingests a prefix that grows with the
+        response, which is the dominant cost of generative teaching.
+        """
+        teacher_key = self._resolve_teacher_key(routing_key)
+        client = self.teacher_client[teacher_key]
+        use_stable_routing = session_id is not None
+        routing_request_id = f"teacher::{session_id}" if use_stable_routing else uuid4().hex
+
+        t0 = time.perf_counter()
+        out = await client.generate_n(
+            request_id=routing_request_id,
+            prompt_ids=prefix_ids,
+            n=n,
+            max_tokens=max_tokens,
+            seed=seed,
+            is_final=is_final,
+            track_parent=bool(use_stable_routing),
+        )
+        dt = time.perf_counter() - t0
+
+        # An empty result means the request was aborted mid-flight. Returning it silently would
+        # leave the chunk with k_sem computed from zero continuations -- indistinguishable from a
+        # teacher that disagreed with the student everywhere, which is a real value the objective
+        # would happily train on.
+        if not out.sequences:
+            raise RuntimeError(
+                f"teacher returned no continuations for a chunk (prefix {len(prefix_ids)} tokens); "
+                f"k_sem from zero rollouts is indistinguishable from total teacher disagreement."
+            )
+        telemetry = {
+            "teacher_gen_seconds": dt,
+            "teacher_gen_tokens": sum(len(x) for x in out.sequences),
+            "teacher_prefix_tokens": len(prefix_ids),
+            "teacher_cached_tokens": out.num_cached_tokens,
+            "teacher_n": len(out.sequences),
+        }
+        return out.sequences, telemetry
+
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],

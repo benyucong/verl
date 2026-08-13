@@ -32,7 +32,7 @@ from omegaconf import DictConfig
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
-from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
+from verl.workers.rollout.replica import MultiTokenOutput, RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
@@ -302,6 +302,43 @@ class LLMServerClient:
             self._release_server(server_id)
             # OPDFlow: when a tracked parent's final chunk completes, release its parent-debt so the
             # parent-aware policies see the replica free up. Fire-and-forget (counter decrement).
+            if is_final and track_parent:
+                self._load_balancer.release_parent.remote(request_id=request_id)
+
+    async def generate_n(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        n: int,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        seed: Optional[int] = None,
+        is_final: bool = False,
+        track_parent: bool = False,
+    ) -> "MultiTokenOutput":
+        """Generate N continuations of one prompt (generative teaching).
+
+        Mirrors `generate`'s routing exactly -- same sticky-session acquire/release, same
+        parent-debt handling -- so a generating teacher gets the replica affinity a scoring one
+        already gets. That matters more here, not less: the M chunks of one trajectory have NESTED
+        prefixes, so pinning them to a single replica is what lets each chunk's prefill reuse the
+        previous chunk's KV instead of recomputing a prefix that grows with the response.
+        """
+        server_id, server = await self._acquire_server(request_id, track_parent=track_parent)
+        try:
+            return await server.generate_n.remote(
+                request_id=uuid4().hex,          # unique per call; routing id stays sticky
+                prompt_ids=prompt_ids,
+                n=n,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+            )
+        finally:
+            self._release_server(server_id)
             if is_final and track_parent:
                 self._load_balancer.release_parent.remote(request_id=request_id)
 
