@@ -190,8 +190,24 @@ class DistillationTeacherModelConfig(BaseConfig):
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
-    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
-        # Prompt + Response from student are fed into teacher as context
+    def validate_and_prepare_for_distillation(
+        self, use_topk: bool, topk: Optional[int], generation_tokens: Optional[int] = None
+    ) -> None:
+        """Dimension the teacher engine for how this objective actually uses it.
+
+        A SCORING teacher (top-k or estimator objectives) reads prompt+response and emits one token,
+        so its whole context is prompt, and response_length collapses to 1.
+
+        A GENERATING teacher (OmniOPD) is the opposite: it reads a PREFIX that stops before the
+        audited chunk and then writes `generation_tokens` of its own. Leaving response_length at 1
+        here is what makes the teacher structurally unable to generate -- the engine would be built
+        with room for a single token, and every continuation would come back empty or truncated with
+        no indication that the configuration, not the model, was responsible.
+
+        The prefix is at most prompt + response - C, because a chunk of C tokens must fit inside the
+        response after its anchor. So generation costs the engine NOTHING extra over scoring: the
+        same prompt+response total is merely split differently.
+        """
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
         student_response_length = self.inference.response_length
@@ -202,8 +218,22 @@ class DistillationTeacherModelConfig(BaseConfig):
                 f"response, and one generated token, but got {student_prompt_length=}, "
                 f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
             )
-        self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
-        self.inference.response_length = 1
+
+        if generation_tokens is not None:
+            if generation_tokens < 1:
+                raise ValueError(f"generation_tokens must be >= 1, got {generation_tokens}")
+            if generation_tokens >= student_response_length:
+                raise ValueError(
+                    f"Generative teaching needs a chunk of {generation_tokens} tokens to fit inside "
+                    f"the student response ({student_response_length}); with C >= the response "
+                    f"length no anchor can be placed and the teacher would have nothing to continue."
+                )
+            # prefix is at most prompt + response - C; the teacher then writes C
+            self.inference.prompt_length = student_prompt_length + student_response_length - generation_tokens
+            self.inference.response_length = generation_tokens
+        else:
+            self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
+            self.inference.response_length = 1
         self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
@@ -237,6 +267,49 @@ class DistillationTeacherModelConfig(BaseConfig):
                 raise NotImplementedError(
                     f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
                 )
+
+
+@dataclass
+class OmniOPDConfig(BaseConfig):
+    """Parameters of the OmniOPD generative-critic objective.
+
+    M (int): audited chunks per trajectory, taken at the highest full-vocabulary entropy positions.
+    N (int): teacher continuations sampled per chunk.
+    C (int): tokens per chunk, and per teacher continuation.
+    alpha (float): Dirichlet-Multinomial smoothing of the Bayesian target.
+    beta (float): weight of the trust-region anchor on unaudited positions.
+    phi (str): semantic metric, "ned" or "rouge1". REQUIRED to be explicit -- a silently defaulted
+        metric changes k_sem and therefore the objective (FID-3).
+    entropy_topk (int): 0 means exact full-vocabulary entropy for chunk selection. FID-1: entropy
+        from a truncated tail systematically under-estimates H and selects DIFFERENT chunks, which
+        changes the algorithm rather than its cost. Non-zero is an explicit, recorded deviation.
+    """
+
+    M: int = 10
+    N: int = 10
+    C: int = 50
+    alpha: float = 1.0
+    beta: float = 0.1
+    phi: str = "ned"
+    entropy_topk: int = 0
+
+    def __post_init__(self):
+        if self.phi not in ("ned", "rouge1"):
+            raise ValueError(f"omniopd.phi must be 'ned' or 'rouge1', got {self.phi!r}")
+        for name in ("M", "N", "C"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"omniopd.{name} must be >= 1, got {getattr(self, name)}")
+        if self.alpha <= 0:
+            raise ValueError(f"omniopd.alpha must be > 0, got {self.alpha}")
+        if self.beta < 0:
+            raise ValueError(f"omniopd.beta must be >= 0, got {self.beta}")
+        if self.entropy_topk != 0:
+            logger.warning(
+                "omniopd.entropy_topk=%d deviates from FID-1: chunk selection is argmax_M over the "
+                "student's FULL-vocabulary entropy, and a truncated tail under-estimates H and "
+                "selects different chunks. This changes the algorithm, not its speed.",
+                self.entropy_topk,
+            )
 
 
 @dataclass
@@ -286,6 +359,7 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    omniopd: "OmniOPDConfig" = field(default_factory=lambda: OmniOPDConfig())
 
     def __post_init__(self):
         if not self.enabled:
@@ -297,6 +371,9 @@ class DistillationConfig(BaseConfig):
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
+                generation_tokens=(
+                    self.omniopd.C if self.distillation_loss.loss_settings.use_teacher_generation else None
+                ),
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

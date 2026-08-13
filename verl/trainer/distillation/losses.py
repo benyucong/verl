@@ -66,14 +66,21 @@ class DistillationLossSettings(BaseConfig):
     names: str | list[str] = field(default_factory=list)
     use_topk: bool = False
     use_estimator: bool = False
+    use_teacher_generation: bool = False
 
     _mutable_fields = {"names"}
 
     def __post_init__(self):
         self.names = [self.names] if isinstance(self.names, str) else self.names
-        if sum([self.use_topk, self.use_estimator]) != 1:
+        # A distillation objective consumes the teacher in exactly one of three ways: top-k
+        # logprobs, a sampled-token KL estimator, or -- for generative teaching -- text the teacher
+        # WROTE. The third is not a variant of the first two: it needs the teacher to generate
+        # rather than score, which changes how its engine must be dimensioned, so it has to be
+        # declared here where the teacher config can see it.
+        if sum([self.use_topk, self.use_estimator, self.use_teacher_generation]) != 1:
             raise ValueError(
-                f"Expected only one of use_estimator, use_topk, but got {self.use_estimator=}, {self.use_topk=}."
+                f"Expected exactly one of use_estimator, use_topk, use_teacher_generation, but got "
+                f"{self.use_estimator=}, {self.use_topk=}, {self.use_teacher_generation=}."
             )
 
 
@@ -605,6 +612,34 @@ def compute_forward_kl_topk(
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["omniopd"], use_teacher_generation=True)
+)  # type: ignore[arg-type]
+def compute_distillation_loss_omniopd(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """OmniOPD objective. REGISTERED BUT NOT YET IMPLEMENTED (milestone 3 step 5).
+
+    Registered now so the configuration path is complete and validated end to end -- selecting
+    loss_mode=omniopd must dimension the teacher for GENERATION rather than scoring, and that
+    happens in DistillationTeacherModelConfig.validate_and_prepare_for_distillation via these
+    settings. Without a registration there is no settings object to consult.
+
+    It raises rather than returning a plausible tensor: a placeholder that silently returned, say, a
+    k1 loss would produce a complete, healthy-looking training run of the wrong algorithm, which is
+    the failure mode this project has already paid for twice (a streaming path that was silently
+    GKD-only, and a `forward_kl_topk` run with topk=1 that was GKD in name only).
+    """
+    raise NotImplementedError(
+        "loss_mode=omniopd: the objective is not wired into the trainer yet (milestone 3 step 5). "
+        "The validated reference implementation is scripts/omniopd_step.py; the config and teacher "
+        "generation paths (steps 1-2) are in place. Refusing to fall back to another objective."
+    )
 
 
 @register_distillation_loss(
