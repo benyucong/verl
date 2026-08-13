@@ -51,6 +51,27 @@ class TokenOutput(BaseModel):
     """Extra fields for dynamic addition."""
 
 
+class MultiTokenOutput(BaseModel):
+    """N independent continuations of ONE prompt, for generative teaching (OmniOPD).
+
+    TokenOutput carries a single flat `token_ids`, and `vLLMHttpServer.generate` reads only
+    `final_res.outputs[0]`. Passing `n>1` through that path is ACCEPTED by vLLM and then silently
+    truncated to the first candidate -- no error, no warning. For an algorithm that needs N Monte
+    Carlo continuations per audited chunk, that failure is invisible: training still runs, and every
+    chunk quietly costs its own prefill instead of N sharing one. This type exists so N>1 has a
+    return shape that cannot lose candidates.
+    """
+
+    sequences: list[list[int]]
+    """token ids of each of the N continuations"""
+    finish_reasons: list[Optional[str]] = []
+    """per-continuation finish reason"""
+    num_cached_tokens: Optional[int] = None
+    """prefix-cache hits for the SHARED prompt; the point of issuing N as one request"""
+    extra_fields: dict[str, Any] = {}
+    """Extra fields for dynamic addition."""
+
+
 class RolloutMode(Enum):
     # Rollout engine and training engine(fsdp/megatron) fused in same process
     # Rollout and trainer share GPUs, switch context with weight synchronization.

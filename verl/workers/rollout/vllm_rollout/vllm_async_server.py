@@ -41,7 +41,7 @@ from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.replica import MultiTokenOutput, RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -691,6 +691,103 @@ class vLLMHttpServer:
             stop_reason=stop_reason,
             num_preempted=getattr(out, "num_preempted", None),
             extra_fields=extra_fields,
+        )
+
+    async def generate_n(
+        self,
+        prompt_ids: list[int],
+        n: int,
+        max_tokens: int,
+        request_id: str,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        seed: Optional[int] = None,
+        priority: int = 0,
+    ) -> MultiTokenOutput:
+        """Generate N independent continuations of ONE prompt, returning ALL of them.
+
+        Generative teaching (OmniOPD) needs N Monte Carlo continuations of C tokens from the prefix
+        ending exactly before an audited chunk. `generate` cannot express that: it reads only
+        `final_res.outputs[0]`, and TokenOutput.token_ids is a flat list, so `n>1` is accepted by
+        vLLM and then silently truncated to one candidate. Training would still run, each chunk
+        quietly paying its own prefill rather than N sharing one -- which is the `expanded` mode the
+        offline harness labels a strawman, and it would make any later systems comparison
+        meaningless by inflating the baseline.
+
+        DELIBERATELY SEPARATE from `generate`. That method is on the live student-rollout path;
+        editing its `outputs[0]` reads to serve the teacher would put every existing experiment at
+        risk for no gain here. This issues its own request with its own SamplingParams and shares no
+        mutable state, so it cannot perturb the student path.
+
+        ONE REQUEST, NOT N. The N continuations share a prompt, so issuing them as a single n=N
+        request pays the prefill once. Issuing N separate requests would multiply teacher prefill by
+        N; `num_cached_tokens` is returned so that saving is measurable rather than assumed.
+        """
+        prompt_ids = normalize_token_ids(prompt_ids)
+        if n < 1:
+            raise ValueError(f"generate_n requires n >= 1, got {n}")
+        budget = self.config.max_model_len - len(prompt_ids)
+        if budget < max_tokens:
+            raise ValueError(
+                f"generate_n: prompt of {len(prompt_ids)} leaves {budget} tokens of context but "
+                f"{max_tokens} were requested (max_model_len={self.config.max_model_len}). The "
+                f"teacher engine is probably still dimensioned for scoring, which caps generation "
+                f"at one token."
+            )
+
+        sp = SamplingParams(
+            n=n,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            detokenize=False,
+        )
+        generator = self.engine.generate(
+            prompt=TokensPrompt(prompt_token_ids=prompt_ids),
+            sampling_params=sp,
+            request_id=request_id,
+            priority=priority,
+        )
+        final_res: Optional[RequestOutput] = None
+        async for output in generator:
+            final_res = output
+        assert final_res is not None
+
+        if not final_res.outputs:                      # aborted mid-flight
+            return MultiTokenOutput(
+                sequences=[], finish_reasons=[],
+                extra_fields={"finish_reason": "abort", "replica_rank": self.replica_rank},
+            )
+
+        # The silent-truncation guard. This is the whole reason the method exists: a short list here
+        # means candidates were dropped, and downstream that is indistinguishable from a teacher
+        # that simply agreed with the student less often.
+        if len(final_res.outputs) != n:
+            raise RuntimeError(
+                f"generate_n asked for {n} continuations and received {len(final_res.outputs)}; "
+                f"refusing to return a truncated set, which would silently corrupt k_sem."
+            )
+        for i, cand in enumerate(final_res.outputs):
+            if len(cand.token_ids) > max_tokens:
+                raise RuntimeError(
+                    f"generate_n: continuation {i} is {len(cand.token_ids)} tokens, over the "
+                    f"{max_tokens} cap; an uncapped teacher span misaligns every chunk label."
+                )
+
+        # The prompt must end EXACTLY before the audited chunk: the teacher may never see the tokens
+        # it is being asked to independently produce.
+        if len(final_res.prompt_token_ids) != len(prompt_ids):
+            raise RuntimeError(
+                f"generate_n: engine saw a {len(final_res.prompt_token_ids)}-token prompt, "
+                f"submitted {len(prompt_ids)}."
+            )
+
+        return MultiTokenOutput(
+            sequences=[list(c.token_ids) for c in final_res.outputs],
+            finish_reasons=[c.finish_reason for c in final_res.outputs],
+            num_cached_tokens=getattr(final_res, "num_cached_tokens", None),
+            extra_fields={"replica_rank": self.replica_rank, "n_requested": n},
         )
 
     async def generate_stream(
