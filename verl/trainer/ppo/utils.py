@@ -75,8 +75,26 @@ class Role(Enum):
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:
-    """Given the config, do we need ref policy."""
-    return config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss
+    """Given the config, do we need ref policy.
+
+    OmniOPD needs one for a reason the first two clauses cannot express. Its trust-region anchor is
+    an EXACT full-vocabulary KL(pi_ref || pi_theta) on UNAUDITED positions only (FID-2). Reaching
+    for `actor.use_kl_loss` to summon a reference would also switch on verl's own kl_penalty over
+    the FULL response -- a sampled-token k1 estimator on every position. That is both a second,
+    unwanted term in the objective and precisely the approximation FID-2 rejects, so the anchor gets
+    its own clause rather than borrowing one.
+    """
+    if config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss:
+        return True
+    distillation = config.get("distillation", None)
+    if distillation is not None and distillation.get("enabled", False):
+        loss = distillation.get("distillation_loss", {}) or {}
+        omni = distillation.get("omniopd", {}) or {}
+        # beta == 0 disables the anchor entirely, and then a reference would be loaded, kept in
+        # memory and never read.
+        if loss.get("loss_mode", None) == "omniopd" and float(omni.get("beta", 0.1) or 0.0) > 0.0:
+            return True
+    return False
 
 
 def need_teacher_policy(
