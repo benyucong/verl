@@ -254,8 +254,22 @@ def apply_forward_horizon(response_mask: torch.Tensor) -> tuple[torch.Tensor, in
         return response_mask, 0
     if horizon <= 0:
         return response_mask, 0
-    position = torch.cumsum(response_mask.to(torch.int32), dim=-1)
-    return response_mask * (position <= horizon).to(response_mask.dtype), horizon
+    # cumsum is NOT available on every tensor type this mask arrives as. In the FSDP path it can
+    # be a nested tensor, where aten.cumsum.default is unimplemented and raises at the first
+    # batch -- which is exactly how the first Forward-Horizon launch died. Densify first, and if
+    # the type still refuses cumsum, fall back to a column index.
+    dense = response_mask
+    if getattr(dense, "is_nested", False):
+        dense = dense.to_padded_tensor(0)
+    try:
+        position = torch.cumsum(dense.to(torch.int32), dim=-1)
+    except (NotImplementedError, RuntimeError):
+        # Column index counts padding as if it were generated, so it is only equivalent when the
+        # response is right-padded -- which it is here, responses being written from index 0.
+        # Preferred second, not first, because cumsum is correct under either padding.
+        idx = torch.arange(1, dense.shape[-1] + 1, device=dense.device)
+        position = idx.expand_as(dense)
+    return dense * (position <= horizon).to(dense.dtype), horizon
 
 
 def distillation_loss(
