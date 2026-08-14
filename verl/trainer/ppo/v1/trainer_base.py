@@ -397,6 +397,28 @@ class PPOTrainer(ABC):
         # initialize SkipManager for V1 rollout skip support
         SkipManager.init(self.config)
 
+        # ONE WANDB RUN PER EXPERIMENT NAME, overriding any inherited WANDB_RUN_ID.
+        #
+        # The curriculum submits each stage as its own SLURM job, and an earlier design gave every
+        # stage of an arm the same WANDB_RUN_ID so the chain would draw as one curve. The result
+        # was a run permanently badged "crashed": a stage's process is torn down abruptly at the
+        # end (ray kills the remaining workers, the DataLoader dies in atexit), so wandb's final
+        # state comes from a killed process, and the next stage then resumes that same id and
+        # inherits the label while training perfectly well. Operators learned to ignore a red
+        # badge, which is the opposite of what a status is for.
+        #
+        # Deriving the id from experiment_name gives each stage its own honest run. WANDB_RUN_GROUP
+        # still stitches them together in the UI, so nothing is lost but the false alarm. It also
+        # reaches stages that were SUBMITTED with the old shared id, because the environment is
+        # read here at job start rather than at submit time.
+        if os.environ.get("WANDB_RUN_ID") and self.config.trainer.experiment_name:
+            import hashlib
+
+            os.environ["WANDB_RUN_ID"] = hashlib.md5(
+                self.config.trainer.experiment_name.encode()
+            ).hexdigest()[:16]
+            os.environ["WANDB_RESUME"] = "allow"
+
         self.logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,

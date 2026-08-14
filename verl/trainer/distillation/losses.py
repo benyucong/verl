@@ -272,42 +272,45 @@ def apply_forward_horizon(response_mask: torch.Tensor) -> tuple[torch.Tensor, in
     return dense * (position <= horizon).to(dense.dtype), horizon
 
 
-def mixed_sft_term(model_output: dict, data: TensorDict, response_mask) -> tuple:
+def mixed_sft_term(log_prob: torch.Tensor, response_mask: torch.Tensor) -> tuple:
     """Per-sequence-normalised SFT loss over the offline prefix inside the response region.
 
-    THE PREFIX REGION is (position < n_prefix_tokens) within the response. It cannot be inferred
-    from response_mask alone, because a zero there means "not sampled" and is shared by both the
-    prefix and right padding. n_prefix_tokens rides through as a per-example scalar.
+    TAKES ALREADY-DENSE TENSORS. Both arguments must be the [bsz, max_resp] tensors the policy
+    loss itself consumes. Earlier versions re-derived log_prob from model_output and called
+    no_padding_2_padding themselves, which is correct only outside the packed path: with
+    use_remove_padding and Ulysses sequence parallelism the re-derivation produced a different
+    width and the update died with "size of tensor a (31632) must match tensor b (18068)".
+    Reusing the tensors the PG branch already built removes an entire class of shape bug.
 
-    NORMALISED SEPARATELY FROM OPD, ON PURPOSE. Each sequence's prefix loss is divided by its own
-    prefix length and then averaged over the batch, while OPD keeps its own aggregation untouched.
-    Averaging prefix and suffix tokens together would make the relative weight of the two terms a
-    function of K, so shrinking the prefix across the curriculum would silently re-weight the
-    objective and no stage would be comparable to any other.
+    THE PREFIX REGION is the leading run of zeros in response_mask before the first sampled
+    token. That mask is exactly "1 iff the policy sampled it", so the prefix (supplied, not
+    sampled) reads 0 and so does right padding -- but padding comes AFTER the last 1, so the
+    leading run identifies the prefix unambiguously and no side-channel field is needed.
 
-    Returns (loss, metrics). Loss is 0.0 when no example in the batch carries a prefix, which is
-    the K = 0 stage and makes it exactly vanilla PG-OPD.
+    NORMALISED SEPARATELY FROM OPD, deliberately. Averaging prefix and suffix tokens together
+    would make the relative weight of the two terms a function of K, so shrinking the prefix
+    across the curriculum would silently re-weight the objective and no stage would be comparable
+    to another.
+
+    Returns (None, {}) when no example carries a prefix, which is the K = 0 stage: the mixed loss
+    then reduces to vanilla PG-OPD exactly.
     """
-    n_pref = data.get("n_prefix_tokens", None)
-    if n_pref is None:
+    rm = response_mask.to(torch.bool)
+    any_sampled = rm.any(dim=-1)
+    first_sampled = torch.argmax(rm.to(torch.int32), dim=-1)
+    n_pref = torch.where(any_sampled, first_sampled, torch.zeros_like(first_sampled))
+    if int(n_pref.sum().item()) == 0:
         return None, {}
-    log_prob = no_padding_2_padding(model_output["log_probs"], data)
-    if response_mask.is_nested:
-        response_mask = response_mask.to_padded_tensor(False)
-    if log_prob.is_nested:
-        log_prob = log_prob.to_padded_tensor(0.0)
 
     n_pref = n_pref.to(log_prob.device).reshape(-1, 1)
     pos = torch.arange(log_prob.shape[-1], device=log_prob.device).unsqueeze(0)
-    # Valid response positions are prefix OR sampled; padding is neither.
-    valid = (pos < n_pref) | response_mask.bool()
-    sft_mask = (pos < n_pref) & valid
+    sft_mask = (pos < n_pref)
 
     k = sft_mask.sum(-1)
     if int(k.sum().item()) == 0:
         return None, {}
     per_seq = -(log_prob * sft_mask).sum(-1) / k.clamp(min=1)
-    has = (k > 0)
+    has = k > 0
     loss = (per_seq * has).sum() / has.sum().clamp(min=1)
     return loss, {
         "distillation/sft_loss": loss.detach().item(),
@@ -371,6 +374,7 @@ def distillation_loss(
         )
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
+        _dense_log_prob, _dense_resp_mask = log_prob, response_mask
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if response_mask.is_nested:
@@ -385,8 +389,10 @@ def distillation_loss(
     # Mixed SFT+OPD: add the prefix SFT term to the UNCHANGED OPD loss. Everything above ran
     # exactly as it does for Reverse-Handoff, so lambda_SFT = 0 recovers RH-OPD identically.
     lam = float(os.environ.get("OPD_LAMBDA_SFT", "0") or 0)
+    _dense_log_prob = locals().get("_dense_log_prob", None)
     if lam:
-        sft, sft_metrics = mixed_sft_term(model_output, data, data["response_mask"])
+        sft, sft_metrics = (mixed_sft_term(_dense_log_prob, _dense_resp_mask)
+                            if _dense_log_prob is not None else (None, {}))
         if sft is not None:
             distillation_metrics.update(sft_metrics)
             distillation_metrics["distillation/opd_loss"] = distillation_loss.detach().item()
