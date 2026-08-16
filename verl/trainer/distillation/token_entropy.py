@@ -151,3 +151,109 @@ def to_signal_series(entropies, prompt_len: int):
     mapping lives in one named function with a test pinning it rather than inline at call sites.
     """
     return [float("-inf")] * (prompt_len - 1) + list(entropies)
+
+
+class SpecDecUnsupported(RuntimeError):
+    """Raised at ENGINE INIT when token entropy is requested alongside speculative decoding.
+
+    Phase 0 instruments `Sampler.forward`, which emits exactly one token per request per step.
+    Speculative and jump decoding emit several through the REJECTION SAMPLER -- a different code path
+    that this patch does not touch. Instrumenting one and not the other would silently drop the extra
+    tokens' entropy, leaving a series shorter than the token list, which is precisely the misalignment
+    class this project keeps paying for.
+
+    Rejecting up front rather than per step matters: a per-step check burns a branch on the hot path
+    and, worse, fails *after* generation has begun, when a partial run already exists to be
+    misread. Supporting the rejection-sampler path is a separate milestone, not Phase 0 scope.
+    """
+
+
+def assert_entropy_config_supported(*, return_token_entropy: bool, speculative_config=None,
+                                    logprobs_mode: str = "raw_logprobs",
+                                    distribution: str = "raw_model") -> dict:
+    """Validate at engine construction. Returns manifest facts to record; raises rather than warns.
+
+    Call this ONCE, before the engine starts generating. Everything it checks is a property of the
+    configuration, so nothing here needs to be re-checked per step.
+    """
+    if not return_token_entropy:
+        return {"token_entropy": False}
+    if speculative_config is not None:
+        raise SpecDecUnsupported(
+            "return_token_entropy=True is not supported with speculative decoding. Phase 0 "
+            "instruments Sampler.forward (one token per request per step); multi-token emission goes "
+            "through the rejection sampler, which is uninstrumented, so entropy values would be "
+            "silently missing for accepted draft tokens. Disable speculative decoding, or disable "
+            "token entropy. Supporting the rejection-sampler path is a separate milestone.")
+    if distribution == "raw_model" and logprobs_mode != "raw_logprobs":
+        raise ValueError(
+            f"distribution='raw_model' requires logprobs_mode='raw_logprobs', got "
+            f"{logprobs_mode!r}. Under processed_* modes vLLM substitutes post-temperature and "
+            f"post-top-k values, so the emitted quantity would be the BEHAVIOR distribution's entropy "
+            f"while every downstream name still said raw_model.")
+    return {"token_entropy": True, "speculative_decoding": False,
+            "logprobs_mode": logprobs_mode, "distribution": distribution}
+
+
+def active_row_mask(num_reqs: int, active_indices):
+    """Rows of a [num_reqs, ...] batch that belong to a live request this step.
+
+    A finished or unscheduled request still occupies a row until the batch is condensed. Emitting
+    entropy for those rows would attach values to requests that generated no token, which the
+    accumulator would then see as duplicates.
+    """
+    m = [False] * num_reqs
+    for i in active_indices:
+        if not (0 <= i < num_reqs):
+            raise EntropyAlignmentError(f"active row {i} outside batch of {num_reqs}")
+        m[i] = True
+    return m
+
+
+def emit_for_step(req_ids, sampled_token_ids, entropies, *, active_indices=None,
+                  placeholder_token_id: int = -1):
+    """Turn one engine step's tensors into per-request (token_ids, entropies) pairs.
+
+    Handles the two ways a `[num_reqs, max_num_generated_tokens]` block lies about its own contents:
+    PADDED CELLS (requests that produced fewer tokens than the widest one this step) and INACTIVE
+    ROWS (finished or unscheduled requests still occupying a slot). Neither may receive or emit an
+    entropy value.
+
+    `sampled_token_ids` is a list of per-request token lists, already trimmed of padding by the
+    caller, or padded with `placeholder_token_id`, which is stripped here.
+    """
+    if not (len(req_ids) == len(sampled_token_ids) == len(entropies)):
+        raise EntropyAlignmentError(
+            f"step shape mismatch: {len(req_ids)} req_ids, {len(sampled_token_ids)} token rows, "
+            f"{len(entropies)} entropy rows")
+    mask = (active_row_mask(len(req_ids), active_indices) if active_indices is not None
+            else [True] * len(req_ids))
+    out = []
+    for i, rid in enumerate(req_ids):
+        if not mask[i]:
+            continue
+        toks = [t for t in sampled_token_ids[i] if t != placeholder_token_id]
+        ents = list(entropies[i])[:len(toks)]
+        if len(ents) != len(toks):
+            raise EntropyAlignmentError(
+                f"{rid}: {len(toks)} real tokens but {len(ents)} entropy values after stripping "
+                f"padding -- the entropy row is shorter than the token row")
+        if toks:
+            out.append((rid, toks, ents))
+    return out
+
+
+def assert_full_vocab(logits, vocab_size: int):
+    """The reduction must see the real vocabulary, not the TP-padded one.
+
+    vLLM pads the vocab dimension for tensor parallelism and slices it back to `org_vocab_size`
+    after the all-gather. Reducing over the padded width would fold `-inf` (or worse, garbage)
+    columns into the distribution and shift every entropy value by a constant that depends on the
+    padding, which is invisible in the output and fatal to selection.
+    """
+    if logits.shape[-1] != vocab_size:
+        raise ValueError(
+            f"entropy would be computed over {logits.shape[-1]} columns but the real vocabulary is "
+            f"{vocab_size}. Slice padding off before reducing (vLLM does this at "
+            f"logits_processor.py:99, `logits[..., :self.org_vocab_size]`).")
+    return logits

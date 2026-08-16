@@ -73,10 +73,16 @@ AVAILABILITY = (
     "static",                 # needs nothing
 )
 
+# NOTE THE PRECISE CLAIM. "exact_full_support" means the reduction runs over the FULL, unpadded
+# vocabulary with no truncation. It does NOT mean exact arithmetic, and it does NOT mean bit-identical
+# across implementations: vLLM reduces bf16 logits in fp32 after a TP all-gather, while the offline
+# oracle applies an fp32 lm_head to hidden states. Both are full-support; neither is the other's
+# ground truth to the last bit. That is exactly why provider equivalence is MEASURED on final
+# selections rather than asserted from the fidelity label.
 FIDELITY = (
-    "exact",                  # full-vocabulary, no truncation
-    "approx_topk",            # truncated support plus a tail bucket
-    "exact_on_realised_token",  # exact, but only at the token actually sampled
+    "exact_full_support",       # full vocabulary, no truncation -- see the note above
+    "approx_topk",              # truncated support plus a tail bucket
+    "exact_on_realised_token",  # full precision, but only at the token actually sampled
     "none",
 )
 
@@ -85,17 +91,17 @@ FIDELITY = (
 # scheduler would have to guess exactly where guessing has already cost this project a result.
 PROVIDERS = {
     # student_entropy, four genuinely different mechanisms:
-    "rollout_exact_scalar":    dict(availability="per_token_online",     fidelity="exact"),
+    "rollout_exact_scalar":    dict(availability="per_token_online",     fidelity="exact_full_support"),
     "rollout_topk_approx":     dict(availability="per_token_online",     fidelity="approx_topk"),
-    "post_eos_actor_forward":  dict(availability="post_trajectory",      fidelity="exact"),
-    "student_scoring_worker":  dict(availability="post_trajectory",      fidelity="exact"),
-    "trainer_forward":         dict(availability="post_teacher_scoring", fidelity="exact"),
+    "post_eos_actor_forward":  dict(availability="post_trajectory",      fidelity="exact_full_support"),
+    "student_scoring_worker":  dict(availability="post_trajectory",      fidelity="exact_full_support"),
+    "trainer_forward":         dict(availability="post_teacher_scoring", fidelity="exact_full_support"),
     # teacher-side:
     "teacher_scoring_k0":      dict(availability="post_teacher_scoring", fidelity="exact_on_realised_token"),
     "teacher_scoring_topk":    dict(availability="post_teacher_scoring", fidelity="approx_topk"),
     # signal-free:
     "none":                    dict(availability="static",               fidelity="none"),
-    "external":                dict(availability="post_trajectory",      fidelity="exact"),
+    "external":                dict(availability="post_trajectory",      fidelity="exact_full_support"),
 }
 
 # Which distribution the signal is taken over. These coincide only at temperature=1 with top-p and
@@ -132,12 +138,42 @@ class ProviderNotCertified(SelectorMismatch):
 
 
 @dataclass(frozen=True)
+class EquivalenceScope:
+    """WHAT a certificate was earned on. Exact equality on one dataset is not equality forever.
+
+    Two providers can agree on 48 short thinking-OFF responses and diverge on longer ones, on a
+    different checkpoint, on a different dtype, or after an engine upgrade. A certificate that did not
+    name its conditions would silently outlive them -- so every field here participates in matching,
+    and new trajectories require a new certificate.
+    """
+
+    model_snapshot: str = ""      # the exact student checkpoint the test ran against
+    trajectory_hash: str = ""     # hash of the token ids tested; NEW TRAJECTORIES => NEW CERTIFICATE
+    engine_version: str = ""      # 0.15.1 is not 0.20.1
+    dtype: str = ""               # bf16 logits / fp32 reduction is not fp32 throughout
+    config_hash: str = ""         # sampling + engine config that could change the distribution
+
+    def key(self):
+        return (self.model_snapshot, self.trajectory_hash, self.engine_version,
+                self.dtype, self.config_hash)
+
+    def describe(self) -> str:
+        parts = [f"{k}={v}" for k, v in
+                 (("model", self.model_snapshot), ("traj", self.trajectory_hash),
+                  ("engine", self.engine_version), ("dtype", self.dtype),
+                  ("cfg", self.config_hash)) if v]
+        return " ".join(parts) or "<unscoped>"
+
+
+@dataclass(frozen=True)
 class ProviderEquivalenceCertificate:
     """Evidence that two providers were TESTED and produced identical final selections.
 
-    Issued only by `assert_provider_equivalence` on exact set equality. It is scoped to one
-    `selector_hash` and one ordered pair of fingerprints, because equivalence established for one
-    selector says nothing about another -- an approximation can agree at M=10 and diverge at M=3.
+    Issued only by `assert_provider_equivalence` on exact set equality. Scoped three ways, because
+    equivalence is a measurement and measurements have conditions:
+      - to one `selector_hash` -- an approximation can agree at M=10 and diverge at M=3;
+      - to one ordered pair of fingerprints;
+      - to one `EquivalenceScope` -- model, trajectories, engine version, dtype, config.
     """
 
     selector_hash: str
@@ -145,16 +181,18 @@ class ProviderEquivalenceCertificate:
     provider_b: str
     n_responses: int
     n_chunks: int
+    scope: EquivalenceScope = field(default_factory=EquivalenceScope)
     evidence: str = ""            # run id, artifact path, or commit -- how to re-check this
 
-    def covers(self, selector_hash: str, fp_a: str, fp_b: str) -> bool:
+    def covers(self, selector_hash: str, fp_a: str, fp_b: str, scope: EquivalenceScope) -> bool:
         return (self.selector_hash == selector_hash
-                and {self.provider_a, self.provider_b} == {fp_a, fp_b})
+                and {self.provider_a, self.provider_b} == {fp_a, fp_b}
+                and self.scope.key() == scope.key())
 
     def describe(self) -> str:
         return (f"certificate[{self.selector_hash}] {self.provider_a} == {self.provider_b} "
-                f"({self.n_responses} responses, {self.n_chunks} chunks"
-                f"{', ' + self.evidence if self.evidence else ''})")
+                f"({self.n_responses} responses, {self.n_chunks} chunks; {self.scope.describe()}"
+                f"{'; ' + self.evidence if self.evidence else ''})")
 
 
 class SignalNotReady(RuntimeError):
@@ -377,8 +415,8 @@ class SelectorSpec:
 
 
 def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
-                        certificates=(), allow_cross_policy: bool = False,
-                        context: str = "") -> None:
+                        certificates=(), scope: "EquivalenceScope | None" = None,
+                        allow_cross_policy: bool = False, context: str = "") -> None:
     """FATAL comparison on the SELECTOR hash (score rule + candidates + C + constraint + M).
 
     Guards the failure that occurred -- analysis re-deriving a selection with aggregation="mean" and
@@ -395,8 +433,19 @@ def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
         if fa == fb:
             return
         sh = analysis.selector_hash()
-        if any(c.covers(sh, fa, fb) for c in certificates):
+        if certificates and scope is None:
+            raise ProviderNotCertified(
+                f"certificates were supplied but no EquivalenceScope was given"
+                f"{' in ' + context if context else ''}. A certificate is valid only for the model, "
+                f"trajectories, engine version, dtype and config it was earned on; without the "
+                f"current scope it cannot be checked, and accepting it unchecked is how a "
+                f"certificate silently outlives its conditions.")
+        if any(c.covers(sh, fa, fb, scope) for c in certificates):
             return
+        near = [c for c in certificates if c.covers(sh, fa, fb, c.scope)]
+        stale = ("\n  A certificate exists for this selector and provider pair but for a DIFFERENT "
+                 f"scope:\n    have: {near[0].scope.describe()}\n    need: {scope.describe()}\n"
+                 "  Re-run the equivalence test on these artifacts.\n" if (near and scope) else "")
         raise ProviderNotCertified(
             f"same logical selector, DIFFERENT providers, no equivalence certificate"
             f"{' in ' + context if context else ''}.\n"
@@ -408,6 +457,7 @@ def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
             f"IMPLEMENTATION of the same logical selector, not a faithful one -- and an approximate "
             f"provider (e.g. top-k entropy) would otherwise pass this guard and be mistaken for "
             f"exact.\n"
+            f"{stale}"
             f"  Run assert_provider_equivalence() on real selections and pass the certificate it "
             f"returns, or use the same provider for both artifacts.")
     if allow_cross_policy:
@@ -442,7 +492,8 @@ def assert_same_score_rule(a: SelectorSpec, b: SelectorSpec, *, context: str = "
 
 
 def assert_provider_equivalence(sel_a, sel_b, spec_a: SelectorSpec, spec_b: SelectorSpec, *,
-                                context: str = "") -> None:
+                                scope: "EquivalenceScope | None" = None,
+                                context: str = "") -> "ProviderEquivalenceCertificate":
     """Two providers claiming exactness must produce the SAME FINAL SET. Exact equality, not Jaccard.
 
     This is the check the four-level split buys. Because the provider is NOT in `selector_hash`,
@@ -469,7 +520,7 @@ def assert_provider_equivalence(sel_a, sel_b, spec_a: SelectorSpec, spec_b: Sele
             selector_hash=spec_a.selector_hash(),
             provider_a=spec_a.provider_fingerprint(), provider_b=spec_b.provider_fingerprint(),
             n_responses=len(keys), n_chunks=sum(len(sel_a.get(k, ())) for k in keys),
-            evidence=context)
+            scope=scope or EquivalenceScope(), evidence=context)
     inter = sum(len(set(sel_a.get(k, ())) & set(sel_b.get(k, ()))) for k in keys)
     union = sum(len(set(sel_a.get(k, ())) | set(sel_b.get(k, ()))) for k in keys)
     shown = "\n".join(f"    {k}: {a} vs {b}" for k, (a, b) in list(bad.items())[:5])
@@ -664,8 +715,10 @@ OMNIOPD_PUBLISHED = SelectorSpec(
 
 OMNIOPD_ONLINE_EXACT = SelectorSpec(
     **_OMNIOPD_RULE, provider=ROLLOUT_EXACT_VLLM_0151,
-    notes="THE SAME SELECTOR, computed during decode. Faithfulness is a claim to be tested by exact "
-          "final-set equality against OMNIOPD_PUBLISHED, not an assumption.")
+    notes="THE SAME LOGICAL SELECTOR, computed during decode -- a CANDIDATE IMPLEMENTATION until an "
+          "equivalence certificate exists. Full-support (bf16 logits, fp32 reduction), which is not "
+          "the same as bit-identical to the fp32 post-EOS forward, so equivalence must be measured "
+          "on final selections rather than inferred from the fidelity label.")
 
 OMNIOPD_ONLINE_TOPK = SelectorSpec(
     **_OMNIOPD_RULE,
