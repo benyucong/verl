@@ -743,3 +743,284 @@ GAPSELECT_M8_CLOSED = SelectorSpec(
     provider=ProviderFingerprint(signal_provider="teacher_scoring_k0"),
     notes="CLOSED. Failed both pre-registered gates against OMNIOPD_PUBLISHED "
           "(docs/genopdflow_phase2_gapselect.md). Retained so the closed claim stays citable.")
+
+
+# ---------------------------------------------------------------------------------------------
+# PROPOSAL vs COMMIT.
+#
+# Any heuristic may PROPOSE reversible teacher work. The authoritative algorithm COMMITS supervision.
+# Whether speculative work can be reused is decided by EXACT REQUEST IDENTITY, never by which
+# selector proposed it.
+#
+# That last point corrects an earlier design error here. Requiring proposal and commit to share a
+# selector hash is wrong: if GapSelect proposes anchor 100 and canonical entropy independently commits
+# anchor 100, the two selectors differ but THE TEACHER REQUEST IS THE SAME REQUEST -- same prefix,
+# same anchor, same model, same sampling, same seed -- and its continuations are reusable. Tying reuse
+# to selector identity would forbid exactly the cross-policy speculation the selector-agnostic design
+# exists to allow: a student signal, a teacher gap, or a hybrid must all be free to propose work for a
+# different authoritative commit policy.
+# ---------------------------------------------------------------------------------------------
+
+
+def canonical_sampling(**params) -> str:
+    """Canonical serialisation of sampling parameters. NEVER repr().
+
+    repr() is unstable across Python versions, dict ordering, float formatting and object identity, so
+    two identical configurations could hash differently and defeat reuse -- or, worse, two different
+    ones could collide. Sorted JSON with explicit float normalisation is stable and comparable.
+    """
+    norm = {}
+    for k, v in params.items():
+        if isinstance(v, float):
+            norm[k] = format(v, ".10g")          # 1.0 and 1.00 must not differ
+        elif isinstance(v, (list, tuple)):
+            norm[k] = [format(x, ".10g") if isinstance(x, float) else x for x in v]
+        else:
+            norm[k] = v
+    return json.dumps(norm, sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class ExecutionFingerprint:
+    """What produced a result, for reuse ACROSS runs.
+
+    Within one workload the workload hash already scopes this. It matters when a cached continuation
+    from an earlier run is offered to a later one: the same request key computed under a different
+    engine build, dtype or patch level is not obviously the same result.
+    """
+
+    engine: str = ""
+    engine_version: str = ""
+    dtype: str = ""
+    code_hash: str = ""
+
+    def key(self) -> str:
+        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class TeacherRequestKey:
+    """Identity of ONE unit of teacher work. Equal keys are interchangeable executions.
+
+    Everything that changes what the teacher computes belongs here; nothing about who asked for it
+    does. Identity is by CONTENT HASH, not by name: `Qwen3-32B` names a family, not a checkpoint, and
+    two runs pointing at different snapshots of it are not interchangeable.
+    """
+
+    trajectory_id: str
+    prefix_hash: str                 # sha256 of the exact prefix token ids submitted
+    anchor_position: int
+    teacher_model_hash: str          # SNAPSHOT hash, not a model name
+    tokenizer_hash: str              # tokenizer + chat template: both change the prefix tokens
+    teacher_sampling: str            # canonical_sampling(...), never repr
+    rollout_index: int
+    seed: int
+    continuation_tokens: int
+    adapter_hash: str = ""           # LoRA/adapter identity; "" when none. Changes the distribution.
+
+    @staticmethod
+    def hash_tokens(token_ids) -> str:
+        h = hashlib.sha256()
+        for t in token_ids:
+            h.update(int(t).to_bytes(4, "little", signed=True))
+        return h.hexdigest()[:16]
+
+    def key(self) -> str:
+        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()[:20]
+
+    def cross_run_key(self, ex: ExecutionFingerprint) -> str:
+        """Key for reuse ACROSS runs, which must also pin the execution environment."""
+        return hashlib.sha256((self.key() + "|" + ex.key()).encode()).hexdigest()[:20]
+
+    def reusable_for(self, other: "TeacherRequestKey") -> bool:
+        return self.key() == other.key()
+
+
+@dataclass(frozen=True)
+class AuditKey:
+    """Request identity PLUS everything that turns the result into supervision.
+
+    The same continuation can serve two different supervision calculations: k_sem compares it against
+    a particular student span under a particular metric, and the target then depends on the full
+    smoothing and objective configuration. Reuse of the REQUEST is TeacherRequestKey; equivalence of
+    the resulting SUPERVISION needs all of this.
+    """
+
+    request: TeacherRequestKey
+    student_chunk_hash: str          # the realised student span scored against
+    chunk_tokens: int                # C
+    phi: str                         # semantic metric, e.g. ned_char_maxlen
+    phi_variant: str = ""            # normalisation choice within that metric (FID-7)
+    alpha: float = 1.0               # Dirichlet-multinomial prior weight
+    N: int = 10                      # continuations the target averages over
+    beta: float = 0.1                # KL trust-region weight
+    prior_form: str = "geometric_mean"   # how pi_bar is formed
+    objective: str = "omniopd_chunk_kl"  # which loss consumes it
+
+    def key(self) -> str:
+        d = dict(asdict(self))
+        d["request"] = self.request.key()
+        return hashlib.sha256(json.dumps(d, sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()[:20]
+
+
+class NotAuthoritative(RuntimeError):
+    """Raised when a selection that is not authorised for the commit role would reach training."""
+
+
+_MINT = object()   # only CommitAuthority holds this
+
+
+@dataclass(frozen=True)
+class ProposalPlan:
+    """Reversible work. ANY policy may produce one, including a deliberately approximate heuristic.
+
+    A ProposalPlan can start teacher requests. It can never supply supervision -- not because of what
+    it contains, but because the trainer accepts only a CommitPlan.
+    """
+
+    policy: SelectorSpec
+    requests: tuple
+
+    def keys(self):
+        return {r.key() for r in self.requests}
+
+    def reusable_against(self, commit: "CommitPlan"):
+        """Which committed requests this proposal already covers -- by REQUEST identity, not policy."""
+        return self.keys() & commit.keys()
+
+
+@dataclass(frozen=True)
+class CommitPlan:
+    """Supervision. Mintable ONLY by the configured CommitAuthority for the current workload."""
+
+    policy: SelectorSpec
+    requests: tuple
+    workload_hash: str
+    _token: object = None
+
+    def __post_init__(self):
+        if self._token is not _MINT:
+            raise NotAuthoritative(
+                "CommitPlan cannot be constructed directly. Only the configured CommitAuthority for "
+                "this workload may mint one -- that is what makes 'the authoritative algorithm "
+                "decides what is learned from' an invariant rather than a convention.")
+
+    def keys(self):
+        return {r.key() for r in self.requests}
+
+
+class CommitAuthority:
+    """Holds the ONE policy authorised to commit for a workload, and mints CommitPlans.
+
+    Which provider may commit is a CONFIGURATION decision, not a property of providers in general.
+    An online provider is barred here because this OmniOPD configuration names the canonical post-EOS
+    provider as authoritative -- another algorithm could legitimately declare an online provider
+    authoritative, and this class would then mint its plans without complaint.
+    """
+
+    def __init__(self, policy: SelectorSpec, workload_hash: str):
+        self.policy = policy
+        self.workload_hash = workload_hash
+
+    def authorises(self, policy: SelectorSpec) -> bool:
+        return (policy.selector_hash() == self.policy.selector_hash()
+                and policy.provider_fingerprint() == self.policy.provider_fingerprint())
+
+    def commit(self, policy: SelectorSpec, requests, *, workload_hash: str) -> CommitPlan:
+        if workload_hash != self.workload_hash:
+            raise NotAuthoritative(
+                f"commit plan is for workload {workload_hash} but this authority governs "
+                f"{self.workload_hash}; a plan minted for another workload must not supervise this one")
+        if not self.authorises(policy):
+            raise NotAuthoritative(
+                "policy is not authorised for the commit role in this workload.\n"
+                f"  offered:      {policy.describe()}\n"
+                f"  authoritative:{self.policy.describe()}\n"
+                f"  offered provider fingerprint:      {policy.provider_fingerprint()}\n"
+                f"  authoritative provider fingerprint:{self.policy.provider_fingerprint()}\n"
+                "  A provider may be authoritative in one configuration and proposal-only in "
+                "another; authorisation is configured, not intrinsic.")
+        return CommitPlan(policy=policy, requests=tuple(requests),
+                          workload_hash=workload_hash, _token=_MINT)
+
+
+@dataclass(frozen=True)
+class SpeculativeSelectionPolicy:
+    """A proposal policy paired with the authoritative commit policy.
+
+    They need NOT share a selector hash. Reuse is decided per request by TeacherRequestKey, so a
+    proposal from any policy -- student entropy, teacher gap, hybrid -- can serve a different
+    authoritative commit policy. Both hashes are recorded separately for provenance.
+    """
+
+    proposal: SelectorSpec
+    commit: SelectorSpec
+
+    def __post_init__(self):
+        if not self.proposal.provider or not self.commit.provider:
+            raise ValueError("both roles need a declared provider")
+        if not self.proposal.provider.enables_same_trajectory_overlap:
+            raise ValueError(
+                f"proposal provider {self.proposal.provider.signal_provider!r} has availability "
+                f"{self.proposal.provider.availability!r}; a signal unavailable during generation "
+                f"cannot launch anything early and is pointless in the proposal role")
+
+    def to_manifest(self) -> dict:
+        return {"role_split": "speculative proposal + authoritative commit",
+                "reuse_decided_by": "TeacherRequestKey (exact request identity), NOT selector identity",
+                "proposal": self.proposal.to_manifest(),
+                "commit": self.commit.to_manifest(),
+                "proposal_selector_hash": self.proposal.selector_hash(),
+                "commit_selector_hash": self.commit.selector_hash(),
+                "note": ("The committed selection is computed by the authoritative provider, so the "
+                         "trained algorithm is whatever that provider defines regardless of proposal "
+                         "behaviour. The proposal affects only WHEN work started.")}
+
+
+OMNIOPD_SPECULATIVE = SpeculativeSelectionPolicy(
+    proposal=OMNIOPD_ONLINE_EXACT,      # scheduling only, in THIS configuration
+    commit=OMNIOPD_PUBLISHED,           # authoritative, in THIS configuration
+)
+
+
+class AlreadyTrained(RuntimeError):
+    """Raised when the same audit would supply supervision twice.
+
+    Queues redeliver. A duplicate that trains twice double-counts one chunk's gradient, which is
+    invisible in every metric and wrong in the update -- so consumption is recorded and repeats are
+    refused rather than tolerated.
+    """
+
+
+class CommitLedger:
+    """Records which audits have supplied supervision, so redelivery is idempotent.
+
+    Scoped to one workload: the same AuditKey under a different workload is a different experiment
+    and must not be suppressed by this ledger.
+    """
+
+    def __init__(self, workload_hash: str):
+        self.workload_hash = workload_hash
+        self._consumed: set = set()
+
+    def consume(self, plan: "CommitPlan", audit: AuditKey) -> None:
+        if plan.workload_hash != self.workload_hash:
+            raise NotAuthoritative(
+                f"plan is for workload {plan.workload_hash}; this ledger governs {self.workload_hash}")
+        if audit.request.key() not in plan.keys():
+            raise NotAuthoritative(
+                "audit references a request that is not in the CommitPlan -- speculative results may "
+                "only train through a request the authoritative policy actually committed")
+        k = audit.key()
+        if k in self._consumed:
+            raise AlreadyTrained(
+                f"audit {k} already supplied supervision in workload {self.workload_hash}. Queue "
+                f"redelivery must be idempotent: training it twice double-counts one chunk's "
+                f"gradient, which no metric would show.")
+        self._consumed.add(k)
+
+    def n_consumed(self) -> int:
+        return len(self._consumed)
