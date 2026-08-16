@@ -47,7 +47,7 @@ class AttemptID:
 
     request_key: str          # TeacherRequestKey.key()
     attempt: int              # 0, 1, 2, ... increments on each re-entry
-    seed: int                 # STABLE across attempts: a restart reproduces the same continuation
+    seed: int                 # stable across attempts: deterministic INTENT, not a bitwise guarantee
 
     @property
     def engine_request_id(self) -> str:
@@ -62,8 +62,12 @@ class AttemptID:
 class _Attempt:
     aid: AttemptID
     state: AttemptState = AttemptState.ACTIVE
-    prefill_tokens: int = 0        # what the engine actually recomputed, after APC
-    decode_tokens: int = 0         # what it actually decoded before terminating
+    prefill_tokens: int = 0        # physical recompute reported by the engine, after APC
+    decode_tokens: int = 0         # decoded while ACTIVE
+    late_after_abort_tokens: int = 0   # decoded after the abort won -- real GPU work, never usable
+    max_observed_decode: int = 0   # high-water mark for CUMULATIVE outputs
+    duplicate_cumulative: int = 0  # redelivered messages carrying no new tokens
+    outputs_after_completion: int = 0
     result: object = None          # quarantined; reaches training only via a CommitPlan
 
 
@@ -77,14 +81,23 @@ class AttemptRegistry:
     """
 
     def __init__(self):
-        self._cur: dict = {}                  # request_key -> _Attempt
+        self._cur: dict = {}                  # request_key -> current _Attempt
+        self._retired: dict = {}              # engine_request_id -> superseded _Attempt
         self._lock = threading.Lock()
         self.stats = {"completed": 0, "aborted_queued": 0, "aborted_running": 0,
-                      "restarts": 0, "stale_outputs_dropped": 0, "redundant_aborts": 0}
+                      "restarts": 0, "results_discarded": 0, "redundant_aborts": 0,
+                      # physical cost that produced nothing usable -- the quantity A1/A2 compare
+                      "late_after_abort_tokens": 0, "stale_attempt_tokens": 0,
+                      "duplicate_cumulative_msgs": 0, "outputs_after_completion": 0,
+                      "prefill_tokens_total": 0}
 
     def start(self, request_key: str, seed: int) -> AttemptID:
         with self._lock:
             prev = self._cur.get(request_key)
+            if prev is not None and prev.state is not AttemptState.ACTIVE:
+                # Keep the superseded attempt reachable: it may still emit, and those tokens are real
+                # GPU work that must be accounted even though nothing usable comes of them.
+                self._retired[prev.aid.engine_request_id] = prev
             if prev is None:
                 aid = AttemptID(request_key, 0, seed)
             else:
@@ -104,29 +117,82 @@ class AttemptRegistry:
             return None
         return cur
 
-    def record_prefill(self, aid: AttemptID, tokens: int) -> None:
-        with self._lock:
-            cur = self._get_current(aid)
-            if cur and cur.state is AttemptState.ACTIVE:
-                cur.prefill_tokens += tokens
+    def _find_any(self, aid: AttemptID):
+        """Current attempt, or a superseded one still emitting. None only for a genuinely unknown id."""
+        cur = self._cur.get(aid.request_key)
+        if cur is not None and cur.aid == aid:
+            return cur, True
+        ret = self._retired.get(aid.engine_request_id)
+        if ret is not None:
+            return ret, False
+        return None, False
 
-    def record_decode(self, aid: AttemptID, tokens: int) -> None:
+    def record_prefill(self, aid: AttemptID, tokens: int) -> None:
+        """Physical recompute reported by the engine, after APC. Counted regardless of state.
+
+        A request cancelled after admission has already paid its prefill; charging it only while
+        ACTIVE would make zero-decode cancellation look free when it was not.
+        """
         with self._lock:
-            cur = self._get_current(aid)
-            if cur and cur.state is AttemptState.ACTIVE:
-                cur.decode_tokens += tokens
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"prefill for unknown attempt {aid.engine_request_id}")
+            att.prefill_tokens += tokens
+            self.stats["prefill_tokens_total"] += tokens
+
+    def observe_decode(self, aid: AttemptID, observed_total_tokens: int) -> int:
+        """Account CUMULATIVE decode via a per-attempt high-water mark. Returns tokens newly seen.
+
+        ACCOUNTING IS INDEPENDENT OF RESULT ACCEPTANCE. A late output after an abort must never become
+        supervision, but it represents real GPU work; ignoring it would undercount exactly the wasted
+        work A1 and A2 are compared on. So the tokens are counted and bucketed by what they can be
+        used for, never dropped.
+
+        The high-water mark makes redelivered cumulative messages idempotent: a duplicate carries no
+        new tokens and inflates nothing.
+        """
+        with self._lock:
+            att, is_current = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"decode for unknown attempt {aid.engine_request_id}")
+            new = max(0, observed_total_tokens - att.max_observed_decode)
+            if new == 0:
+                att.duplicate_cumulative += 1
+                self.stats["duplicate_cumulative_msgs"] += 1
+                return 0
+            att.max_observed_decode = observed_total_tokens
+            if not is_current:
+                att.late_after_abort_tokens += new
+                self.stats["stale_attempt_tokens"] += new
+            elif att.state is AttemptState.ACTIVE:
+                att.decode_tokens += new
+            elif att.state is AttemptState.ABORTED:
+                att.late_after_abort_tokens += new
+                self.stats["late_after_abort_tokens"] += new
+            else:                                   # COMPLETED
+                att.outputs_after_completion += 1
+                self.stats["outputs_after_completion"] += 1
+            return new
 
     def complete(self, aid: AttemptID, result) -> bool:
         """ACTIVE -> COMPLETED. Returns False if abort already won, or the attempt is superseded."""
         with self._lock:
             cur = self._get_current(aid)
             if cur is None:
-                self.stats["stale_outputs_dropped"] += 1
+                # A superseded attempt finishing is an EXPECTED asynchronous race after revocation,
+                # not a fault: discard the result, keep the diagnostic, do not crash the run. Hard
+                # errors are reserved for unknown ids, malformed identities and impossible
+                # transitions -- see _find_any and the double-complete check below.
+                att, _ = self._find_any(aid)
+                if att is None:
+                    raise AttemptError(f"completion for unknown attempt {aid.engine_request_id}")
+                self.stats["results_discarded"] += 1
                 return False
             if cur.state is AttemptState.ABORTED:
-                # Abort won the race. The result is discarded: accepting it would let a cancelled
-                # child supply a continuation that could then be committed.
-                self.stats["stale_outputs_dropped"] += 1
+                # Abort won. The result is discarded -- accepting it would let a cancelled child
+                # supply a continuation that could then be committed -- but its cost is already
+                # recorded by observe_decode.
+                self.stats["results_discarded"] += 1
                 return False
             if cur.state is AttemptState.COMPLETED:
                 raise AttemptError(f"{aid.engine_request_id}: completed twice")
@@ -157,8 +223,12 @@ class AttemptRegistry:
         return cur.state if cur else None
 
     def cost(self, aid: AttemptID):
-        cur = self._get_current(aid)
-        return (0, 0) if cur is None else (cur.prefill_tokens, cur.decode_tokens)
+        """(prefill, usable decode, unusable decode). The third is real GPU work that produced
+        nothing committable -- late-after-abort and stale-attempt tokens."""
+        att, _ = self._find_any(aid)
+        if att is None:
+            return (0, 0, 0)
+        return (att.prefill_tokens, att.decode_tokens, att.late_after_abort_tokens)
 
     def quarantined_result(self, aid: AttemptID):
         cur = self._get_current(aid)
@@ -205,7 +275,12 @@ class ResourceReservation:
         """
         if not self.K_tok:
             return 0
-        return max(0, self.K_tok - committed_tokens_this_step - self.R_tok)
+        # The reserve is CONSUMED by committed tokens scheduled in this step, exactly as for
+        # occupancy resources -- the resource resets each step, the reservation does not stack on top
+        # of committed work already scheduled within it. Subtracting R_tok unconditionally was the
+        # same double-count as the original slot formula.
+        reserve_gap = max(0, self.R_tok - committed_tokens_this_step)
+        return max(0, self.K_tok - committed_tokens_this_step - reserve_gap)
 
     def limitations(self):
         out = []
