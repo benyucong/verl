@@ -121,6 +121,42 @@ class SelectorMismatch(RuntimeError):
     """Raised when analysis would compare scores it computed against chunks generated another way."""
 
 
+class ProviderNotCertified(SelectorMismatch):
+    """Raised when two artifacts share a selector but were produced by different, uncertified providers.
+
+    Sharing `selector_hash` means "these claim to be the same logical selector" -- a CLAIM, not a
+    finding. Without this, approximate top-k entropy would pass the selector-hash guard and be
+    silently interchanged with exact entropy, which is the precise failure the four-level split was
+    introduced to expose rather than hide.
+    """
+
+
+@dataclass(frozen=True)
+class ProviderEquivalenceCertificate:
+    """Evidence that two providers were TESTED and produced identical final selections.
+
+    Issued only by `assert_provider_equivalence` on exact set equality. It is scoped to one
+    `selector_hash` and one ordered pair of fingerprints, because equivalence established for one
+    selector says nothing about another -- an approximation can agree at M=10 and diverge at M=3.
+    """
+
+    selector_hash: str
+    provider_a: str
+    provider_b: str
+    n_responses: int
+    n_chunks: int
+    evidence: str = ""            # run id, artifact path, or commit -- how to re-check this
+
+    def covers(self, selector_hash: str, fp_a: str, fp_b: str) -> bool:
+        return (self.selector_hash == selector_hash
+                and {self.provider_a, self.provider_b} == {fp_a, fp_b})
+
+    def describe(self) -> str:
+        return (f"certificate[{self.selector_hash}] {self.provider_a} == {self.provider_b} "
+                f"({self.n_responses} responses, {self.n_chunks} chunks"
+                f"{', ' + self.evidence if self.evidence else ''})")
+
+
 class SignalNotReady(RuntimeError):
     """Raised when a selector is asked to rank before its signal exists.
 
@@ -341,7 +377,8 @@ class SelectorSpec:
 
 
 def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
-                        allow_cross_policy: bool = False, context: str = "") -> None:
+                        certificates=(), allow_cross_policy: bool = False,
+                        context: str = "") -> None:
     """FATAL comparison on the SELECTOR hash (score rule + candidates + C + constraint + M).
 
     Guards the failure that occurred -- analysis re-deriving a selection with aggregation="mean" and
@@ -351,7 +388,28 @@ def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
     Cross-policy comparison is a legitimate experiment and stays possible, but must be REQUESTED.
     """
     if analysis.selector_hash() == manifest_spec.selector_hash():
-        return
+        # Same LOGICAL selector. Artifacts are interchangeable only if they came from the same
+        # provider, or if a certificate records that the two providers were tested equal. A shared
+        # selector_hash is a claim of equivalence, never a demonstration of it.
+        fa, fb = analysis.provider_fingerprint(), manifest_spec.provider_fingerprint()
+        if fa == fb:
+            return
+        sh = analysis.selector_hash()
+        if any(c.covers(sh, fa, fb) for c in certificates):
+            return
+        raise ProviderNotCertified(
+            f"same logical selector, DIFFERENT providers, no equivalence certificate"
+            f"{' in ' + context if context else ''}.\n"
+            f"  analysis: {analysis.provider.describe() if analysis.provider else '<none>'}\n"
+            f"  manifest: {manifest_spec.provider.describe() if manifest_spec.provider else '<none>'}\n"
+            f"  selector: {sh}\n"
+            f"  A shared selector_hash means these CLAIM to compute the same selector; it is not "
+            f"evidence that they do. Until an equivalence test passes, the second is a CANDIDATE "
+            f"IMPLEMENTATION of the same logical selector, not a faithful one -- and an approximate "
+            f"provider (e.g. top-k entropy) would otherwise pass this guard and be mistaken for "
+            f"exact.\n"
+            f"  Run assert_provider_equivalence() on real selections and pass the certificate it "
+            f"returns, or use the same provider for both artifacts.")
     if allow_cross_policy:
         return
     diffs = {k: (getattr(analysis, k), getattr(manifest_spec, k))
@@ -396,6 +454,8 @@ def assert_provider_equivalence(sel_a, sel_b, spec_a: SelectorSpec, spec_b: Sele
     not identical, and this project has already been burned treating a 0.97 Jaccard as agreement.
 
     `sel_a`/`sel_b` are per-response selections: {response_id: set(chunk_starts)}.
+    Returns a `ProviderEquivalenceCertificate` on success, which `assert_spec_matches` accepts as
+    licence to interchange artifacts from the two providers.
     """
     if spec_a.selector_hash() != spec_b.selector_hash():
         raise SelectorMismatch(
@@ -405,7 +465,11 @@ def assert_provider_equivalence(sel_a, sel_b, spec_a: SelectorSpec, spec_b: Sele
     bad = {k: (sorted(sel_a.get(k, ())), sorted(sel_b.get(k, ()))) for k in sorted(keys)
            if set(sel_a.get(k, ())) != set(sel_b.get(k, ()))}
     if not bad:
-        return
+        return ProviderEquivalenceCertificate(
+            selector_hash=spec_a.selector_hash(),
+            provider_a=spec_a.provider_fingerprint(), provider_b=spec_b.provider_fingerprint(),
+            n_responses=len(keys), n_chunks=sum(len(sel_a.get(k, ())) for k in keys),
+            evidence=context)
     inter = sum(len(set(sel_a.get(k, ())) & set(sel_b.get(k, ()))) for k in keys)
     union = sum(len(set(sel_a.get(k, ())) | set(sel_b.get(k, ()))) for k in keys)
     shown = "\n".join(f"    {k}: {a} vs {b}" for k, (a, b) in list(bad.items())[:5])
