@@ -8,23 +8,29 @@ chunk-mean proxy against an anchor-ranked generation workload, and its conclusio
 
 THREE THINGS THIS MODULE INSISTS ON, each because the obvious shortcut is unsafe:
 
-1. THREE HASHES, NOT ONE. A single hash forces a bad choice: include the budget and legitimate
-   M=8-vs-M=10 sweeps trip the guard; exclude it and data generated at M=8 can be analysed as M=10
-   without tripping anything -- the same class of bug as the aggregation mismatch. So:
-       ranker_hash             the ranking RULE: signal identity, aggregation, anchor, candidates,
-                               constraint, tie-break. Excludes budget, so controlled sweeps can
-                               assert "same ranker, different budget" and mean it.
-       selection_instance_hash ranker + M + C. THIS is what generation-vs-analysis must match:
-                               M and C together are the audit budget, and a set selected under one
-                               budget is not a set selected under another.
-       workload_hash           selection instance + N, teacher sampling params, models, seeds,
-                               continuation cap -- everything that changes what the numbers MEAN.
+1. FOUR LEVELS OF IDENTITY, SEPARATING MATHEMATICS FROM IMPLEMENTATION. Two exact implementations of
+   the same selector are the SAME SELECTOR; where the numbers came from is provenance, not identity.
+       score_rule_hash      the mathematics: signal semantics, WHICH DISTRIBUTION, aggregation,
+                            anchor offset, tie-break.
+       selector_hash        score rule + candidate construction + C + constraint + M.
+                            THIS is the generation-vs-analysis check.
+       workload_hash        selector + N + continuation length + models + sampling + seeds --
+                            everything that changes what the numbers MEAN.
+       provider_fingerprint post-EOS forward vs online vLLM, dtype, engine version, code hash.
+                            RECORDED, never part of selector identity.
 
-2. THE SIGNAL PROVIDER IS DECLARED, NOT DERIVED FROM THE NAME. "student entropy" can come from an
-   exact GPU-side reduction in the rollout sampler, an exact post-EOS actor forward, a top-k
-   approximation, or a separate scoring worker. Those differ in availability, fidelity and systems
-   cost, and only the first can score a chunk while the trajectory is still generating -- which is
-   the whole basis of same-trajectory overlap. A name cannot carry that, so it is four fields.
+   A single hash forces a bad choice: include the budget and legitimate M=8-vs-M=10 sweeps trip the
+   guard; exclude it and data generated at M=8 can be analysed as M=10 without tripping anything.
+   Hence score_rule (for sweeps) and selector (for lookups) as separate levels.
+
+   Because the provider is NOT in the selector hash, two providers claiming exactness must be held to
+   it: `assert_provider_equivalence` demands EXACT final-set equality. A failure means the online
+   implementation is NOT YET FAITHFUL -- it does not silently become a different intended algorithm.
+
+2. WHICH DISTRIBUTION, STATED. Entropy over the raw model distribution and over the behavior
+   distribution (after temperature / top-k / top-p) COINCIDE at temperature=1, top_p=1, top_k
+   disabled -- the current setup -- and diverge everywhere else. Leaving it implicit means a later
+   sampling change silently redefines the selector while every name stays the same.
 
 3. AN UNAVAILABLE SIGNAL IS `DEFER`, NEVER A FABRICATED ONE. The pipeline currently contains a
    fallback that substitutes uniform ones when a signal is missing: selection becomes arbitrary while
@@ -92,18 +98,23 @@ PROVIDERS = {
     "external":                dict(availability="post_trajectory",      fidelity="exact"),
 }
 
+# Which distribution the signal is taken over. These coincide only at temperature=1 with top-p and
+# top-k disabled; vLLM applies temperature at sampler.py:177 and truncation at
+# topk_topp_sampler.py:104, so a "behavior" signal read after those points is a different quantity
+# from the raw one under any other sampling config.
+DISTRIBUTIONS = ("raw_model", "behavior")
+
 AGGREGATIONS = ("anchor", "mean", "sum", "max")
 CANDIDATE_POLICIES = ("all_starts", "stride", "disjoint_grid")
 CONSTRAINTS = ("greedy_resample_nonoverlap", "dp_optimal_nonoverlap", "none")
 TIE_BREAKS = ("larger_t", "smaller_t")
 RANKING_STATES = ("finalized", "provisional")
 
-# The ranking RULE. Budget (M, C) is deliberately absent -- that is the point of a separate hash.
-RANKER_FIELDS = ("signal_semantics", "signal_provider", "availability", "fidelity",
-                 "aggregation", "anchor_offset", "candidate_policy", "candidate_stride",
-                 "constraint", "tie_break")
-# What generation and analysis must agree on. M and C are the audit budget and change the SET.
-SELECTION_INSTANCE_FIELDS = RANKER_FIELDS + ("M", "chunk_tokens")
+# THE MATHEMATICS. No provider, no budget: two exact implementations of this rule are the same rule.
+SCORE_RULE_FIELDS = ("signal_semantics", "distribution", "aggregation", "anchor_offset", "tie_break")
+# THE SELECTOR. Adds candidate construction and the budget, which together fix WHICH chunks come out.
+SELECTOR_FIELDS = SCORE_RULE_FIELDS + ("candidate_policy", "candidate_stride", "constraint",
+                                       "chunk_tokens", "M")
 
 
 class SelectorMismatch(RuntimeError):
@@ -134,6 +145,61 @@ DEFER = _Defer()
 
 
 @dataclass(frozen=True)
+class ProviderFingerprint:
+    """WHERE the numbers came from. Provenance, never identity.
+
+    Two providers claiming `fidelity="exact"` are asserting they compute the SAME selector. That
+    assertion is checked by `assert_provider_equivalence` (exact final-set equality), not by being
+    folded into the selector hash -- folding it in would declare them different algorithms, which is
+    the opposite of what is meant, and would make faithfulness unfalsifiable.
+    """
+
+    signal_provider: str
+    availability: str = ""
+    fidelity: str = ""
+    dtype: str = ""              # e.g. "bf16 logits / fp32 reduction"
+    engine: str = ""             # e.g. "vllm"
+    engine_version: str = ""     # PIN IT. 0.15.1 on acc is not 0.20.1 on LUMI until tested.
+    code_hash: str = ""          # patch or source hash of the computing code
+
+    def __post_init__(self):
+        if self.signal_provider not in PROVIDERS:
+            raise ValueError(f"unknown signal_provider {self.signal_provider!r}; register it in "
+                             f"PROVIDERS with its availability and fidelity -- an unregistered "
+                             f"provider has no known availability and the scheduler would guess")
+        known = PROVIDERS[self.signal_provider]
+        for f in ("availability", "fidelity"):
+            if not getattr(self, f):
+                object.__setattr__(self, f, known[f])
+            elif getattr(self, f) != known[f]:
+                raise ValueError(
+                    f"{f}={getattr(self, f)!r} contradicts provider {self.signal_provider!r}, "
+                    f"registered as {known[f]!r}. Fix the spec or register a new provider.")
+
+    @property
+    def enables_same_trajectory_overlap(self) -> bool:
+        """True only if a chunk can be scored while its own trajectory is still generating.
+
+        The entire progressive-execution design rests on this. `post_trajectory` reproduces OmniOPD
+        faithfully but forecloses same-trajectory overlap; cross-trajectory pipelining survives.
+        """
+        return self.availability in ("per_token_online", "per_chunk_online")
+
+    @property
+    def needs_teacher_before_selection(self) -> bool:
+        return self.availability == "post_teacher_scoring"
+
+    def fingerprint(self) -> str:
+        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()[:16]
+
+    def describe(self) -> str:
+        v = f"{self.engine}{'@' + self.engine_version if self.engine_version else ''}"
+        return (f"{self.signal_provider}[{self.availability}/{self.fidelity}]"
+                f"{' ' + v if v else ''}{' ' + self.dtype if self.dtype else ''}")
+
+
+@dataclass(frozen=True)
 class SelectorSpec:
     """A complete, executable description of one selection policy.
 
@@ -145,12 +211,9 @@ class SelectorSpec:
     """
 
     signal_semantics: str
-    signal_provider: str
-    # Declared explicitly and CHECKED against PROVIDERS rather than derived: a spec that lies about
-    # when its signal arrives would mis-plan the pipeline, so the lie must be caught at construction.
-    availability: str = ""
-    fidelity: str = ""
-
+    # RAW MODEL or BEHAVIOR distribution. They coincide only at temperature=1 / top_p=1 / top_k off.
+    # Stating it prevents a later sampling change from silently redefining the selector.
+    distribution: str = "raw_model"
     aggregation: str = "anchor"
     # Offset from the chunk start to the token whose signal is read, for aggregation="anchor".
     # -1 is OmniOPD's rule: response position t is scored by H[prompt_len + t - 1], the logits that
@@ -167,25 +230,14 @@ class SelectorSpec:
     M: int = 10                                 # chunks audited per response
     N: int = 10                                 # teacher continuations per chunk (workload-level)
     ranking_state: str = "finalized"            # provisional => may be revised as tokens stream in
+    # Provenance. Optional so a spec can name the MATHEMATICS alone; required before any run.
+    provider: "ProviderFingerprint | None" = None
     notes: str = ""                             # free text; never part of any hash
 
     def __post_init__(self):
         if self.signal_semantics not in SIGNAL_SEMANTICS:
             raise ValueError(f"unknown signal_semantics {self.signal_semantics!r}")
-        if self.signal_provider not in PROVIDERS:
-            raise ValueError(f"unknown signal_provider {self.signal_provider!r}; register it in "
-                             f"PROVIDERS with its availability and fidelity -- an unregistered "
-                             f"provider has no known availability and the scheduler would guess")
-        known = PROVIDERS[self.signal_provider]
-        for f in ("availability", "fidelity"):
-            if not getattr(self, f):
-                object.__setattr__(self, f, known[f])
-            elif getattr(self, f) != known[f]:
-                raise ValueError(
-                    f"{f}={getattr(self, f)!r} contradicts provider {self.signal_provider!r}, which "
-                    f"is registered as {known[f]!r}. Fix the spec or register a new provider; do not "
-                    f"paper over the difference.")
-        for name, allowed in (("availability", AVAILABILITY), ("fidelity", FIDELITY),
+        for name, allowed in (("distribution", DISTRIBUTIONS),
                               ("aggregation", AGGREGATIONS), ("tie_break", TIE_BREAKS),
                               ("candidate_policy", CANDIDATE_POLICIES),
                               ("constraint", CONSTRAINTS), ("ranking_state", RANKING_STATES)):
@@ -204,13 +256,25 @@ class SelectorSpec:
         return hashlib.sha256(
             json.dumps(d, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
-    def ranker_hash(self) -> str:
-        """The ranking rule alone. Two specs sharing this rank candidates identically."""
-        return self._h({k: getattr(self, k) for k in RANKER_FIELDS})
+    def score_rule_hash(self) -> str:
+        """The MATHEMATICS: signal semantics, distribution, aggregation, anchor, tie-break.
 
-    def selection_instance_hash(self) -> str:
-        """Ranker + audit budget (M, C). **This is the generation-vs-analysis check.**"""
-        return self._h({k: getattr(self, k) for k in SELECTION_INSTANCE_FIELDS})
+        Deliberately provider-free and budget-free. Two exact implementations of one rule share this,
+        which is what makes "is the online provider faithful?" a falsifiable question rather than a
+        definitional one.
+        """
+        return self._h({k: getattr(self, k) for k in SCORE_RULE_FIELDS})
+
+    def selector_hash(self) -> str:
+        """Score rule + candidate construction + C + constraint + M.
+
+        **The generation-vs-analysis check.** M and C are the audit budget: a set selected under one
+        budget is not a set selected under another, so reading M=8 data as M=10 must fail here.
+        """
+        return self._h({k: getattr(self, k) for k in SELECTOR_FIELDS})
+
+    def provider_fingerprint(self) -> str:
+        return self.provider.fingerprint() if self.provider else ""
 
     def workload_hash(self, *, models=None, seeds=None, teacher_sampling=None,
                       continuation_tokens=None) -> str:
@@ -222,7 +286,7 @@ class SelectorSpec:
         them in a hash would make an unresolved ambiguity invisible.
         """
         return self._h({
-            "selection_instance": self.selection_instance_hash(),
+            "selector": self.selector_hash(),
             "N": self.N,
             "models": models or {},
             "seeds": seeds or {},
@@ -233,45 +297,52 @@ class SelectorSpec:
 
     # -- scheduling facts ----------------------------------------------------------------------
 
+    # Scheduling facts are properties of the PROVIDER, not of the mathematics.
     @property
     def enables_same_trajectory_overlap(self) -> bool:
-        """True only if a chunk can be scored while its own trajectory is still generating.
-
-        This is the property the whole progressive-execution design rests on. `post_trajectory`
-        reproduces OmniOPD faithfully but forecloses same-trajectory overlap: the score for chunk 1
-        is unknown until EOS. Cross-trajectory pipelining survives either way.
-        """
-        return self.availability in ("per_token_online", "per_chunk_online")
+        return bool(self.provider) and self.provider.enables_same_trajectory_overlap
 
     @property
     def needs_teacher_before_selection(self) -> bool:
-        return self.availability == "post_teacher_scoring"
+        return bool(self.provider) and self.provider.needs_teacher_before_selection
+
+    def with_provider(self, provider: "ProviderFingerprint") -> "SelectorSpec":
+        """Same mathematics, different implementation. score_rule_hash and selector_hash are
+        unchanged by construction -- which is the whole point of the split."""
+        return SelectorSpec(**{**asdict(self), "provider": provider,
+                               "notes": self.notes})
 
     def to_manifest(self) -> dict:
         d = asdict(self)
-        d.update(ranker_hash=self.ranker_hash(),
-                 selection_instance_hash=self.selection_instance_hash(),
+        d.update(score_rule_hash=self.score_rule_hash(),
+                 selector_hash=self.selector_hash(),
+                 provider_fingerprint=self.provider_fingerprint(),
                  enables_same_trajectory_overlap=self.enables_same_trajectory_overlap,
                  needs_teacher_before_selection=self.needs_teacher_before_selection,
-                 ranker_fields=list(RANKER_FIELDS),
-                 selection_instance_fields=list(SELECTION_INSTANCE_FIELDS))
+                 score_rule_fields=list(SCORE_RULE_FIELDS),
+                 selector_fields=list(SELECTOR_FIELDS))
         return d
 
     @classmethod
     def from_manifest(cls, d: dict) -> "SelectorSpec":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        kw = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        prov = kw.get("provider")
+        if isinstance(prov, dict):
+            kw["provider"] = ProviderFingerprint(
+                **{k: v for k, v in prov.items() if k in ProviderFingerprint.__dataclass_fields__})
+        return cls(**kw)
 
     def describe(self) -> str:
         agg = f"anchor@{self.anchor_offset}" if self.aggregation == "anchor" else self.aggregation
-        return (f"{self.signal_semantics} via {self.signal_provider} "
-                f"[{self.availability}/{self.fidelity}] {agg} C={self.chunk_tokens} M={self.M} "
-                f"N={self.N} {self.constraint}/{self.tie_break} "
-                f"ranker={self.ranker_hash()} inst={self.selection_instance_hash()}")
+        prov = f" via {self.provider.describe()}" if self.provider else " (no provider)"
+        return (f"{self.signal_semantics}/{self.distribution}{prov} {agg} C={self.chunk_tokens} "
+                f"M={self.M} N={self.N} {self.constraint}/{self.tie_break} "
+                f"rule={self.score_rule_hash()} sel={self.selector_hash()}")
 
 
 def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
                         allow_cross_policy: bool = False, context: str = "") -> None:
-    """FATAL comparison on the SELECTION INSTANCE hash (ranker + M + C).
+    """FATAL comparison on the SELECTOR hash (score rule + candidates + C + constraint + M).
 
     Guards the failure that occurred -- analysis re-deriving a selection with aggregation="mean" and
     looking up continuations generated for aggregation="anchor" -- and equally the budget failure:
@@ -279,37 +350,75 @@ def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
 
     Cross-policy comparison is a legitimate experiment and stays possible, but must be REQUESTED.
     """
-    if analysis.selection_instance_hash() == manifest_spec.selection_instance_hash():
+    if analysis.selector_hash() == manifest_spec.selector_hash():
         return
     if allow_cross_policy:
         return
     diffs = {k: (getattr(analysis, k), getattr(manifest_spec, k))
-             for k in SELECTION_INSTANCE_FIELDS
+             for k in SELECTOR_FIELDS
              if getattr(analysis, k) != getattr(manifest_spec, k)}
-    same_ranker = analysis.ranker_hash() == manifest_spec.ranker_hash()
-    hint = ("  The RANKER matches; only the budget differs. That is a legitimate sweep, but it is "
-            "not a valid lookup: chunks selected under one budget are a different SET. Use "
-            "assert_same_ranker() for the sweep and read each budget from its own manifest.\n"
-            if same_ranker else "")
+    same_rule = analysis.score_rule_hash() == manifest_spec.score_rule_hash()
+    hint = ("  The SCORE RULE matches; only candidate construction or the budget differs. That is a "
+            "legitimate sweep, but it is not a valid lookup: chunks selected under one budget are a "
+            "different SET. Use assert_same_score_rule() for the sweep and read each budget from its "
+            "own manifest.\n" if same_rule else "")
     raise SelectorMismatch(
-        f"selector selection-instance mismatch{' in ' + context if context else ''} -- refusing to "
-        f"compare scores computed under one policy against chunks generated under another.\n"
+        f"selector mismatch{' in ' + context if context else ''} -- refusing to compare scores "
+        f"computed under one policy against chunks generated under another.\n"
         + "\n".join(f"    {k}: analysis={a!r} but manifest={m!r}" for k, (a, m) in diffs.items())
         + f"\n{hint}  analysis: {analysis.describe()}\n  manifest: {manifest_spec.describe()}\n"
         f"  If this IS the experiment, pass allow_cross_policy=True explicitly and say so in the "
         f"write-up.")
 
 
-def assert_same_ranker(a: SelectorSpec, b: SelectorSpec, *, context: str = "") -> None:
-    """For controlled budget sweeps: the ranking rule must be identical while M or C differ."""
-    if a.ranker_hash() == b.ranker_hash():
+def assert_same_score_rule(a: SelectorSpec, b: SelectorSpec, *, context: str = "") -> None:
+    """For controlled budget sweeps: the mathematics must be identical while M or C differ."""
+    if a.score_rule_hash() == b.score_rule_hash():
         return
-    diffs = {k: (getattr(a, k), getattr(b, k)) for k in RANKER_FIELDS
+    diffs = {k: (getattr(a, k), getattr(b, k)) for k in SCORE_RULE_FIELDS
              if getattr(a, k) != getattr(b, k)}
     raise SelectorMismatch(
-        f"ranker mismatch{' in ' + context if context else ''} -- a budget sweep must hold the "
-        f"ranking rule fixed, otherwise it measures two things at once.\n"
+        f"score-rule mismatch{' in ' + context if context else ''} -- a budget sweep must hold the "
+        f"mathematics fixed, otherwise it measures two things at once.\n"
         + "\n".join(f"    {k}: {x!r} vs {y!r}" for k, (x, y) in diffs.items()))
+
+
+def assert_provider_equivalence(sel_a, sel_b, spec_a: SelectorSpec, spec_b: SelectorSpec, *,
+                                context: str = "") -> None:
+    """Two providers claiming exactness must produce the SAME FINAL SET. Exact equality, not Jaccard.
+
+    This is the check the four-level split buys. Because the provider is NOT in `selector_hash`,
+    `post_eos_actor_forward` and `rollout_exact_scalar` are the same selector by construction -- so
+    the claim "the online path is faithful" becomes falsifiable, and this is where it is falsified.
+
+    A failure means THE ONLINE IMPLEMENTATION IS NOT YET FAITHFUL. It does not mean the online path
+    is a different intended algorithm, and it must never be written up that way: near-identical is
+    not identical, and this project has already been burned treating a 0.97 Jaccard as agreement.
+
+    `sel_a`/`sel_b` are per-response selections: {response_id: set(chunk_starts)}.
+    """
+    if spec_a.selector_hash() != spec_b.selector_hash():
+        raise SelectorMismatch(
+            f"provider equivalence is only meaningful between the SAME selector; got "
+            f"{spec_a.selector_hash()} vs {spec_b.selector_hash()}")
+    keys = set(sel_a) | set(sel_b)
+    bad = {k: (sorted(sel_a.get(k, ())), sorted(sel_b.get(k, ()))) for k in sorted(keys)
+           if set(sel_a.get(k, ())) != set(sel_b.get(k, ()))}
+    if not bad:
+        return
+    inter = sum(len(set(sel_a.get(k, ())) & set(sel_b.get(k, ()))) for k in keys)
+    union = sum(len(set(sel_a.get(k, ())) | set(sel_b.get(k, ()))) for k in keys)
+    shown = "\n".join(f"    {k}: {a} vs {b}" for k, (a, b) in list(bad.items())[:5])
+    raise SelectorMismatch(
+        f"provider equivalence FAILED{' in ' + context if context else ''}: "
+        f"{len(bad)}/{len(keys)} responses select different chunk sets.\n{shown}\n"
+        f"    (Jaccard {inter / max(union, 1):.4f} -- reported for context only; the bar is EXACT "
+        f"set equality, and a high Jaccard with frequent set inequality is precisely the failure "
+        f"this check exists to catch.)\n"
+        f"  a: {spec_a.provider.describe() if spec_a.provider else '?'}\n"
+        f"  b: {spec_b.provider.describe() if spec_b.provider else '?'}\n"
+        f"  This means the online implementation is NOT YET FAITHFUL. It is not a different "
+        f"intended algorithm and must not be described as one.")
 
 
 def require_signal(values, spec: SelectorSpec, *, context: str = ""):
@@ -320,9 +429,11 @@ def require_signal(values, spec: SelectorSpec, *, context: str = ""):
     A selector with no signal has exactly two honest outcomes: DEFER, or fail.
     """
     if values is None:
+        prov = spec.provider.signal_provider if spec.provider else "<no provider declared>"
+        avail = spec.provider.availability if spec.provider else "unknown"
         raise SignalNotReady(
-            f"{spec.signal_semantics} from {spec.signal_provider} is unavailable"
-            f"{' in ' + context if context else ''} (availability={spec.availability}). Return DEFER "
+            f"{spec.signal_semantics} from {prov} is unavailable"
+            f"{' in ' + context if context else ''} (availability={avail}). Return DEFER "
             f"and retry when the signal lands. Do not substitute uniform or placeholder values: the "
             f"ranking would be arbitrary while every downstream metric still reported it as real.")
     return values
@@ -408,7 +519,7 @@ def select(signal, prompt_len, resp_len, spec):
     signal is expected later rather than absent. Anything else raises.
     """
     if signal is None:
-        if spec.availability == "static":
+        if spec.provider and spec.provider.availability == "static":
             raise SignalNotReady("a static-availability signal cannot be missing")
         return DEFER
     return apply_constraint(candidate_scores(signal, prompt_len, resp_len, spec), spec)
@@ -422,17 +533,18 @@ def manifest_block(specs_by_arm, *, models=None, seeds=None, teacher_sampling=No
                                    continuation_tokens=continuation_tokens)
           for name, spec in specs_by_arm.items()}
     block = {
-        "schema_version": 2,
+        "schema_version": 3,
         "arms": {name: spec.to_manifest() for name, spec in specs_by_arm.items()},
-        "ranker_hashes": {n: s.ranker_hash() for n, s in specs_by_arm.items()},
-        "selection_instance_hashes": {n: s.selection_instance_hash() for n, s in specs_by_arm.items()},
+        "score_rule_hashes": {n: s.score_rule_hash() for n, s in specs_by_arm.items()},
+        "selector_hashes": {n: s.selector_hash() for n, s in specs_by_arm.items()},
+        "provider_fingerprints": {n: s.provider_fingerprint() for n, s in specs_by_arm.items()},
         "workload_hashes": wl,
         "models": models or {}, "seeds": seeds or {},
         "teacher_sampling": teacher_sampling or {},
         "continuation_tokens": continuation_tokens,
-        "distinct_rankers": sorted({s.ranker_hash() for s in specs_by_arm.values()}),
-        "distinct_selection_instances": sorted({s.selection_instance_hash()
-                                                for s in specs_by_arm.values()}),
+        "distinct_score_rules": sorted({s.score_rule_hash() for s in specs_by_arm.values()}),
+        "distinct_selectors": sorted({s.selector_hash() for s in specs_by_arm.values()}),
+        "distinct_providers": sorted({s.provider_fingerprint() for s in specs_by_arm.values()}),
         "any_enables_same_trajectory_overlap": any(
             s.enables_same_trajectory_overlap for s in specs_by_arm.values()),
         "any_needs_teacher_before_selection": any(
@@ -465,35 +577,52 @@ def spec_from_manifest_arm(manifest, arm):
 # whether same-trajectory overlap is possible.
 # ---------------------------------------------------------------------------------------------
 
+# The two exact providers share score_rule_hash AND selector_hash by construction. That identity is
+# the point: it makes "is the online path faithful?" falsifiable via assert_provider_equivalence,
+# rather than true by definition.
+
+_OMNIOPD_RULE = dict(signal_semantics="student_entropy", distribution="raw_model",
+                     aggregation="anchor", anchor_offset=-1, chunk_tokens=50, M=10, N=10)
+
+POST_EOS_EXACT = ProviderFingerprint(
+    signal_provider="post_eos_actor_forward", dtype="fp32 lm_head / fp32 reduction")
+
+# engine_version is PINNED. 0.15.1 on acc is the first target; 0.20.1 on LUMI is structurally
+# similar but UNTESTED, and must not be claimed until that source and runtime are exercised.
+ROLLOUT_EXACT_VLLM_0151 = ProviderFingerprint(
+    signal_provider="rollout_exact_scalar", dtype="bf16 logits / fp32 reduction",
+    engine="vllm", engine_version="0.15.1", code_hash="")
+
 OMNIOPD_PUBLISHED = SelectorSpec(
-    signal_semantics="student_entropy", signal_provider="post_eos_actor_forward",
-    aggregation="anchor", anchor_offset=-1, chunk_tokens=50, M=10, N=10,
-    notes="OmniOPD 3.2.3 Eq 6-7, faithful reference. Exact, but post-EOS: reproduces the algorithm "
+    **_OMNIOPD_RULE, provider=POST_EOS_EXACT,
+    notes="OmniOPD 3.2.3 Eq 6-7, faithful reference. Exact but post-EOS: reproduces the algorithm "
           "and forecloses same-trajectory overlap. The Phase-0 baseline.")
 
 OMNIOPD_ONLINE_EXACT = SelectorSpec(
-    signal_semantics="student_entropy", signal_provider="rollout_exact_scalar",
-    aggregation="anchor", anchor_offset=-1, chunk_tokens=50, M=10, N=10,
-    notes="Same algorithm, same fidelity, scored per token during decode. The desired OPDFlow path: "
-          "identical selection to OMNIOPD_PUBLISHED, available early enough to overlap. Feasibility "
-          "depends on a GPU-side scalar reduction in the vLLM sampler -- UNVERIFIED.")
+    **_OMNIOPD_RULE, provider=ROLLOUT_EXACT_VLLM_0151,
+    notes="THE SAME SELECTOR, computed during decode. Faithfulness is a claim to be tested by exact "
+          "final-set equality against OMNIOPD_PUBLISHED, not an assumption.")
 
 OMNIOPD_ONLINE_TOPK = SelectorSpec(
-    signal_semantics="student_entropy", signal_provider="rollout_topk_approx",
-    aggregation="anchor", anchor_offset=-1, chunk_tokens=50, M=10, N=10,
-    notes="Optional fallback and an explicit DEVIATION: omniopd_chunks.py:120 currently refuses "
-          "entropy_topk != 0 in favour of exact full-vocab (FID-1). Only on measured evidence that "
-          "selection is unchanged.")
+    **_OMNIOPD_RULE,
+    provider=ProviderFingerprint(signal_provider="rollout_topk_approx", engine="vllm",
+                                 engine_version="0.15.1"),
+    notes="Optional fallback and an explicit DEVIATION: omniopd_chunks.py:120 refuses entropy_topk "
+          "!= 0 in favour of exact full-vocab (FID-1). At V=151936, K=20 observes 0.013% of the "
+          "support and the unobserved tail is largest exactly at the high-entropy anchors this rule "
+          "selects -- so it must be validated by selection agreement, never by entropy MSE.")
 
 GAPSELECT_M10 = SelectorSpec(
-    signal_semantics="teacher_gap_abs", signal_provider="teacher_scoring_k0",
-    aggregation="mean", chunk_tokens=50, M=10, N=10,
+    signal_semantics="teacher_gap_abs", distribution="raw_model", aggregation="mean",
+    chunk_tokens=50, M=10, N=10,
+    provider=ProviderFingerprint(signal_provider="teacher_scoring_k0"),
     notes="Teacher-side plugin and scheduler stress workload: the one policy whose signal does not "
           "exist until after teacher scoring, so it exercises the deferred-selection path. NOT an "
           "algorithmic improvement claim.")
 
 GAPSELECT_M8_CLOSED = SelectorSpec(
-    signal_semantics="teacher_gap_abs", signal_provider="teacher_scoring_k0",
-    aggregation="mean", chunk_tokens=50, M=8, N=10,
+    signal_semantics="teacher_gap_abs", distribution="raw_model", aggregation="mean",
+    chunk_tokens=50, M=8, N=10,
+    provider=ProviderFingerprint(signal_provider="teacher_scoring_k0"),
     notes="CLOSED. Failed both pre-registered gates against OMNIOPD_PUBLISHED "
           "(docs/genopdflow_phase2_gapselect.md). Retained so the closed claim stays citable.")
