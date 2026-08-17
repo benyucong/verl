@@ -6,18 +6,34 @@ TWO DISTINCTIONS THIS MODULE EXISTS TO KEEP:
    one physical execution of it. A revoked anchor that re-enters must NOT reuse its previous engine
    request id -- the engine may reject the duplicate, or worse, attribute a late output or an abort
    acknowledgement from the dead attempt to the live one. The sampling seed stays stable across
-   attempts, so a restart reproduces the same continuation; only the identity the engine sees changes.
+   attempts -- deterministic INTENT -- while the identity the engine sees changes.
 
 2. RESOURCE KINDS. Sequence slots, KV blocks and per-step scheduled tokens are different resources
    and must not share a reserve. Slots and KV blocks are PERSISTENT OCCUPANCY: a request holds them
    until it terminates, so the reserve-gap algebra applies. Scheduled tokens are RENEWED EVERY STEP,
-   so treating them as occupancy would reserve capacity that no longer exists a step later; committed
-   tokens are scheduled first and speculation takes only the permitted remainder.
+   so treating them as occupancy would reserve capacity that no longer exists a step later. Committed
+   tokens are scheduled first and speculation takes the remainder -- but the reserve is still CONSUMED
+   within the step, so it is max(0, K_tok - max(R_tok, committed)), not K_tok - committed - R_tok.
 
 The terminal transition is atomic and one-way. Whichever of completion or abort wins is
-authoritative, and every later output from that attempt is discarded -- otherwise a cancelled child
+authoritative, and every later RESULT from that attempt is discarded -- otherwise a cancelled child
 could still supply a continuation that reaches training, which is a correctness bug rather than an
 accounting one.
+
+RESULT ACCEPTANCE AND COST ACCOUNTING ARE INDEPENDENT PATHS. A late output after an abort must never
+become supervision, but it consumed real GPU time; dropping it from the ACCOUNTING as well would
+undercount precisely the wasted work A1 and A2 are compared on. Every output is therefore costed and
+bucketed by usability, and only the result is discarded. Cumulative outputs are accounted through a
+per-attempt high-water mark, so redelivered messages inflate nothing.
+
+A late output from a superseded or aborted attempt is an EXPECTED asynchronous race: discarded,
+accounted, recorded as a diagnostic -- never a crash. Hard errors are reserved for unknown request
+ids, malformed identities and impossible transitions such as double completion.
+
+ON SEEDS: a stable seed expresses deterministic INTENT. It is NOT a claim that a restarted attempt is
+bitwise reproducible under a different continuous-batching schedule -- batch composition changes
+kernel reduction order. Algorithmically a restart is a fresh valid teacher sample; bitwise
+reproducibility is a separate question and must be tested separately if it is ever relied upon.
 """
 from __future__ import annotations
 
@@ -34,7 +50,12 @@ class AttemptState(Enum):
 
 
 class AttemptError(RuntimeError):
-    """Raised on an illegal attempt transition or on output from a stale attempt."""
+    """Raised ONLY on unknown request ids, malformed identities, or impossible transitions.
+
+    Deliberately NOT raised for a late output from a superseded or aborted attempt: that is an
+    expected asynchronous race after revocation, and crashing a run on it would turn normal operation
+    into a fault.
+    """
 
 
 @dataclass(frozen=True)
@@ -74,10 +95,11 @@ class _Attempt:
 class AttemptRegistry:
     """Tracks the CURRENT attempt per logical request, and enforces one terminal state each.
 
-    Outputs are accepted only from the current attempt. A late output from a superseded attempt is
-    silently dropped rather than raising: it is an expected consequence of revocation, not a bug, and
-    raising would turn normal operation into noise. An output from a TERMINATED attempt does raise,
-    because that means the engine emitted after acknowledging a terminal state.
+    RESULTS are accepted only from the current, still-ACTIVE attempt. COSTS are accounted from every
+    attempt, current or superseded, terminated or not -- a superseded attempt that keeps emitting is
+    consuming real GPU time, and forgetting it would understate speculative waste.
+
+    Superseded attempts are retained rather than deleted for exactly that reason.
     """
 
     def __init__(self):
