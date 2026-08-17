@@ -107,17 +107,26 @@ class _Attempt:
     # compute tokens in an already-running GPU step and discard them without ever emitting them. The
     # high-water mark measures what was DELIVERED; engine counters measure what was COMPUTED; the
     # difference is real wasted work that must not vanish from the accounting.
-    physical_decode_tokens: int = 0    # from ENGINE counters -- what the GPU actually produced
+    # ACCUMULATED FROM PER-STEP INCREMENTS, never taken as max() of a progress figure. vLLM's request
+    # progress can RESET on preemption and recomputation, so a max() over logical progress would miss
+    # every recomputed token -- precisely the work preemption creates.
+    physical_decode_tokens: int = 0        # cumulative physical decode, monotonic by construction
+    preemption_recompute_tokens: int = 0   # recomputation after preemption, counted SEPARATELY
     # ABORT IS NOT INSTANTANEOUS, and abort_request() RETURNING is not acknowledgement. The RPC
     # returning says the request was delivered; only an engine-side terminal event (FINISHED_ABORTED)
     # says the engine is done with it.
+    # TWO CLOCKS. Engine-side steps say WHEN SOMETHING HAPPENED; our observation ticks say when we
+    # LEARNED of it. Work reported after the terminal event is normal; work that OCCURRED after it is
+    # impossible, and only the engine clock can tell those apart.
     enqueued_seq: int = -1
-    first_scheduled_seq: int = -1      # the engine actually began work
+    first_scheduled_seq: int = -1
     abort_requested_seq: int = -1
-    abort_rpc_returned_seq: int = -1   # the RPC came back -- NOT acknowledgement
-    engine_terminal_status: str = ""   # e.g. FINISHED_ABORTED, FINISHED_STOPPED
-    engine_terminal_seq: int = -1      # the real acknowledgement
-    last_physical_work_seq: int = -1
+    abort_rpc_returned_seq: int = -1       # the RPC came back -- NOT acknowledgement
+    last_engine_work_step: int = -1        # ENGINE clock: last step that computed for this attempt
+    engine_terminal_step: int = -1         # ENGINE clock: when the engine finished with it
+    engine_terminal_status: str = ""
+    terminal_observed_seq: int = -1        # OUR clock: when we saw the terminal event
+    finalized: bool = False
 
     @property
     def delivered_decode(self) -> int:
@@ -128,8 +137,10 @@ class _Attempt:
     def dropped_undelivered(self) -> int:
         """Computed by the GPU but never delivered -- discarded mid-step by an abort.
 
-        Invisible to output-based accounting, and real. Clamped at zero: engine counters can lag
-        delivery, and a negative would be a reporting artifact rather than negative work.
+        Clamped only because polling MID-FLIGHT can transiently show delivered ahead of the counter.
+        That is a race, not a fact about the world, and `finalize()` asserts the invariant once the
+        terminal counter refresh has landed -- clamping there would hide misaligned telemetry, which
+        is the bug most worth catching.
         """
         return max(0, self.physical_decode_tokens - self.delivered_decode)
 
@@ -372,38 +383,97 @@ class AttemptRegistry:
             self._seq += 1
             att.abort_rpc_returned_seq = self._seq
 
-    def record_engine_terminal(self, aid: AttemptID, status: str) -> None:
-        """The engine's own terminal event, e.g. FINISHED_ABORTED. The REAL acknowledgement."""
-        with self._lock:
-            att, _ = self._find_any(aid)
-            if att is None:
-                raise AttemptError(f"terminal for unknown attempt {aid.engine_request_id}")
-            self._seq += 1
-            att.engine_terminal_status = status
-            att.engine_terminal_seq = self._seq
+    def record_engine_terminal(self, aid: AttemptID, status: str, *, engine_step: int) -> None:
+        """The engine's own terminal event, e.g. FINISHED_ABORTED. The REAL acknowledgement.
 
-    def record_physical_decode(self, aid: AttemptID, engine_counter_tokens: int) -> None:
-        """Physically computed decode from ENGINE counters, not from delivered output.
-
-        Set rather than accumulated: engine counters are cumulative per request, so adding would
-        double-count every poll.
+        `engine_step` is when it happened on the engine clock; the observation tick is when we learned
+        of it. Both are kept because only the engine clock can distinguish "reported late" from
+        "occurred after the end".
         """
         with self._lock:
             att, _ = self._find_any(aid)
             if att is None:
-                raise AttemptError(f"physical decode for unknown attempt {aid.engine_request_id}")
-            att.physical_decode_tokens = max(att.physical_decode_tokens, engine_counter_tokens)
+                raise AttemptError(f"terminal for unknown attempt {aid.engine_request_id}")
+            if att.last_engine_work_step > engine_step:
+                raise AttemptError(
+                    f"{aid.engine_request_id}: last engine work at step {att.last_engine_work_step} "
+                    f"is after the terminal event at step {engine_step} -- causally impossible")
+            att.engine_terminal_status = status
+            att.engine_terminal_step = engine_step
             self._seq += 1
-            att.last_physical_work_seq = self._seq
+            att.terminal_observed_seq = self._seq
+
+    def finalize(self, aid: AttemptID) -> None:
+        """Call after the TERMINAL counter refresh. Asserts the invariant instead of clamping it.
+
+        Mid-flight, stale polling can transiently show delivered ahead of the physical counter -- a
+        race. Once the terminal refresh has landed there is no race left, and physical < delivered
+        means the two telemetry sources disagree about the same request. Clamping here would hide
+        precisely the misalignment worth finding.
+        """
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"finalize for unknown attempt {aid.engine_request_id}")
+            if att.engine_terminal_step < 0:
+                raise AttemptError(
+                    f"{aid.engine_request_id}: finalize before any engine terminal event; the "
+                    f"physical counter has not had its final refresh")
+            if att.physical_decode_tokens < att.delivered_decode:
+                raise AttemptError(
+                    f"{aid.engine_request_id}: TELEMETRY MISALIGNED after terminal refresh -- "
+                    f"physical {att.physical_decode_tokens} < delivered {att.delivered_decode}. "
+                    f"The engine cannot have delivered more tokens than it computed; one of the two "
+                    f"sources is not describing this request.")
+            att.finalized = True
+
+    def add_physical_decode(self, aid: AttemptID, delta_tokens: int, *, engine_step: int,
+                            recompute: bool = False) -> None:
+        """Accumulate PER-STEP physical decode from engine telemetry.
+
+        Increments, not a max() over reported progress: vLLM's request progress RESETS when a request
+        is preempted and recomputed, so a max would silently discard every recomputed token -- exactly
+        the work preemption generates, and exactly what A2's reservation exists to avoid causing.
+
+        Recomputation is counted separately rather than inferred from final progress, because final
+        progress cannot distinguish "computed once" from "computed, preempted, computed again".
+        """
+        if delta_tokens < 0:
+            raise AttemptError(f"negative physical delta {delta_tokens} for {aid.engine_request_id}")
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"physical decode for unknown attempt {aid.engine_request_id}")
+            if att.engine_terminal_step >= 0 and engine_step > att.engine_terminal_step:
+                raise AttemptError(
+                    f"{aid.engine_request_id}: engine work at step {engine_step} AFTER the terminal "
+                    f"event at step {att.engine_terminal_step}. Reporting work late is normal; work "
+                    f"OCCURRING after the engine finished is impossible, so this is misaligned "
+                    f"telemetry rather than a race.")
+            att.physical_decode_tokens += delta_tokens
+            if recompute:
+                att.preemption_recompute_tokens += delta_tokens
+            att.last_engine_work_step = max(att.last_engine_work_step, engine_step)
+            self._seq += 1
 
     def abort_timeline(self, aid: AttemptID):
-        """(enqueued, first_scheduled, abort_requested, abort_rpc_returned, engine_terminal,
-        last_physical_work). abort_rpc_returned is NOT the acknowledgement; engine_terminal is."""
+        """(enqueued, first_scheduled, abort_requested, abort_rpc_returned | last_engine_work,
+        engine_terminal | terminal_observed).
+
+        The first four are OUR observation ticks, the next two the ENGINE clock, the last ours again.
+        abort_rpc_returned is NOT acknowledgement -- engine_terminal is. Work after the RPC return is
+        plausible; work after the engine terminal is impossible and raises.
+        """
         att, _ = self._find_any(aid)
         if att is None:
-            return (-1,) * 6
+            return (-1,) * 7
         return (att.enqueued_seq, att.first_scheduled_seq, att.abort_requested_seq,
-                att.abort_rpc_returned_seq, att.engine_terminal_seq, att.last_physical_work_seq)
+                att.abort_rpc_returned_seq, att.last_engine_work_step, att.engine_terminal_step,
+                att.terminal_observed_seq)
+
+    def preemption_recompute(self, aid: AttemptID) -> int:
+        att, _ = self._find_any(aid)
+        return 0 if att is None else att.preemption_recompute_tokens
 
     def delivery_gap(self, aid: AttemptID):
         """(physical, delivered, dropped_undelivered) decode tokens."""
