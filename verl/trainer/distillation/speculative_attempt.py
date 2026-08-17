@@ -81,15 +81,32 @@ class AttemptID:
 
 @dataclass
 class _Attempt:
+    """An IMMUTABLE PHYSICAL-WORK LEDGER. It records what happened, never whether it was useful.
+
+    Usability cannot be known when tokens arrive: it depends on whether the canonical post-EOS
+    selector later commits this anchor. Banking pre-abort decode as "usable" on arrival would
+    undercount waste for every anchor that is proposed, decoded, and then loses -- which is the
+    dominant waste mode the A1/A2 comparison exists to measure.
+    """
+
     aid: AttemptID
     state: AttemptState = AttemptState.ACTIVE
-    prefill_tokens: int = 0        # physical recompute reported by the engine, after APC
-    decode_tokens: int = 0         # decoded while ACTIVE
-    late_after_abort_tokens: int = 0   # decoded after the abort won -- real GPU work, never usable
-    max_observed_decode: int = 0   # high-water mark for CUMULATIVE outputs
-    duplicate_cumulative: int = 0  # redelivered messages carrying no new tokens
+    admitted: bool = False             # the engine began work: prefill started
+    logical_prefix_tokens: int = 0     # what was SUBMITTED
+    physical_prefill_tokens: int = 0   # what the engine RECOMPUTED after APC reuse
+    prefill_recorded: bool = False     # idempotency guard: engines may report more than once
+    # decode, bucketed by WHEN it happened -- not by whether it turned out to be useful
+    decode_while_active: int = 0
+    decode_after_abort: int = 0
+    decode_while_stale: int = 0        # emitted by an attempt already superseded
+    max_observed_decode: int = 0       # high-water mark for CUMULATIVE outputs
+    duplicate_cumulative: int = 0
     outputs_after_completion: int = 0
-    result: object = None          # quarantined; reaches training only via a CommitPlan
+    result: object = None              # quarantined; reaches training only via a CommitPlan
+
+    @property
+    def total_decode(self) -> int:
+        return self.decode_while_active + self.decode_after_abort + self.decode_while_stale
 
 
 class AttemptRegistry:
@@ -109,9 +126,11 @@ class AttemptRegistry:
         self.stats = {"completed": 0, "aborted_queued": 0, "aborted_running": 0,
                       "restarts": 0, "results_discarded": 0, "redundant_aborts": 0,
                       # physical cost that produced nothing usable -- the quantity A1/A2 compare
-                      "late_after_abort_tokens": 0, "stale_attempt_tokens": 0,
+                      "decode_after_abort_tokens": 0, "decode_while_stale_tokens": 0,
                       "duplicate_cumulative_msgs": 0, "outputs_after_completion": 0,
-                      "prefill_tokens_total": 0}
+                      "duplicate_prefill_reports": 0,
+                      "physical_prefill_tokens_total": 0, "logical_prefix_tokens_total": 0,
+                      "aborted_never_admitted": 0}
 
     def start(self, request_key: str, seed: int) -> AttemptID:
         with self._lock:
@@ -133,6 +152,17 @@ class AttemptRegistry:
             self._cur[request_key] = _Attempt(aid=aid)
             return aid
 
+    def mark_admitted(self, aid: AttemptID, *, logical_prefix_tokens: int = 0) -> None:
+        """The engine began work on this attempt. Until this is called it is QUEUED, and a
+        cancellation costs nothing at all -- not even prefill."""
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"admit for unknown attempt {aid.engine_request_id}")
+            att.admitted = True
+            if logical_prefix_tokens:
+                att.logical_prefix_tokens = logical_prefix_tokens
+
     def _get_current(self, aid: AttemptID):
         cur = self._cur.get(aid.request_key)
         if cur is None or cur.aid != aid:
@@ -149,18 +179,31 @@ class AttemptRegistry:
             return ret, False
         return None, False
 
-    def record_prefill(self, aid: AttemptID, tokens: int) -> None:
-        """Physical recompute reported by the engine, after APC. Counted regardless of state.
+    def record_prefill(self, aid: AttemptID, *, physical_tokens: int,
+                       logical_tokens: int = 0) -> None:
+        """IDEMPOTENT. Engines may report prefill more than once for one request.
 
-        A request cancelled after admission has already paid its prefill; charging it only while
-        ACTIVE would make zero-decode cancellation look free when it was not.
+        Two quantities, reported separately and never conflated: `logical_tokens` is the prefix
+        submitted, `physical_tokens` is what the engine actually recomputed after APC reuse. A nested
+        speculative prefix can be almost entirely cached, so the logical figure would wildly
+        overstate the GPU cost; the physical figure is what was paid.
+
+        Recording prefill implies admission -- an engine does not prefill a request it never took.
         """
         with self._lock:
             att, _ = self._find_any(aid)
             if att is None:
                 raise AttemptError(f"prefill for unknown attempt {aid.engine_request_id}")
-            att.prefill_tokens += tokens
-            self.stats["prefill_tokens_total"] += tokens
+            if att.prefill_recorded:
+                self.stats["duplicate_prefill_reports"] += 1
+                return
+            att.prefill_recorded = True
+            att.admitted = True
+            att.physical_prefill_tokens = physical_tokens
+            if logical_tokens:
+                att.logical_prefix_tokens = logical_tokens
+            self.stats["physical_prefill_tokens_total"] += physical_tokens
+            self.stats["logical_prefix_tokens_total"] += att.logical_prefix_tokens
 
     def observe_decode(self, aid: AttemptID, observed_total_tokens: int) -> int:
         """Account CUMULATIVE decode via a per-attempt high-water mark. Returns tokens newly seen.
@@ -184,13 +227,13 @@ class AttemptRegistry:
                 return 0
             att.max_observed_decode = observed_total_tokens
             if not is_current:
-                att.late_after_abort_tokens += new
-                self.stats["stale_attempt_tokens"] += new
+                att.decode_while_stale += new
+                self.stats["decode_while_stale_tokens"] += new
             elif att.state is AttemptState.ACTIVE:
-                att.decode_tokens += new
+                att.decode_while_active += new      # WHEN it happened; not a usability claim
             elif att.state is AttemptState.ABORTED:
-                att.late_after_abort_tokens += new
-                self.stats["late_after_abort_tokens"] += new
+                att.decode_after_abort += new
+                self.stats["decode_after_abort_tokens"] += new
             else:                                   # COMPLETED
                 att.outputs_after_completion += 1
                 self.stats["outputs_after_completion"] += 1
@@ -223,8 +266,14 @@ class AttemptRegistry:
             self.stats["completed"] += 1
             return True
 
-    def abort(self, aid: AttemptID, *, had_started: bool) -> bool:
-        """ACTIVE -> ABORTED. Idempotent. Returns False if completion already won."""
+    def abort(self, aid: AttemptID) -> bool:
+        """ACTIVE -> ABORTED. Idempotent. Returns False if completion already won.
+
+        Whether this was a queued or a running cancellation is derived from the LEDGER -- whether the
+        engine ever admitted the attempt -- rather than taken on the caller's word. A caller that
+        merely believes a request was still queued is exactly how a prefill gets lost from the
+        accounting.
+        """
         with self._lock:
             cur = self._get_current(aid)
             if cur is None:
@@ -237,20 +286,30 @@ class AttemptRegistry:
                 # winner, and discarding work already paid for would be waste, not safety.
                 return False
             cur.state = AttemptState.ABORTED
-            self.stats["aborted_running" if had_started else "aborted_queued"] += 1
+            if not cur.admitted:
+                self.stats["aborted_never_admitted"] += 1     # genuinely free: no prefill, no decode
+                self.stats["aborted_queued"] += 1
+            elif cur.decode_while_active == 0:
+                self.stats["aborted_queued"] += 1             # admitted and prefilled, never decoded
+            else:
+                self.stats["aborted_running"] += 1
             return True
 
     def state(self, aid: AttemptID):
         cur = self._get_current(aid)
         return cur.state if cur else None
 
-    def cost(self, aid: AttemptID):
-        """(prefill, usable decode, unusable decode). The third is real GPU work that produced
-        nothing committable -- late-after-abort and stale-attempt tokens."""
+    def physical_cost(self, aid: AttemptID):
+        """(physical prefill, decode-while-active, decode-after-terminal). PHYSICAL WORK ONLY.
+
+        Deliberately NOT (prefill, usable, unusable): usability depends on the canonical commit set,
+        which does not exist yet when these tokens arrive. Use `classify()` once it does.
+        """
         att, _ = self._find_any(aid)
         if att is None:
             return (0, 0, 0)
-        return (att.prefill_tokens, att.decode_tokens, att.late_after_abort_tokens)
+        return (att.physical_prefill_tokens, att.decode_while_active,
+                att.decode_after_abort + att.decode_while_stale)
 
     def quarantined_result(self, aid: AttemptID):
         cur = self._get_current(aid)
@@ -313,3 +372,50 @@ class ResourceReservation:
         if not self.K_tok:
             out.append("per-step scheduled-token budget not enforced")
         return out
+
+
+def classify_after_commit(registry: "AttemptRegistry", committed_request_keys) -> dict:
+    """Split the physical ledger into REUSABLE and WASTED -- only now, after the canonical commit.
+
+    This is the one place usability may be decided, and it is decided for every token at once:
+
+      - anchor COMMITTED and its attempt COMPLETED  -> its decode-while-active is REUSABLE
+      - anchor COMMITTED but attempt not completed  -> everything it decoded is WASTED (unfinished)
+      - anchor NOT COMMITTED                        -> EVERYTHING is wasted, including decode that
+                                                       was produced normally, before any abort
+      - decode after abort, or from a superseded attempt -> ALWAYS wasted
+
+    The third case is the one an arrival-time judgement gets wrong. A proposed anchor that decoded
+    cleanly for 200 tokens and then lost the commit produced 200 wasted tokens, not 200 useful ones;
+    calling them usable when they arrived would hide the dominant waste mode of speculation.
+
+    Prefill is reported separately in both forms because they answer different questions: the logical
+    prefix is what was asked for, the physical prefill is what the GPU actually recomputed after APC.
+    """
+    committed = set(committed_request_keys)
+    out = {"reusable_decode": 0, "wasted_decode": 0,
+           "wasted_committed_unfinished": 0, "wasted_lost_anchor": 0,
+           "wasted_post_terminal": 0,
+           "physical_prefill_reusable": 0, "physical_prefill_wasted": 0,
+           "logical_prefix_total": 0, "n_reusable": 0, "n_wasted": 0}
+    with registry._lock:                                    # noqa: SLF001 -- same module
+        attempts = list(registry._cur.values()) + list(registry._retired.values())  # noqa: SLF001
+    for att in attempts:
+        key = att.aid.request_key
+        post_terminal = att.decode_after_abort + att.decode_while_stale
+        out["wasted_post_terminal"] += post_terminal
+        out["logical_prefix_total"] += att.logical_prefix_tokens
+        if key in committed and att.state is AttemptState.COMPLETED:
+            out["reusable_decode"] += att.decode_while_active
+            out["physical_prefill_reusable"] += att.physical_prefill_tokens
+            out["n_reusable"] += 1
+        else:
+            bucket = ("wasted_committed_unfinished" if key in committed
+                      else "wasted_lost_anchor")
+            out[bucket] += att.decode_while_active
+            out["physical_prefill_wasted"] += att.physical_prefill_tokens
+            out["n_wasted"] += 1
+        if key not in committed or att.state is not AttemptState.COMPLETED:
+            out["wasted_decode"] += att.decode_while_active
+    out["wasted_decode"] += out["wasted_post_terminal"]
+    return out
