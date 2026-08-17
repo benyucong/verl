@@ -103,16 +103,35 @@ class _Attempt:
     duplicate_cumulative: int = 0
     outputs_after_completion: int = 0
     result: object = None              # quarantined; reaches training only via a CommitPlan
-    # ABORT IS NOT INSTANTANEOUS. A GPU step may already be in flight when the abort is requested, so
-    # "cancelled" cannot promise "no further engine work" at that instant. The gap between these is a
-    # measured quantity, not an assumption.
-    abort_requested_seq: int = -1      # monotonic tick when cancellation was requested
-    abort_acknowledged_seq: int = -1   # when the engine confirmed it
-    last_physical_work_seq: int = -1   # the last tick at which this attempt actually consumed GPU
+    # PHYSICAL vs DELIVERED. Output messages are NOT a complete work meter: after an abort vLLM may
+    # compute tokens in an already-running GPU step and discard them without ever emitting them. The
+    # high-water mark measures what was DELIVERED; engine counters measure what was COMPUTED; the
+    # difference is real wasted work that must not vanish from the accounting.
+    physical_decode_tokens: int = 0    # from ENGINE counters -- what the GPU actually produced
+    # ABORT IS NOT INSTANTANEOUS, and abort_request() RETURNING is not acknowledgement. The RPC
+    # returning says the request was delivered; only an engine-side terminal event (FINISHED_ABORTED)
+    # says the engine is done with it.
+    enqueued_seq: int = -1
+    first_scheduled_seq: int = -1      # the engine actually began work
+    abort_requested_seq: int = -1
+    abort_rpc_returned_seq: int = -1   # the RPC came back -- NOT acknowledgement
+    engine_terminal_status: str = ""   # e.g. FINISHED_ABORTED, FINISHED_STOPPED
+    engine_terminal_seq: int = -1      # the real acknowledgement
+    last_physical_work_seq: int = -1
 
     @property
-    def total_decode(self) -> int:
+    def delivered_decode(self) -> int:
+        """Tokens that actually reached us as output."""
         return self.decode_while_active + self.decode_after_abort + self.decode_while_stale
+
+    @property
+    def dropped_undelivered(self) -> int:
+        """Computed by the GPU but never delivered -- discarded mid-step by an abort.
+
+        Invisible to output-based accounting, and real. Clamped at zero: engine counters can lag
+        delivery, and a negative would be a reporting artifact rather than negative work.
+        """
+        return max(0, self.physical_decode_tokens - self.delivered_decode)
 
 
 class AttemptRegistry:
@@ -325,21 +344,73 @@ class AttemptRegistry:
                 self.stats["aborted_running"] += 1
             return True
 
-    def acknowledge_abort(self, aid: AttemptID) -> None:
-        """The engine confirmed the cancellation. Work may still have landed between request and this."""
+    def mark_enqueued(self, aid: AttemptID) -> None:
         with self._lock:
             att, _ = self._find_any(aid)
             if att is None:
-                raise AttemptError(f"abort ack for unknown attempt {aid.engine_request_id}")
+                raise AttemptError(f"enqueue for unknown attempt {aid.engine_request_id}")
             self._seq += 1
-            att.abort_acknowledged_seq = self._seq
+            att.enqueued_seq = self._seq
+
+    def mark_first_scheduled(self, aid: AttemptID) -> None:
+        """The engine actually began work. A queued abort is one that never reaches this."""
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"schedule for unknown attempt {aid.engine_request_id}")
+            self._seq += 1
+            att.first_scheduled_seq = self._seq
+            att.admitted = True
+
+    def mark_abort_rpc_returned(self, aid: AttemptID) -> None:
+        """The abort RPC returned. THIS IS NOT ACKNOWLEDGEMENT -- it says the request was delivered,
+        not that the engine has finished with it. Only an engine terminal event says that."""
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"abort rpc for unknown attempt {aid.engine_request_id}")
+            self._seq += 1
+            att.abort_rpc_returned_seq = self._seq
+
+    def record_engine_terminal(self, aid: AttemptID, status: str) -> None:
+        """The engine's own terminal event, e.g. FINISHED_ABORTED. The REAL acknowledgement."""
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"terminal for unknown attempt {aid.engine_request_id}")
+            self._seq += 1
+            att.engine_terminal_status = status
+            att.engine_terminal_seq = self._seq
+
+    def record_physical_decode(self, aid: AttemptID, engine_counter_tokens: int) -> None:
+        """Physically computed decode from ENGINE counters, not from delivered output.
+
+        Set rather than accumulated: engine counters are cumulative per request, so adding would
+        double-count every poll.
+        """
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"physical decode for unknown attempt {aid.engine_request_id}")
+            att.physical_decode_tokens = max(att.physical_decode_tokens, engine_counter_tokens)
+            self._seq += 1
+            att.last_physical_work_seq = self._seq
 
     def abort_timeline(self, aid: AttemptID):
-        """(requested, acknowledged, last_physical_work) ticks. Work after `requested` is real."""
+        """(enqueued, first_scheduled, abort_requested, abort_rpc_returned, engine_terminal,
+        last_physical_work). abort_rpc_returned is NOT the acknowledgement; engine_terminal is."""
         att, _ = self._find_any(aid)
         if att is None:
-            return (-1, -1, -1)
-        return (att.abort_requested_seq, att.abort_acknowledged_seq, att.last_physical_work_seq)
+            return (-1,) * 6
+        return (att.enqueued_seq, att.first_scheduled_seq, att.abort_requested_seq,
+                att.abort_rpc_returned_seq, att.engine_terminal_seq, att.last_physical_work_seq)
+
+    def delivery_gap(self, aid: AttemptID):
+        """(physical, delivered, dropped_undelivered) decode tokens."""
+        att, _ = self._find_any(aid)
+        if att is None:
+            return (0, 0, 0)
+        return (att.physical_decode_tokens, att.delivered_decode, att.dropped_undelivered)
 
     def accepted_attempt(self, request_key: str):
         return self._accepted.get(request_key)
@@ -450,7 +521,7 @@ def classify_after_commit(registry: "AttemptRegistry", committed_request_keys,
     out = {"reusable_decode": 0, "wasted_decode": 0,
            "wasted_committed_unfinished": 0, "wasted_lost_anchor": 0,
            "wasted_superseded_attempt": 0, "wasted_audit_failed": 0,
-           "wasted_post_terminal": 0,
+           "wasted_post_terminal": 0, "wasted_dropped_undelivered": 0,
            "physical_prefill_reusable": 0, "physical_prefill_wasted": 0,
            "logical_prefix_total": 0, "n_reusable": 0, "n_wasted": 0}
     with registry._lock:                                    # noqa: SLF001 -- same module
@@ -460,6 +531,9 @@ def classify_after_commit(registry: "AttemptRegistry", committed_request_keys,
         key = att.aid.request_key
         post_terminal = att.decode_after_abort + att.decode_while_stale
         out["wasted_post_terminal"] += post_terminal
+        # Computed by the GPU, never delivered: invisible to output-based accounting and always
+        # wasted, since nothing that was never delivered can supply supervision.
+        out["wasted_dropped_undelivered"] += att.dropped_undelivered
         out["logical_prefix_total"] += att.logical_prefix_tokens
 
         is_accepted = accepted.get(key) == att.aid.engine_request_id
@@ -489,5 +563,5 @@ def classify_after_commit(registry: "AttemptRegistry", committed_request_keys,
             out["wasted_decode"] += att.decode_while_active
             out["physical_prefill_wasted"] += att.physical_prefill_tokens
             out["n_wasted"] += 1
-    out["wasted_decode"] += out["wasted_post_terminal"]
+    out["wasted_decode"] += out["wasted_post_terminal"] + out["wasted_dropped_undelivered"]
     return out
