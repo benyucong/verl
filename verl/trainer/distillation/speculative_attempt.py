@@ -103,6 +103,12 @@ class _Attempt:
     duplicate_cumulative: int = 0
     outputs_after_completion: int = 0
     result: object = None              # quarantined; reaches training only via a CommitPlan
+    # ABORT IS NOT INSTANTANEOUS. A GPU step may already be in flight when the abort is requested, so
+    # "cancelled" cannot promise "no further engine work" at that instant. The gap between these is a
+    # measured quantity, not an assumption.
+    abort_requested_seq: int = -1      # monotonic tick when cancellation was requested
+    abort_acknowledged_seq: int = -1   # when the engine confirmed it
+    last_physical_work_seq: int = -1   # the last tick at which this attempt actually consumed GPU
 
     @property
     def total_decode(self) -> int:
@@ -122,13 +128,18 @@ class AttemptRegistry:
     def __init__(self):
         self._cur: dict = {}                  # request_key -> current _Attempt
         self._retired: dict = {}              # engine_request_id -> superseded _Attempt
+        # THE SINGLE ACCEPTED RESULT per logical request. Two attempts can both complete -- attempt 0
+        # finishing as revocation lands, attempt 1 finishing after re-entry -- and only one of them
+        # may ever supply supervision.
+        self._accepted: dict = {}             # request_key -> engine_request_id of the accepted one
+        self._seq = 0                         # monotonic tick for the abort timeline
         self._lock = threading.Lock()
         self.stats = {"completed": 0, "aborted_queued": 0, "aborted_running": 0,
                       "restarts": 0, "results_discarded": 0, "redundant_aborts": 0,
                       # physical cost that produced nothing usable -- the quantity A1/A2 compare
                       "decode_after_abort_tokens": 0, "decode_while_stale_tokens": 0,
                       "duplicate_cumulative_msgs": 0, "outputs_after_completion": 0,
-                      "duplicate_prefill_reports": 0,
+                      "duplicate_prefill_reports": 0, "duplicate_completions_rejected": 0,
                       "physical_prefill_tokens_total": 0, "logical_prefix_tokens_total": 0,
                       "aborted_never_admitted": 0}
 
@@ -199,6 +210,8 @@ class AttemptRegistry:
                 return
             att.prefill_recorded = True
             att.admitted = True
+            self._seq += 1
+            att.last_physical_work_seq = self._seq
             att.physical_prefill_tokens = physical_tokens
             if logical_tokens:
                 att.logical_prefix_tokens = logical_tokens
@@ -226,6 +239,8 @@ class AttemptRegistry:
                 self.stats["duplicate_cumulative_msgs"] += 1
                 return 0
             att.max_observed_decode = observed_total_tokens
+            self._seq += 1
+            att.last_physical_work_seq = self._seq
             if not is_current:
                 att.decode_while_stale += new
                 self.stats["decode_while_stale_tokens"] += new
@@ -261,8 +276,18 @@ class AttemptRegistry:
                 return False
             if cur.state is AttemptState.COMPLETED:
                 raise AttemptError(f"{aid.engine_request_id}: completed twice")
+            # SINGLE ACCEPTED RESULT. If another attempt for this logical request already supplied
+            # one, this completion is real physical work but must never supervise: two attempts
+            # finishing in a race would otherwise both be counted reusable and the same chunk would
+            # be trained on twice.
+            if self._accepted.get(aid.request_key) not in (None, aid.engine_request_id):
+                cur.state = AttemptState.COMPLETED
+                self.stats["duplicate_completions_rejected"] += 1
+                self.stats["results_discarded"] += 1
+                return False
             cur.state = AttemptState.COMPLETED
             cur.result = result                # quarantined
+            self._accepted[aid.request_key] = aid.engine_request_id
             self.stats["completed"] += 1
             return True
 
@@ -285,15 +310,39 @@ class AttemptRegistry:
                 # Completion won. The finished result stays in quarantine -- it may still be a
                 # winner, and discarding work already paid for would be waste, not safety.
                 return False
+            self._seq += 1
+            cur.abort_requested_seq = self._seq
             cur.state = AttemptState.ABORTED
             if not cur.admitted:
-                self.stats["aborted_never_admitted"] += 1     # genuinely free: no prefill, no decode
+                # ZERO TEACHER-MODEL WORK -- not "free". No prefill and no decode reached the model,
+                # but the request still cost queue occupancy, an RPC round trip and control-plane
+                # bookkeeping. Those are small, and they are not nothing.
+                self.stats["aborted_never_admitted"] += 1
                 self.stats["aborted_queued"] += 1
             elif cur.decode_while_active == 0:
                 self.stats["aborted_queued"] += 1             # admitted and prefilled, never decoded
             else:
                 self.stats["aborted_running"] += 1
             return True
+
+    def acknowledge_abort(self, aid: AttemptID) -> None:
+        """The engine confirmed the cancellation. Work may still have landed between request and this."""
+        with self._lock:
+            att, _ = self._find_any(aid)
+            if att is None:
+                raise AttemptError(f"abort ack for unknown attempt {aid.engine_request_id}")
+            self._seq += 1
+            att.abort_acknowledged_seq = self._seq
+
+    def abort_timeline(self, aid: AttemptID):
+        """(requested, acknowledged, last_physical_work) ticks. Work after `requested` is real."""
+        att, _ = self._find_any(aid)
+        if att is None:
+            return (-1, -1, -1)
+        return (att.abort_requested_seq, att.abort_acknowledged_seq, att.last_physical_work_seq)
+
+    def accepted_attempt(self, request_key: str):
+        return self._accepted.get(request_key)
 
     def state(self, aid: AttemptID):
         cur = self._get_current(aid)
@@ -374,48 +423,71 @@ class ResourceReservation:
         return out
 
 
-def classify_after_commit(registry: "AttemptRegistry", committed_request_keys) -> dict:
-    """Split the physical ledger into REUSABLE and WASTED -- only now, after the canonical commit.
+def classify_after_commit(registry: "AttemptRegistry", committed_request_keys,
+                          audit_ok=None) -> dict:
+    """Split the physical ledger into REUSABLE and WASTED. PURE and REPEATABLE.
 
-    This is the one place usability may be decided, and it is decided for every token at once:
+    Reads the ledger and mutates nothing. Running it twice, or again with a revised commit set,
+    returns a consistent view of the same immutable costs -- the ledger records physical work, this
+    only interprets it.
 
-      - anchor COMMITTED and its attempt COMPLETED  -> its decode-while-active is REUSABLE
-      - anchor COMMITTED but attempt not completed  -> everything it decoded is WASTED (unfinished)
-      - anchor NOT COMMITTED                        -> EVERYTHING is wasted, including decode that
-                                                       was produced normally, before any abort
-      - decode after abort, or from a superseded attempt -> ALWAYS wasted
+    USABILITY REQUIRES ALL FOUR:
+      1. the anchor survives the canonical commit;
+      2. the attempt COMPLETED;
+      3. its output passes the AuditKey checks (`audit_ok`, default: all pass);
+      4. it is THE SINGLE ACCEPTED attempt for that logical request.
 
-    The third case is the one an arrival-time judgement gets wrong. A proposed anchor that decoded
-    cleanly for 200 tokens and then lost the commit produced 200 wasted tokens, not 200 useful ones;
-    calling them usable when they arrived would hide the dominant waste mode of speculation.
+    Condition 4 is what makes retries honest. If attempt 0 decodes 200 tokens and is aborted, and
+    attempt 1 completes after re-entry, only attempt 1 is usable -- and attempt 0's ENTIRE prefill and
+    decode is wasted, not merely its post-abort tail. Its clean pre-abort decode bought nothing,
+    because the continuation that will actually be used came from a different attempt.
 
-    Prefill is reported separately in both forms because they answer different questions: the logical
-    prefix is what was asked for, the physical prefill is what the GPU actually recomputed after APC.
+    Post-terminal tokens -- after an abort, or from a superseded attempt -- are always wasted,
+    whatever the commit decides.
     """
     committed = set(committed_request_keys)
+    ok = (lambda key: True) if audit_ok is None else audit_ok
     out = {"reusable_decode": 0, "wasted_decode": 0,
            "wasted_committed_unfinished": 0, "wasted_lost_anchor": 0,
+           "wasted_superseded_attempt": 0, "wasted_audit_failed": 0,
            "wasted_post_terminal": 0,
            "physical_prefill_reusable": 0, "physical_prefill_wasted": 0,
            "logical_prefix_total": 0, "n_reusable": 0, "n_wasted": 0}
     with registry._lock:                                    # noqa: SLF001 -- same module
         attempts = list(registry._cur.values()) + list(registry._retired.values())  # noqa: SLF001
+        accepted = dict(registry._accepted)                 # noqa: SLF001
     for att in attempts:
         key = att.aid.request_key
         post_terminal = att.decode_after_abort + att.decode_while_stale
         out["wasted_post_terminal"] += post_terminal
         out["logical_prefix_total"] += att.logical_prefix_tokens
-        if key in committed and att.state is AttemptState.COMPLETED:
+
+        is_accepted = accepted.get(key) == att.aid.engine_request_id
+        usable = (key in committed
+                  and att.state is AttemptState.COMPLETED
+                  and is_accepted
+                  and ok(key))
+        if usable:
             out["reusable_decode"] += att.decode_while_active
             out["physical_prefill_reusable"] += att.physical_prefill_tokens
             out["n_reusable"] += 1
         else:
-            bucket = ("wasted_committed_unfinished" if key in committed
-                      else "wasted_lost_anchor")
+            # Order matters. "Another attempt won" is checked BEFORE "this one did not complete":
+            # for a retry, both are true, and the informative fact is that a sibling supplied the
+            # continuation -- so this attempt's whole cost bought nothing, however far it got.
+            someone_else_accepted = (accepted.get(key) is not None
+                                     and accepted.get(key) != att.aid.engine_request_id)
+            if key not in committed:
+                bucket = "wasted_lost_anchor"
+            elif someone_else_accepted:
+                bucket = "wasted_superseded_attempt"
+            elif att.state is not AttemptState.COMPLETED:
+                bucket = "wasted_committed_unfinished"
+            else:
+                bucket = "wasted_audit_failed"
             out[bucket] += att.decode_while_active
+            out["wasted_decode"] += att.decode_while_active
             out["physical_prefill_wasted"] += att.physical_prefill_tokens
             out["n_wasted"] += 1
-        if key not in committed or att.state is not AttemptState.COMPLETED:
-            out["wasted_decode"] += att.decode_while_active
     out["wasted_decode"] += out["wasted_post_terminal"]
     return out
