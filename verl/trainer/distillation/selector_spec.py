@@ -120,7 +120,7 @@ RANKING_STATES = ("finalized", "provisional")
 SCORE_RULE_FIELDS = ("signal_semantics", "distribution", "aggregation", "anchor_offset", "tie_break")
 # THE SELECTOR. Adds candidate construction and the budget, which together fix WHICH chunks come out.
 SELECTOR_FIELDS = SCORE_RULE_FIELDS + ("candidate_policy", "candidate_stride", "constraint",
-                                       "chunk_tokens", "M")
+                                       "chunk_tokens", "M", "selector_variant")
 
 
 class SelectorMismatch(RuntimeError):
@@ -304,6 +304,18 @@ class SelectorSpec:
     M: int = 10                                 # chunks audited per response
     N: int = 10                                 # teacher continuations per chunk (workload-level)
     ranking_state: str = "finalized"            # provisional => may be revised as tokens stream in
+    # A DECLARED DIVERGENCE from the rule the other fields describe. Empty means "this spec is the
+    # rule it says it is", so every pre-existing hash is unchanged.
+    #
+    # It exists because the four-level design assumed a provider either implements the rule or is
+    # shown not to, and in the second case is abandoned. Gate 6 produced a third outcome: the online
+    # provider is NOT equivalent (9 of 16 responses selected the same set; anchors 150 and 151 are
+    # different chunks, never a partial match) and is used ANYWAY, deliberately, as its own arm.
+    #
+    # Sharing a selector_hash after equivalence has been REFUTED would make artifacts from the two
+    # indistinguishable by hash -- the exact confusion selector_hash exists to prevent. So a declared
+    # variant enters the SELECTOR hash and gets its own identity.
+    selector_variant: str = ""
     # Provenance. Optional so a spec can name the MATHEMATICS alone; required before any run.
     provider: "ProviderFingerprint | None" = None
     notes: str = ""                             # free text; never part of any hash
@@ -340,12 +352,21 @@ class SelectorSpec:
         return self._h({k: getattr(self, k) for k in SCORE_RULE_FIELDS})
 
     def selector_hash(self) -> str:
-        """Score rule + candidate construction + C + constraint + M.
+        """Score rule + candidate construction + C + constraint + M (+ a declared variant).
+
+        `selector_variant` is OMITTED from the digest when empty. Adding a key to the hashed dict
+        changes the digest even when its value is empty, which would silently move every historical
+        selector_hash -- 33c83e0e38e2deb3 for the published rule -- and break equality against every
+        artifact already on disk. Omitting it keeps those byte-identical while still giving a
+        declared variant its own identity.
 
         **The generation-vs-analysis check.** M and C are the audit budget: a set selected under one
         budget is not a set selected under another, so reading M=8 data as M=10 must fail here.
         """
-        return self._h({k: getattr(self, k) for k in SELECTOR_FIELDS})
+        d = {k: getattr(self, k) for k in SELECTOR_FIELDS}
+        if not d.get("selector_variant"):
+            d.pop("selector_variant", None)
+        return self._h(d)
 
     def provider_fingerprint(self) -> str:
         return self.provider.fingerprint() if self.provider else ""
@@ -477,6 +498,25 @@ def assert_spec_matches(analysis: SelectorSpec, manifest_spec: SelectorSpec, *,
         + f"\n{hint}  analysis: {analysis.describe()}\n  manifest: {manifest_spec.describe()}\n"
         f"  If this IS the experiment, pass allow_cross_policy=True explicitly and say so in the "
         f"write-up.")
+
+
+def assert_not_published_omniopd(spec: "SelectorSpec", *, context: str = "") -> None:
+    """Refuse to let a variant be reported under the published selector's identity.
+
+    Cheap to call and worth calling: the two specs differ in one field, share every number a reader
+    would recognise, and produce artifacts that look identical apart from a hash nobody checks by eye.
+    """
+    if spec.selector_variant and spec.selector_hash() == OMNIOPD_PUBLISHED.selector_hash():
+        raise SelectorMismatch(
+            f"{context}: selector_variant={spec.selector_variant!r} but selector_hash matches "
+            f"OMNIOPD_PUBLISHED. A declared variant must not share the published identity.")
+    if (not spec.selector_variant and spec.provider
+            and spec.provider.signal_provider != "post_eos_actor_forward"
+            and spec.selector_hash() == OMNIOPD_PUBLISHED.selector_hash()):
+        raise SelectorMismatch(
+            f"{context}: provider {spec.provider.signal_provider!r} is not the canonical post-EOS "
+            f"forward, yet this spec claims the published selector_hash. Gate 6 refuted that "
+            f"equivalence (9/16). Set selector_variant to declare it.")
 
 
 def assert_same_score_rule(a: SelectorSpec, b: SelectorSpec, *, context: str = "") -> None:
@@ -718,7 +758,20 @@ OMNIOPD_ONLINE_EXACT = SelectorSpec(
     notes="THE SAME LOGICAL SELECTOR, computed during decode -- a CANDIDATE IMPLEMENTATION until an "
           "equivalence certificate exists. Full-support (bf16 logits, fp32 reduction), which is not "
           "the same as bit-identical to the fp32 post-EOS forward, so equivalence must be measured "
-          "on final selections rather than inferred from the fidelity label.")
+          "on final selections rather than inferred from the fidelity label. SUPERSEDED as a "
+          "candidate: Gate 6 REFUTED equivalence at 9/16. Retained so the refuted claim stays "
+          "citable; use OMNIOPD_ONLINE_VARIANT to actually run it.")
+
+# The arm that is actually run when online entropy drives selection. Same mathematics, different
+# provider, and MEASURED to select differently -- so it is a variant with its own selector_hash
+# rather than a candidate implementation of the published rule.
+OMNIOPD_ONLINE_VARIANT = SelectorSpec(
+    **_OMNIOPD_RULE, provider=ROLLOUT_EXACT_VLLM_0151, selector_variant="online_entropy",
+    notes="DECLARED VARIANT, not OmniOPD. Chunk selection uses entropy emitted by the rollout engine "
+          "during decode instead of the canonical post-EOS actor forward. Gate 6: the two agree on "
+          "the exact chunk set in 9 of 16 responses, so this trains on DIFFERENT spans. Report it as "
+          "'OmniOPD with online-entropy selection'; never as OmniOPD. Its selector_hash differs from "
+          "OMNIOPD_PUBLISHED by construction, so no artifact of one can be read as the other.")
 
 OMNIOPD_ONLINE_TOPK = SelectorSpec(
     **_OMNIOPD_RULE,
