@@ -623,23 +623,102 @@ def compute_distillation_loss_omniopd(
     model_output,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """OmniOPD objective. REGISTERED BUT NOT YET IMPLEMENTED (milestone 3 step 5).
+    """OmniOPD objective as a (bsz, resp_len) per-token loss matrix.
 
-    Registered now so the configuration path is complete and validated end to end -- selecting
-    loss_mode=omniopd must dimension the teacher for GENERATION rather than scoring, and that
-    happens in DistillationTeacherModelConfig.validate_and_prepare_for_distillation via these
-    settings. Without a registration there is no settings object to consult.
+        audited t in chunk c : -pi_hat^(c) * log pi_theta(y_t)
+        unaudited t          : beta * KL(pi_ref || pi_theta)[t]
 
-    It raises rather than returning a plausible tensor: a placeholder that silently returned, say, a
-    k1 loss would produce a complete, healthy-looking training run of the wrong algorithm, which is
-    the failure mode this project has already paid for twice (a streaming path that was silently
-    GKD-only, and a `forward_kl_topk` run with topk=1 that was GKD in name only).
+        pi_bar^(c) = exp( mean_{t in c} log pi_theta(y_t) )            geometric mean, log-space
+        pi_hat^(c) = (k_sem^(c) + alpha * pi_bar^(c)) / (N + alpha)    DETACHED (FID-5)
+
+    WHERE THE TWO INPUTS COME FROM, and why they are split this way:
+
+      log pi_theta(y_t)  model_output["log_probs"], which verl already computes for every loss.
+      KL per token       model_output["omniopd_kl"], computed in the LOGITS PROCESSOR, because the
+                         anchor is an exact full-vocabulary KL (FID-2) and the full student
+                         distribution exists only there. This mirrors forward_kl_topk, which also
+                         does its real work in the processor and reads the result back here.
+
+    The processor -- not this function -- owns the reference model. A sampled-token log-ratio would
+    be cheaper and is NOT acceptable: unaudited positions are the majority of every trajectory, so a
+    sampled surrogate changes the gradient on most of the tokens being trained.
+
+    FID-5 and FID-9 are enforced here rather than assumed, because both failures are silent: a target
+    carrying gradient adds a term the method does not have, and a target outside [0, 1] means the
+    update is pushing log-likelihood DOWN on chunks the teacher agreed with.
     """
-    raise NotImplementedError(
-        "loss_mode=omniopd: the objective is not wired into the trainer yet (milestone 3 step 5). "
-        "The validated reference implementation is scripts/omniopd_step.py; the config and teacher "
-        "generation paths (steps 1-2) are in place. Refusing to fall back to another objective."
-    )
+    log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    if "omniopd_kl" not in model_output:
+        raise ValueError(
+            "loss_mode=omniopd needs model_output['omniopd_kl'], the exact full-vocabulary "
+            "KL(pi_ref || pi_theta) per response token, produced by the logits processor. Its "
+            "absence means the engine is not running the omniopd path -- refusing to fall back to a "
+            "sampled-token surrogate, which would train a different objective and look healthy."
+        )
+    kl = no_padding_2_padding(model_output["omniopd_kl"], data)
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    response_mask = response_mask.bool()
+    assert log_probs.shape == kl.shape == response_mask.shape, (
+        f"log_probs {log_probs.shape}, omniopd_kl {kl.shape}, mask {response_mask.shape}")
+
+    om = distillation_config.omniopd
+    N, C, alpha, beta = om.N, om.C, om.alpha, om.beta
+    anchors_all = data.non_tensor_batch["omniopd_anchors"]
+    k_sem_all = data.non_tensor_batch["omniopd_k_sem"]
+
+    losses = torch.zeros_like(log_probs, dtype=torch.float32)
+    audited = torch.zeros_like(response_mask)
+    chunk_logp, k_sem_flat, rows_flat, pos_flat = [], [], [], []
+    for b, (anchors, k_sem) in enumerate(zip(anchors_all, k_sem_all, strict=True)):
+        if len(anchors) != len(k_sem):
+            raise ValueError(f"row {b}: {len(anchors)} anchors but {len(k_sem)} k_sem values")
+        T = int(response_mask[b].sum())
+        for ci, t0 in enumerate(anchors):
+            if t0 + C > T:
+                raise ValueError(f"row {b} chunk {ci}: anchor {t0} + C {C} runs past response {T}")
+            idx = torch.arange(t0, t0 + C, device=log_probs.device)
+            if bool(audited[b, idx].any()):
+                raise ValueError(f"row {b} chunk {ci}: overlaps an earlier chunk")
+            audited[b, idx] = True
+            chunk_logp.append(log_probs[b, idx])
+            k_sem_flat.append(float(k_sem[ci]))
+            rows_flat.append(b)
+            pos_flat.append(idx)
+
+    if not chunk_logp:
+        raise ValueError("no audited chunks in this batch; the objective has nothing to reinforce")
+
+    lp = torch.stack(chunk_logp)                                   # (n_chunks, C)
+    pi_bar = torch.exp(lp.mean(dim=-1))
+    k_sem_t = torch.tensor(k_sem_flat, device=lp.device, dtype=torch.float32)
+    target = ((k_sem_t + alpha * pi_bar) / (N + alpha)).detach()    # FID-5
+    if target.requires_grad:
+        raise ValueError("OmniOPD target carries gradient; it must be detached (FID-5)")
+    tmin, tmax = float(target.min()), float(target.max())
+    if not (0.0 <= tmin and tmax <= 1.0):
+        raise ValueError(
+            f"OmniOPD target outside [0,1]: [{tmin}, {tmax}]. pi_hat is a probability; outside that "
+            f"range the objective is no longer purely reinforcing (FID-9), which means k_sem or N is "
+            f"wrong upstream rather than that the loss is merely large.")
+
+    per_tok = -(target[:, None] * lp)                               # (n_chunks, C)
+    for i, (b, idx) in enumerate(zip(rows_flat, pos_flat, strict=True)):
+        losses[b, idx] = per_tok[i]
+    unaudited = response_mask & ~audited
+    losses = torch.where(unaudited, beta * kl, losses)
+
+    metrics = {
+        "omniopd/L_chunk": Metric(AggregationType.MEAN, per_tok.sum()),
+        "omniopd/L_kl": Metric(AggregationType.MEAN, (beta * kl)[unaudited].sum()),
+        "omniopd/n_chunks": Metric(AggregationType.MEAN, torch.tensor(float(len(k_sem_flat)))),
+        "omniopd/n_unaudited": Metric(AggregationType.MEAN, unaudited.sum().float()),
+        "omniopd/target_mean": Metric(AggregationType.MEAN, target.mean()),
+        "omniopd/k_sem_mean": Metric(AggregationType.MEAN, k_sem_t.mean()),
+        "omniopd/pi_bar_mean": Metric(AggregationType.MEAN, pi_bar.mean().detach()),
+    }
+    return losses, metrics
 
 
 @register_distillation_loss(
