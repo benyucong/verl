@@ -45,9 +45,11 @@ logger = logging.getLogger(__name__)
 
 try:  # as a package member
     from .omniopd_producer import assemble_omniopd_record, build_chunk_requests, select_anchors
+    from .selector_spec import OMNIOPD_ONLINE_VARIANT
     from .token_entropy import to_signal_series
 except ImportError:  # or with the distillation dir on sys.path, which is how the tests import it
     from omniopd_producer import assemble_omniopd_record, build_chunk_requests, select_anchors
+    from selector_spec import OMNIOPD_ONLINE_VARIANT
     from token_entropy import to_signal_series
 
 
@@ -167,6 +169,13 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
     output.extra_fields["omniopd_anchors"] = rec["omniopd_anchors"]
     output.extra_fields["omniopd_k_sem"] = rec["omniopd_k_sem"]
     output.extra_fields["omniopd_telemetry"] = rec.get("omniopd_telemetry")
+    # STAMP THE SELECTOR THAT ACTUALLY RAN. Anchors here come from entropy emitted by the rollout
+    # engine during decode, not from the canonical post-EOS actor forward. Gate 6 measured the two
+    # picking the same chunk set in only 9 of 16 responses, so this trains on DIFFERENT spans -- it
+    # is a declared variant with its own selector_hash, and an artifact that did not say so could be
+    # read as published OmniOPD. Recorded per trajectory so the label travels with the data.
+    output.extra_fields["selector_hash"] = OMNIOPD_ONLINE_VARIANT.selector_hash()
+    output.extra_fields["selector_variant"] = OMNIOPD_ONLINE_VARIANT.selector_variant
     # The entropy series has done its job and is large (one float per response token). Dropping it
     # keeps it out of the object array _postprocess builds for every extra_fields key.
     if os.environ.get("OPD_KEEP_TOKEN_ENTROPIES", "0") in ("0", "", "false", "False"):
