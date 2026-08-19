@@ -180,3 +180,75 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
     # keeps it out of the object array _postprocess builds for every extra_fields key.
     if os.environ.get("OPD_KEEP_TOKEN_ENTROPIES", "0") in ("0", "", "false", "False"):
         output.extra_fields.pop("token_entropies", None)
+
+
+def aggregate_omniopd_telemetry(records: list) -> dict:
+    """Per-trajectory audit records into omniopd/* metrics. Pure stdlib, no torch.
+
+    `records` are the dicts attach_omniopd_audit wrote, one per trajectory, each optionally carrying
+    omniopd_k_sem, omniopd_anchors and omniopd_telemetry.
+
+    THE POINT OF THIS IS TO MAKE TWO SILENT FAILURES LOUD.
+
+    k_sem DEGENERACY. k_sem is a sum of phi over N teacher continuations. If the teacher decodes
+    greedily, all N continuations are IDENTICAL, so every chunk scores either ~N (teacher reproduced
+    the student) or ~0 (it did not), with nothing in between -- and the objective still trains, on a
+    target that has collapsed to a near-binary signal carrying a fraction of the intended
+    information. Nothing raises. `k_sem_interior_frac` is the fraction of chunks strictly inside
+    (0.05N, 0.95N); a value near zero means the teacher is not sampling, whatever the config says.
+
+    PREFIX REUSE. The M chunk requests per trajectory are issued sequentially precisely so each
+    prefill reuses the previous one's KV. If sticky routing breaks, they scatter across replicas and
+    every chunk re-ingests a prefix that grows with the response. The only symptom is that the run is
+    slow, so the hit fraction is reported rather than assumed.
+    """
+    out: dict = {}
+    if not records:
+        return out
+
+    def _pct(xs, p):
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        return float(s[min(len(s) - 1, int(p * len(s)))])
+
+    audited = [r for r in records if r.get("omniopd_anchors")]
+    skipped = [r for r in records if not r.get("omniopd_anchors")]
+    out["omniopd/trajectories"] = len(records)
+    out["omniopd/trajectories_audited"] = len(audited)
+    out["omniopd/trajectories_skipped"] = len(skipped)
+    for why in ("short_response", "no_anchor"):
+        out[f"omniopd/skipped_{why}"] = sum(
+            1 for r in skipped if (r.get("omniopd_telemetry") or {}).get("skipped") == why
+        )
+
+    n_chunks = [len(r["omniopd_anchors"]) for r in audited]
+    out["omniopd/chunks_total"] = sum(n_chunks)
+    out["omniopd/chunks_per_trajectory"] = (sum(n_chunks) / len(n_chunks)) if n_chunks else 0.0
+
+    ks = [float(k) for r in audited for k in (r.get("omniopd_k_sem") or [])]
+    if ks:
+        N = max(1.0, max(ks))                      # k_sem is bounded above by N
+        out["omniopd/k_sem_mean"] = sum(ks) / len(ks)
+        out["omniopd/k_sem_p05"] = _pct(ks, 0.05)
+        out["omniopd/k_sem_p50"] = _pct(ks, 0.50)
+        out["omniopd/k_sem_p95"] = _pct(ks, 0.95)
+        out["omniopd/k_sem_interior_frac"] = sum(1 for k in ks if 0.05 * N < k < 0.95 * N) / len(ks)
+        out["omniopd/k_sem_zero_frac"] = sum(1 for k in ks if k <= 0.05 * N) / len(ks)
+
+    tels = [r.get("omniopd_telemetry") or {} for r in audited]
+    pref = sum(t.get("teacher_prefix_tokens") or 0 for t in tels)
+    cach = sum(t.get("teacher_cached_tokens") or 0 for t in tels)
+    out["omniopd/teacher_prefix_tokens"] = pref
+    out["omniopd/teacher_cached_tokens"] = cach
+    out["omniopd/prefix_cache_frac"] = (cach / pref) if pref else 0.0
+    out["omniopd/teacher_gen_tokens"] = sum(t.get("teacher_gen_tokens") or 0 for t in tels)
+    out["omniopd/teacher_gen_seconds"] = sum(t.get("teacher_gen_seconds") or 0.0 for t in tels)
+
+    variants = {r.get("selector_variant") for r in records if r.get("selector_variant")}
+    hashes = {r.get("selector_hash") for r in records if r.get("selector_hash")}
+    # More than one selector in a single batch means two different rules produced these rows and the
+    # aggregate is a blend of two systems. Surfaced rather than silently averaged.
+    out["omniopd/selector_variants"] = sorted(v for v in variants if v)
+    out["omniopd/selector_hashes"] = sorted(h for h in hashes if h)
+    return out
