@@ -1257,7 +1257,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         self._omniopd_ref_module = m
         return m
 
-    def _omniopd_kl_rmpad(self, student_logits, model_inputs, kl_slice: int = 512):
+    def _omniopd_kl_rmpad(self, student_logits, model_inputs, kl_slice: int = 512, temperature=None):
         """Exact full-vocabulary KL(pi_ref || pi_theta) per packed position (FID-2).
 
         Computed in POSITION SLICES. Both distributions at once is 2 x (total_nnz, V); at
@@ -1276,6 +1276,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
             ref_out = ref(**model_inputs, use_cache=False)
         ref_logits = ref_out.logits.squeeze(0)
         cur_logits = student_logits.squeeze(0)
+        # These are the PRE-temperature logits: prepare_model_outputs divides by temperature after
+        # this runs, so the chunk log-likelihood the loss uses is scaled and this KL is not. At
+        # temperature 1.0 that is the same distribution; anywhere else the trust region would anchor
+        # against a distribution the policy never samples from, and nothing would report it.
+        if temperature is not None:
+            _t = float(torch.as_tensor(temperature).float().max())
+            if abs(_t - 1.0) > 1e-6:
+                raise NotImplementedError(
+                    f"loss_mode=omniopd with sampling temperature {_t}: the trust-region KL is taken "
+                    f"on unscaled logits while the audited chunk log-likelihood is scaled by "
+                    f"temperature, so the two terms would describe different distributions. Refusing "
+                    f"rather than anchoring against one the policy never samples from."
+                )
         if ref_logits.shape != cur_logits.shape:
             raise ValueError(
                 f"OmniOPD reference logits {tuple(ref_logits.shape)} do not match the student's "
@@ -1287,9 +1300,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
             rl = torch.log_softmax(rl_chunk.float(), dim=-1)
             return (rl.exp() * (rl - cl)).sum(-1)
 
+        # THE SLICE MUST BE CLONED. cur_logits[j:j+k] is a VIEW, and prepare_model_outputs later
+        # mutates the same storage in place -- logits_rmpad.div_(temperature) at :1095, and the
+        # cross-entropy backward when inplace_backward is on. Backward through this KL then dies with
+        # "a variable needed for gradient computation has been modified by an inplace operation ...
+        # output 0 of AsStridedBackward0" (AsStrided being exactly this view), on the first optimizer
+        # step -- after the entire rollout and teacher audit have been paid for. Cloning per SLICE
+        # rather than cloning the whole logits keeps the copy bounded by kl_slice, which is the same
+        # reason the loop exists at all.
         parts = []
         for j in range(0, cur_logits.shape[0], kl_slice):
-            c = cur_logits[j : j + kl_slice]
+            c = cur_logits[j : j + kl_slice].clone()
             r = ref_logits[j : j + kl_slice]
             if torch.is_grad_enabled() and c.requires_grad:
                 parts.append(checkpoint(_kl, c, r, use_reentrant=False))
@@ -1332,7 +1353,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         "before the KL is meaningful. Refusing rather than anchoring against "
                         "misaligned positions."
                     )
-                omniopd_kl = self._omniopd_kl_rmpad(raw_output.logits, model_inputs)
+                omniopd_kl = self._omniopd_kl_rmpad(
+                    raw_output.logits, model_inputs, temperature=micro_batch.get("temperature")
+                )
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
