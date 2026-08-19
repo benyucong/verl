@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import os
 import torch
 from tensordict import TensorDict
 
@@ -780,6 +781,26 @@ def compute_distillation_loss_omniopd(
             AggregationType.MEAN,
             torch.tensor(float(sum(1 for a in anchors_all if len(a) == 0)))),
     }
+
+    # EMITTED DIRECTLY, not only as Metric objects. Two smoke runs completed with three and four
+    # optimizer steps and logged NO omniopd metric at all: _update_actor does return them under an
+    # actor/ prefix, but the fully-async trainer's logged dict carried only fully_async/rollouter/*.
+    # Until that routing is fixed, a run can train end to end and leave no evidence of what the
+    # objective actually computed -- which is the difference between "it ran" and "it works". This
+    # is the one place both terms and the target are known together.
+    if os.environ.get("OPD_OMNIOPD_QUIET", "0") in ("0", "", "false", "False"):
+        _lc = float(per_tok.sum())
+        _lk = float(kl[unaudited].sum())
+        _tm = float(target.mean())
+        _km = float(k_sem_t.mean())
+        _pm = float(pi_bar.mean())
+        print(
+            "[OMNIOPD-LOSS] L_chunk=%.4f L_kl=%.4f beta*L_kl=%.4f n_chunks=%d n_unaudited=%d "
+            "target_mean=%.4f k_sem_mean=%.4f pi_bar_mean=%.4f identity=%.4f"
+            % (_lc, _lk, beta * _lk, len(k_sem_flat), int(unaudited.sum()), _tm, _km, _pm,
+               (_km + alpha * _pm) / (N + alpha)),
+            flush=True,
+        )
     return losses, metrics
 
 
