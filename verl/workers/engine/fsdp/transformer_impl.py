@@ -565,6 +565,17 @@ class FSDPEngine(BaseEngine):
             lr_scheduler = None
 
         self.module = module
+
+        # OmniOPD's trust-region anchor is KL(pi_ref || pi_theta) against the frozen INITIAL policy,
+        # which is exactly the checkpoint this engine just loaded. Enabled by an explicit env var
+        # rather than inferred, so a run's log records unambiguously whether the anchor was active:
+        # a silently-absent anchor trains a different objective and looks entirely healthy.
+        self._omniopd_ref_path = os.environ.get("OPD_OMNIOPD_REF_PATH") or (
+            self.model_config.local_path if os.environ.get("OPD_OMNIOPD_ANCHOR") == "1" else None
+        )
+        self._omniopd_ref_module = None
+        if self._omniopd_ref_path:
+            print(f"[omniopd] trust-region anchor ENABLED against {self._omniopd_ref_path}", flush=True)
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
@@ -1207,6 +1218,70 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         return model_output
 
+    def _omniopd_reference(self):
+        """The frozen INITIAL policy, loaded once, for OmniOPD's trust-region anchor.
+
+        It is not veRL's `ref` worker. In the fully-async pipeline the trainer runs as Role.Actor
+        (`use_trainer_do_validate=False`), so `_is_ref` is False and no reference exists in that
+        pool at all -- vanilla k1 does not need one, because the teacher IS its reference. OmniOPD
+        does need one, and it needs the FULL distribution rather than sampled-token log-probs, so
+        the two models' logits have to meet inside a single forward. Hence a local frozen copy
+        rather than a cross-worker call.
+        """
+        if getattr(self, "_omniopd_ref_module", None) is not None:
+            return self._omniopd_ref_module
+        import torch
+        from transformers import AutoModelForCausalLM
+        path = self._omniopd_ref_path
+        dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+        m = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, trust_remote_code=True)
+        m = m.to(get_device_id()).eval()
+        for prm in m.parameters():
+            prm.requires_grad_(False)
+        self._omniopd_ref_module = m
+        return m
+
+    def _omniopd_kl_rmpad(self, student_logits, model_inputs, kl_slice: int = 512):
+        """Exact full-vocabulary KL(pi_ref || pi_theta) per packed position (FID-2).
+
+        Computed in POSITION SLICES. Both distributions at once is 2 x (total_nnz, V); at
+        V=151936 and a 6k-token micro-batch that is ~7 GB in fp32 before autograd retains the
+        log_softmax intermediates, which is what OOMed a 64 GiB card in milestone 2. Slicing puts
+        peak memory under `kl_slice` instead of under sequence length.
+
+        A sampled-token log-ratio would avoid all of this and is NOT acceptable here: unaudited
+        positions are the majority of every trajectory, so the surrogate would change the gradient
+        on most of the tokens being trained while looking perfectly healthy.
+        """
+        import torch
+        from torch.utils.checkpoint import checkpoint
+        ref = self._omniopd_reference()
+        with torch.no_grad():
+            ref_out = ref(**model_inputs, use_cache=False)
+        ref_logits = ref_out.logits.squeeze(0)
+        cur_logits = student_logits.squeeze(0)
+        if ref_logits.shape != cur_logits.shape:
+            raise ValueError(
+                f"OmniOPD reference logits {tuple(ref_logits.shape)} do not match the student's "
+                f"{tuple(cur_logits.shape)}; the anchor would be computed against the wrong "
+                f"positions.")
+
+        def _kl(cl_chunk, rl_chunk):
+            cl = torch.log_softmax(cl_chunk.float(), dim=-1)
+            rl = torch.log_softmax(rl_chunk.float(), dim=-1)
+            return (rl.exp() * (rl - cl)).sum(-1)
+
+        parts = []
+        for j in range(0, cur_logits.shape[0], kl_slice):
+            c = cur_logits[j : j + kl_slice]
+            r = ref_logits[j : j + kl_slice]
+            if torch.is_grad_enabled() and c.requires_grad:
+                parts.append(checkpoint(_kl, c, r, use_reentrant=False))
+            else:
+                parts.append(_kl(c, r))
+        del ref_logits, ref_out
+        return torch.cat(parts)
+
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
@@ -1229,9 +1304,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 use_cache=False,
             )  # prevent model thinks we are generating
 
+            # OmniOPD's anchor must be taken BEFORE prepare_model_outputs, which consumes the
+            # student logits: logprobs_from_logits runs with inplace_backward=True and mutates them.
+            # Computing the KL afterwards would silently anchor against a corrupted distribution.
+            omniopd_kl = None
+            if getattr(self, "_omniopd_ref_path", None):
+                if getattr(self, "use_ulysses_sp", False) and self.ulysses_sequence_parallel_size > 1:
+                    raise NotImplementedError(
+                        "loss_mode=omniopd with Ulysses SP > 1: the student logits are sequence-"
+                        "sharded, so the reference forward would have to be sharded identically "
+                        "before the KL is meaningful. Refusing rather than anchoring against "
+                        "misaligned positions."
+                    )
+                omniopd_kl = self._omniopd_kl_rmpad(raw_output.logits, model_inputs)
+
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
+            if omniopd_kl is not None:
+                import torch as _torch
+                cu = micro_batch["input_ids"].offsets()
+                model_output["omniopd_kl"] = _torch.nested.nested_tensor_from_jagged(omniopd_kl, cu)
 
             if loss_function is not None:
                 loss, metrics = loss_function(
