@@ -300,6 +300,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
         request_id = uuid4().hex
         response_ids: list[int] = []
         response_logprobs: list[float] = []
+        # CUMULATIVE, like response_ids -- not the per-delta slice. _delta_token_output slices
+        # token_entropies to its own delta, and _emit pairs CUMULATIVE response_ids with the LAST
+        # delta's extra_fields, so the final chunk (the one the OmniOPD audit runs on) would carry
+        # the whole response against one chunk's worth of entropy. Anchor selection indexes that
+        # series against the response, so every anchor would move.
+        response_entropies: list[float] = []
         total_num_preempted = 0
         emitted_chunks = 0
         chunk_emit_tasks: list[asyncio.Task] = []
@@ -313,6 +319,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # survive a weight-sync abort -- see the comment on the cutting loop below.
         buf_ids: list[int] = []
         buf_lps: list[float] = []
+        buf_ents: list[float] = []
         # Version window accumulated since the last chunk cut; consumed and reset by _stage.
         cut_min_gs: int | None = None
         cut_max_gs: int | None = None
@@ -332,7 +339,18 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 num_turns=2,
                 metrics=AgentLoopMetrics(**{"generate_sequences": gen_s, "num_preempted": -1}),
                 reward_score=0.0,
-                extra_fields={**extra_fields, "turn_scores": [], "tool_rewards": []},
+                extra_fields={
+                    **extra_fields,
+                    "turn_scores": [],
+                    "tool_rewards": [],
+                    # Sliced exactly like response_ids above, so the two always describe the same
+                    # tokens. Omitted entirely when entropy was never requested.
+                    **(
+                        {"token_entropies": response_entropies[:snapshot_len][: self.response_length]}
+                        if response_entropies
+                        else {}
+                    ),
+                },
             )
             chunk_emit_tasks.append(
                 asyncio.create_task(
@@ -346,7 +364,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 )
             )
 
-        def _stage(tok_ids: list, lps: list, is_final: bool) -> bool:
+        def _stage(tok_ids: list, lps: list, is_final: bool, ents: list | None = None) -> bool:
             """Emit one cut chunk IMMEDIATELY. Returns False once response_length is reached.
 
             This used to buffer a chunk and release it only when its successor arrived, because
@@ -368,11 +386,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 return False
             if len(tok_ids) > remaining:
                 tok_ids, lps = tok_ids[:remaining], lps[:remaining]
+                if ents is not None:
+                    ents = ents[:remaining]
             token_offset = len(response_ids)
             n = len(tok_ids)
             response_ids.extend(tok_ids)
             if len(lps) >= n:
                 response_logprobs.extend(lps[:n])
+            if ents is not None and len(ents) >= n:
+                response_entropies.extend(ents[:n])
             _now = time.time()
             # Weight-version window scoped to THIS CHUNK, matching split -- where each chunk is its
             # own request, so generate() naturally reports the versions that decoded that chunk.
@@ -460,6 +482,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 buf_ids.extend(new_token_ids)
                 if delta.log_probs is not None:
                     buf_lps.extend(list(delta.log_probs[: len(new_token_ids)]))
+                _dent = last_extra_fields.get("token_entropies")
+                if _dent is not None:
+                    if len(_dent) < len(new_token_ids):
+                        raise RuntimeError(
+                            f"continuous-stream delta carried {len(new_token_ids)} tokens but "
+                            f"{len(_dent)} entropy values; anchor selection would be shifted."
+                        )
+                    buf_ents.extend(list(_dent[: len(new_token_ids)]))
 
             # Cut chunks at EXACT chunk_tokens boundaries, ACROSS aborts.
             #
@@ -489,19 +519,24 @@ class SingleTurnAgentLoop(AgentLoopBase):
             # per chunk and makes the boundary case impossible by construction rather than caught.
             keep = chunk_tokens
             while len(buf_ids) > keep:
-                if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens], False):
+                if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens], False,
+                              ents=buf_ents[:chunk_tokens] if buf_ents else None):
                     break  # response_length reached; drop the rest
                 del buf_ids[:chunk_tokens]
                 del buf_lps[: min(chunk_tokens, len(buf_lps))]
+                del buf_ents[: min(chunk_tokens, len(buf_ents))]
             if stream_done and buf_ids:
-                _stage(buf_ids, buf_lps, True)
+                # ents MUST be passed here: this is the terminal cut, and the final chunk is exactly
+                # the one _compute_omniopd_audit runs on.
+                _stage(buf_ids, buf_lps, True, ents=buf_ents if buf_ents else None)
                 buf_ids.clear()
                 buf_lps.clear()
+                buf_ents.clear()
 
         # Defensive tail flush: the generator can in principle end without ever yielding a terminal
         # stop_reason. Losing this would leave the parent with no is_final and stall its assembly.
         if buf_ids:
-            _stage(buf_ids, buf_lps, True)
+            _stage(buf_ids, buf_lps, True, ents=buf_ents if buf_ents else None)
         if chunk_idx > 0 and not final_emitted:
             # A response ending exactly on a chunk boundary leaves the buffer empty when the
             # terminal delta arrives, so no cut chunk can carry is_final. Log it rather than let
@@ -537,6 +572,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics=AgentLoopMetrics(**metrics),
             extra_fields={
                 **last_extra_fields,
+                # cumulative, sliced exactly like response_ids above
+                **({"token_entropies": response_entropies[: self.response_length]}
+                   if response_entropies else {}),
                 "stop_reason": last_stop_reason,
                 "streaming_chunks_emitted": emitted_chunks,
                 "continuous_stream": True,
@@ -559,6 +597,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
         request_id = uuid4().hex
         response_ids: list[int] = []
         response_logprobs: list[float] = []
+        # CUMULATIVE, like response_ids. Each chunk here is a separate request, so its extra_fields
+        # carry only that chunk's entropies, while every emitted output pairs them with the
+        # cumulative response -- and the final chunk is the one the OmniOPD audit runs on.
+        response_entropies: list[float] = []
         routed_experts = None
         total_generate_time = 0.0
         total_num_preempted = 0
@@ -683,10 +725,20 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_ids.extend(new_token_ids)
             if chunk_output.log_probs is not None:
                 response_logprobs.extend(list(chunk_output.log_probs[:n_new_tokens]))
+            _cent = (chunk_output.extra_fields or {}).get("token_entropies")
+            if _cent is not None:
+                if len(_cent) < n_new_tokens:
+                    raise RuntimeError(
+                        f"split-stream chunk carried {n_new_tokens} tokens but {len(_cent)} entropy "
+                        f"values; anchor selection would be shifted against the response."
+                    )
+                response_entropies.extend(list(_cent[:n_new_tokens]))
             routed_experts = _append_routed_experts(routed_experts, chunk_output.routed_experts, n_new_tokens)
             if chunk_output.num_preempted is not None:
                 total_num_preempted += int(chunk_output.num_preempted)
             last_extra_fields = dict(chunk_output.extra_fields or {})
+            if response_entropies:
+                last_extra_fields["token_entropies"] = response_entropies[: self.response_length]
             last_stop_reason = chunk_output.stop_reason
 
             continue_generating = _should_continue_chunked_generation(
@@ -755,6 +807,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics=AgentLoopMetrics(**metrics),
             extra_fields={
                 **last_extra_fields,
+                # cumulative, sliced exactly like response_ids above
+                **({"token_entropies": response_entropies[: self.response_length]}
+                   if response_entropies else {}),
                 "stop_reason": last_stop_reason,
                 "streaming_chunks_emitted": emitted_chunks,
             },
