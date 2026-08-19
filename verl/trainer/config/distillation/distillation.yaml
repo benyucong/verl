@@ -55,6 +55,37 @@ distillation_loss:
   clip_ratio_high: 0.2
 
 
+# OmniOPD generative-critic objective (loss_mode=omniopd). Present in the schema rather than added
+# with a CLI '+' because the agent loop reads it off the RAW DictConfig
+# (agent_loop.py _compute_omniopd_audit), where a missing key is a struct-mode error rather than a
+# fallback to the dataclass default. The values below ARE the dataclass defaults; _target_ is
+# required, or omega_conf_to_dataclass hands DistillationConfig a plain dict and __post_init__ dies
+# reading self.omniopd.C.
+omniopd:
+  _target_: verl.workers.config.distillation.OmniOPDConfig
+
+  # Audited chunks per trajectory, at the highest full-vocabulary entropy positions.
+  M: 10
+
+  # Teacher continuations sampled per chunk.
+  N: 10
+
+  # Tokens per chunk, and per teacher continuation.
+  C: 50
+
+  # Dirichlet-Multinomial smoothing of the Bayesian target.
+  alpha: 1.0
+
+  # Weight of the trust-region anchor on unaudited positions.
+  beta: 0.1
+
+  # Semantic metric: "ned" or "rouge1". Only "ned" is implemented.
+  phi: ned
+
+  # 0 means exact full-vocabulary entropy for chunk selection (FID-1). Non-zero is a recorded
+  # deviation: a truncated tail under-estimates H and selects DIFFERENT chunks.
+  entropy_topk: 0
+
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8
 

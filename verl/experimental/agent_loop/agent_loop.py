@@ -46,7 +46,8 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
-from verl.trainer.distillation.omniopd_stage import attach_omniopd_audit, omniopd_enabled
+from verl.trainer.distillation.omniopd_stage import (attach_omniopd_audit, omniopd_enabled,
+                                                      resolve_omniopd_config)
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -1436,7 +1437,7 @@ class AgentLoopWorker:
             response_ids=response_ids,
             teacher_manager=self.teacher_server_manager,
             tokenizer=self.tokenizer,
-            omniopd_config=self.config.distillation.omniopd,
+            omniopd_config=resolve_omniopd_config(self.config),
             session_id=session_id,
             routing_key=routing_key,
             seed=abs(hash((session_id, "omniopd"))) % (2**31) if session_id is not None else None,

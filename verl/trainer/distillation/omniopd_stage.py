@@ -79,6 +79,34 @@ def omniopd_enabled(config: Any) -> bool:
         return False
 
 
+def resolve_omniopd_config(config):
+    """The omniopd node, from the raw DictConfig, or the dataclass defaults if it is absent.
+
+    Two different objects carry this config. The trainer gets the instantiated DistillationConfig,
+    where `omniopd` always exists via default_factory. The AGENT LOOP holds the raw Hydra
+    DictConfig, and there a missing key is a struct-mode ConfigAttributeError -- raised mid-rollout,
+    after the whole response has been generated. distillation.yaml now carries the node, so this is
+    a fallback rather than the normal path; it exists because the failure it prevents is expensive
+    and arrives late, and because the values it substitutes are the same defaults the dataclass
+    would have used anyway.
+    """
+    try:
+        om = config.distillation.omniopd
+        if om is not None:
+            return om
+    except Exception:
+        pass
+    try:
+        from verl.workers.config.distillation import OmniOPDConfig
+    except ImportError:
+        from ...workers.config.distillation import OmniOPDConfig
+    logger.warning(
+        "distillation.omniopd absent from the config; falling back to OmniOPDConfig() defaults "
+        "(M=10 N=10 C=50 alpha=1.0 beta=0.1 phi=ned). Add the node to distillation.yaml to set them."
+    )
+    return OmniOPDConfig()
+
+
 async def run_omniopd_audit(
     *,
     prompt_ids: list[int],
