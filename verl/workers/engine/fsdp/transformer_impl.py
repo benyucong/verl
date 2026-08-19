@@ -1279,16 +1279,29 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # These are the PRE-temperature logits: prepare_model_outputs divides by temperature after
         # this runs, so the chunk log-likelihood the loss uses is scaled and this KL is not. At
         # temperature 1.0 that is the same distribution; anywhere else the trust region would anchor
-        # against a distribution the policy never samples from, and nothing would report it.
+        # against one the policy never samples from.
+        #
+        # THE AUTHORITATIVE CHECK IS IN THE LAUNCHER, not here. The first version of this guard did
+        # `torch.as_tensor(temperature).float().max()` and died with "max(): Expected reduction dim
+        # ... numel() == 0" (jobs 44821067 and 44825615) because the value reaching this frame can be
+        # an EMPTY tensor. Making it tolerate that would leave a guard that quietly never fires,
+        # which is worse than no guard: it would be trusted. So the real constraint is enforced on
+        # the config, where it is a scalar and cannot no-op, and this stays a cheap opportunistic
+        # assert for the case where a usable value is actually present.
+        _t = None
         if temperature is not None:
-            _t = float(torch.as_tensor(temperature).float().max())
-            if abs(_t - 1.0) > 1e-6:
-                raise NotImplementedError(
-                    f"loss_mode=omniopd with sampling temperature {_t}: the trust-region KL is taken "
-                    f"on unscaled logits while the audited chunk log-likelihood is scaled by "
-                    f"temperature, so the two terms would describe different distributions. Refusing "
-                    f"rather than anchoring against one the policy never samples from."
-                )
+            try:
+                _tt = torch.as_tensor(temperature).float()
+                if _tt.numel() > 0:
+                    _t = float(_tt.reshape(-1)[0]) if _tt.numel() == 1 else float(_tt.max())
+            except (TypeError, RuntimeError, ValueError):
+                _t = None
+        if _t is not None and abs(_t - 1.0) > 1e-6:
+            raise NotImplementedError(
+                f"loss_mode=omniopd with sampling temperature {_t}: the trust-region KL is taken on "
+                f"unscaled logits while the audited chunk log-likelihood is scaled by temperature, "
+                f"so the two terms would describe different distributions."
+            )
         if ref_logits.shape != cur_logits.shape:
             raise ValueError(
                 f"OmniOPD reference logits {tuple(ref_logits.shape)} do not match the student's "
@@ -1354,7 +1367,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         "misaligned positions."
                     )
                 omniopd_kl = self._omniopd_kl_rmpad(
-                    raw_output.logits, model_inputs, temperature=micro_batch.get("temperature")
+                    raw_output.logits, model_inputs,
+                    # read the way prepare_model_inputs does (:925), not via .get, which returned an
+                    # empty tensor here
+                    temperature=micro_batch["temperature"] if "temperature" in micro_batch.keys() else None,
                 )
 
             model_output = self.prepare_model_outputs(
