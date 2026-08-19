@@ -56,12 +56,26 @@ except ImportError:  # or with the distillation dir on sys.path, which is how th
 def omniopd_enabled(config: Any) -> bool:
     """OmniOPD runs only when the loss asks for teacher generation.
 
-    Read off the same flag the loss registry keys on rather than a separate env switch, so a run
-    cannot be configured into a state where the trainer expects an audit the rollout never produced.
+    Resolved from the loss NAME through the same registry the trainer uses, so a run cannot be
+    configured into a state where the trainer expects an audit the rollout never produced.
+
+    NOT from config.distillation.distillation_loss.loss_settings. That field is populated at runtime
+    on the dataclass and exists in NO composed YAML, so on the raw DictConfig the read raises
+    ConfigAttributeError -- a subclass of AttributeError, which an `except AttributeError` swallows.
+    The gate then returns False on every real run: no audit, no teacher generation, no anchors, and
+    a loss that raises much later complaining the engine gave it no KL. Nothing named the true cause.
     """
     try:
-        return bool(config.distillation.distillation_loss.loss_settings.use_teacher_generation)
-    except AttributeError:
+        loss_mode = config.distillation.distillation_loss.loss_mode
+    except Exception:
+        return False
+    try:
+        from .losses import get_distillation_loss_settings
+    except ImportError:
+        from losses import get_distillation_loss_settings
+    try:
+        return bool(get_distillation_loss_settings(str(loss_mode)).use_teacher_generation)
+    except Exception:
         return False
 
 

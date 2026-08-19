@@ -617,6 +617,27 @@ def compute_forward_kl_topk(
 @register_distillation_loss(
     DistillationLossSettings(names=["omniopd"], use_teacher_generation=True)
 )  # type: ignore[arg-type]
+def _omniopd_column(data, key):
+    """Read a per-sample OmniOPD column from a DataProto OR a bare TensorDict.
+
+    Both appear on the path: the rollout assembles a DataProto, and the trainer micro-batches it
+    into TensorDicts (protocol.py to_tensordict wraps each non-tensor column in a NonTensorStack, so
+    the values survive rearrange_micro_batches and make_iterator in row order).
+    """
+    ntb = getattr(data, "non_tensor_batch", None)
+    if ntb is not None and key in ntb:
+        return ntb[key]
+    try:
+        return data[key]
+    except (KeyError, IndexError) as e:
+        raise KeyError(
+            f"OmniOPD loss needs the per-sample column {key!r} and it is absent from this batch. "
+            f"It is produced by the rollout-side audit (omniopd_stage.attach_omniopd_audit); if the "
+            f"audit did not run, the objective has no targets and must not silently train without "
+            f"them."
+        ) from e
+
+
 def compute_distillation_loss_omniopd(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -665,8 +686,12 @@ def compute_distillation_loss_omniopd(
 
     om = distillation_config.omniopd
     N, C, alpha, beta = om.N, om.C, om.alpha, om.beta
-    anchors_all = data.non_tensor_batch["omniopd_anchors"]
-    k_sem_all = data.non_tensor_batch["omniopd_k_sem"]
+    # The trainer hands this a TensorDict, not a DataProto: DataProto.to_tensordict turns each
+    # non-tensor column into a NonTensorStack indexed by batch dim, so the columns survive every
+    # split and reorder -- but they are reached with data[key], and .non_tensor_batch does not exist
+    # on a TensorDict at all. Reading it there is an AttributeError on the first backward.
+    anchors_all = _omniopd_column(data, "omniopd_anchors")
+    k_sem_all = _omniopd_column(data, "omniopd_k_sem")
 
     losses = torch.zeros_like(log_probs, dtype=torch.float32)
     audited = torch.zeros_like(response_mask)
@@ -688,7 +713,15 @@ def compute_distillation_loss_omniopd(
             pos_flat.append(idx)
 
     if not chunk_logp:
-        raise ValueError("no audited chunks in this batch; the objective has nothing to reinforce")
+        # Not an error. A micro-batch can legitimately contain only responses shorter than one chunk,
+        # and the objective is DEFINED there: with an empty audited set every position is unaudited,
+        # so the loss is beta*KL everywhere. Raising instead would abort the optimizer step over a
+        # batch whose composition is a property of the data, not of the configuration.
+        return torch.where(response_mask, beta * kl, torch.zeros_like(log_probs)), {
+            "omniopd/audited_chunks": 0,
+            "omniopd/audited_frac": 0.0,
+            "omniopd/rows_without_audit": int(response_mask.shape[0]),
+        }
 
     lp = torch.stack(chunk_logp)                                   # (n_chunks, C)
     pi_bar = torch.exp(lp.mean(dim=-1))

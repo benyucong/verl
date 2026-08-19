@@ -1234,7 +1234,23 @@ class FSDPEngineWithLMHead(FSDPEngine):
         from transformers import AutoModelForCausalLM
         path = self._omniopd_ref_path
         dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
-        m = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, trust_remote_code=True)
+        # THE ATTENTION BACKEND MUST MATCH THE STUDENT'S. The student runs rmpad/varlen: a
+        # micro-batch is several sequences CONCATENATED into one row, kept apart only by cu_seqlens,
+        # which flash_attention_2 honours. Loaded with the transformers default the reference would
+        # use SDPA, which knows nothing of cu_seqlens and applies a plain causal mask -- so every
+        # sequence after the first attends back into its predecessor. The reference logits would be
+        # contaminated exactly at the packed boundaries, the KL would be wrong there, and nothing
+        # would raise: the shapes are identical either way.
+        attn = getattr(self.model_config, "attn_implementation", None) or "flash_attention_2"
+        try:
+            m = AutoModelForCausalLM.from_pretrained(
+                path, dtype=dtype, trust_remote_code=True, attn_implementation=attn)
+        except (ValueError, ImportError) as e:
+            raise RuntimeError(
+                f"OmniOPD reference could not load with attn_implementation={attn!r}: {e}. Refusing "
+                f"to fall back to SDPA -- under rmpad packing that silently mixes sequences and "
+                f"corrupts the trust-region KL at every packed boundary."
+            ) from e
         m = m.to(get_device_id()).eval()
         for prm in m.parameters():
             prm.requires_grad_(False)

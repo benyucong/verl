@@ -1208,6 +1208,7 @@ class AgentLoopWorker:
                     response_ids=output.response_ids,
                     validate=validate,
                     sample_kwargs=kwargs,
+                    chunk_is_final=chunk_is_final,
                 )
             else:
                 await self._compute_teacher_logprobs(
@@ -1402,13 +1403,22 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        chunk_is_final: Optional[bool] = None,
     ) -> None:
         """Select audit anchors from student entropy, have the teacher rewrite them, score k_sem.
 
-        The audit is a whole-response operation -- anchors are a global argmax over the finished
-        response -- so unlike incremental scoring it has no per-chunk form and runs once, at the end.
+        The audit is a whole-response operation -- anchors are a global argmax over the FINISHED
+        response -- so unlike incremental scoring it has no per-chunk form and runs exactly once.
+
+        THAT IS WHY chunk_is_final IS LOAD-BEARING. Under chunk streaming this postprocess runs once
+        per chunk; without the gate the audit would fire on every partial response, spending M teacher
+        generations per chunk and then overwriting its own anchors with those of a prefix. The last
+        writer would win, so the trajectory would train against anchors chosen from a truncated
+        response -- expensive, wrong, and completely silent. None means the caller is not streaming.
         """
         if not (self.distillation_enabled and not validate):
+            return
+        if chunk_is_final is False:
             return
         routing_key = session_id = None
         if sample_kwargs is not None:

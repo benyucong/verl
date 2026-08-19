@@ -25,6 +25,7 @@ import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
+from vllm.sampling_params import RequestOutputKind
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
@@ -803,6 +804,13 @@ class vLLMHttpServer:
             top_p=top_p,
             seed=seed,
             detokenize=False,
+            # WITHOUT FINAL_ONLY THIS METHOD CANNOT WORK. vLLM V1 aggregates the n children of an
+            # n>1 request into one RequestOutput only under FINAL_ONLY; the default CUMULATIVE
+            # streams whichever children emitted in the last engine step, so the final output
+            # carries a SUBSET and the truncation guard below raises. The offline microbench that
+            # validated N=10 went through LLM.generate, which forces FINAL_ONLY itself -- which is
+            # exactly why this never showed up there.
+            output_kind=RequestOutputKind.FINAL_ONLY,
         )
         generator = self.engine.generate(
             prompt=TokensPrompt(prompt_token_ids=prompt_ids),
