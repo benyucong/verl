@@ -190,6 +190,36 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
     # read as published OmniOPD. Recorded per trajectory so the label travels with the data.
     output.extra_fields["selector_hash"] = OMNIOPD_ONLINE_VARIANT.selector_hash()
     output.extra_fields["selector_variant"] = OMNIOPD_ONLINE_VARIANT.selector_variant
+
+    # EMIT PER TRAJECTORY. aggregate_omniopd_telemetry() consumes these fields, but it runs in the
+    # trainer and the non-streaming arm never reaches that path -- so without this line an entire run
+    # can complete and leave no evidence that the audit did anything. One line per trajectory is
+    # affordable (there are as many as there are samples) and it is the only place k_sem, the anchor
+    # count and the prefix-cache hit rate can be read back on any arm.
+    if os.environ.get("OPD_OMNIOPD_QUIET", "0") in ("0", "", "false", "False"):
+        t = rec.get("omniopd_telemetry") or {}
+        ks = rec.get("omniopd_k_sem") or []
+        pf = t.get("prefix_cache_frac")
+        logger.info(
+            "[OMNIOPD] sid=%s chunks=%d k_sem[min=%.3f mean=%.3f max=%.3f] cache=%s gen_tok=%s "
+            "gen_s=%.2f variant=%s",
+            session_id, len(rec.get("omniopd_anchors") or []),
+            min(ks) if ks else float("nan"),
+            (sum(ks) / len(ks)) if ks else float("nan"),
+            max(ks) if ks else float("nan"),
+            ("%.3f" % pf) if pf is not None else "n/a",
+            t.get("teacher_gen_tokens"), t.get("teacher_gen_seconds") or 0.0,
+            OMNIOPD_ONLINE_VARIANT.selector_variant,
+        )
+        print(
+            "[OMNIOPD] sid=%s chunks=%d k_sem_mean=%s cache=%s gen_tok=%s gen_s=%.2f skipped=%s"
+            % (session_id, len(rec.get("omniopd_anchors") or []),
+               ("%.3f" % (sum(ks) / len(ks))) if ks else "n/a",
+               ("%.3f" % pf) if pf is not None else "n/a",
+               t.get("teacher_gen_tokens"), t.get("teacher_gen_seconds") or 0.0,
+               t.get("skipped", "-")),
+            flush=True,
+        )
     # The entropy series has done its job and is large (one float per response token). Dropping it
     # keeps it out of the object array _postprocess builds for every extra_fields key.
     if os.environ.get("OPD_KEEP_TOKEN_ENTROPIES", "0") in ("0", "", "false", "False"):
