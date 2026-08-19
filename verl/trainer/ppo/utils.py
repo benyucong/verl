@@ -77,23 +77,23 @@ def need_reference_policy(
 ) -> bool:
     """Given the config, do we need ref policy.
 
-    OmniOPD needs one for a reason the first two clauses cannot express. Its trust-region anchor is
-    an EXACT full-vocabulary KL(pi_ref || pi_theta) on UNAUDITED positions only (FID-2). Reaching
-    for `actor.use_kl_loss` to summon a reference would also switch on verl's own kl_penalty over
-    the FULL response -- a sampled-token k1 estimator on every position. That is both a second,
-    unwanted term in the objective and precisely the approximation FID-2 rejects, so the anchor gets
-    its own clause rather than borrowing one.
+    OmniOPD does NOT appear here, though it does need a reference. Its trust-region anchor is an
+    EXACT full-vocabulary KL(pi_ref || pi_theta) on unaudited positions (FID-2), and verl's ref
+    worker returns SAMPLED-TOKEN log probs -- precisely the approximation FID-2 rejects. So the
+    anchor is computed inside the training engine instead, against a frozen copy loaded there
+    (fsdp/transformer_impl.py::_omniopd_reference, enabled by OPD_OMNIOPD_ANCHOR), where the two
+    models' logits can meet in one forward.
+
+    This clause used to return True for omniopd. That loaded a second full model per trainer rank
+    whose output nothing read -- compute_distillation_loss_omniopd consumes model_output["omniopd_kl"]
+    and never ref_log_prob -- and then crashed in ref_compute_ref_log_prob (job 44821067,
+    "max(): Expected reduction dim to be specified for input.numel() == 0").
+
+    Removing it cannot silently drop the trust region: the loss RAISES when the engine does not
+    supply omniopd_kl, rather than falling back to a surrogate.
     """
     if config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss:
         return True
-    distillation = config.get("distillation", None)
-    if distillation is not None and distillation.get("enabled", False):
-        loss = distillation.get("distillation_loss", {}) or {}
-        omni = distillation.get("omniopd", {}) or {}
-        # beta == 0 disables the anchor entirely, and then a reference would be loaded, kept in
-        # memory and never read.
-        if loss.get("loss_mode", None) == "omniopd" and float(omni.get("beta", 0.1) or 0.0) > 0.0:
-            return True
     return False
 
 
