@@ -222,8 +222,17 @@ def distillation_ppo_loss(
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    # ORDER IS LOAD-BEARING. ppo_loss is the ONLY writer of config.global_batch_info
+    # (workers/utils/losses.py:65-68), and distillation_loss READS it (:461) to normalise. Called the
+    # other way round, the very first micro-batch of a run sees an empty dict, so agg_loss falls back
+    # to dp_size=1 and to that micro-batch's own sequence count instead of ppo_mini_batch_size x
+    # dp_size -- silently over-weighting the first accumulated gradient by (global/n)/dp_size.
+    # Nothing raises: the guard in core_algos only fires for dp_size > 1, and dp_size is exactly what
+    # defaulted to 1. It is inert for k1 (use_policy_gradient=True takes the other branch at :456),
+    # which is why it has never mattered -- but omniopd FORCES use_policy_gradient=False.
+    # ppo_loss does not read the distillation result; that is combined below at :236.
     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     if not distillation_loss_config.use_task_rewards:
         policy_loss = 0.0
 
@@ -719,10 +728,23 @@ def compute_distillation_loss_omniopd(
         # and the objective is DEFINED there: with an empty audited set every position is unaudited,
         # so the loss is beta*KL everywhere. Raising instead would abort the optimizer step over a
         # batch whose composition is a property of the data, not of the configuration.
-        return torch.where(response_mask, beta * kl, torch.zeros_like(log_probs)), {
-            "omniopd/audited_chunks": 0,
-            "omniopd/audited_frac": 0.0,
-            "omniopd/rows_without_audit": int(response_mask.shape[0]),
+        # THE KEY SET MUST MATCH THE NORMAL PATH EXACTLY. Metrics are reduced across DP ranks, and a
+        # rank emitting a different set either raises in Metric.aggregate_dp (when the empty
+        # micro-batches land unevenly) or, when they land evenly, silently averages the shared keys
+        # over a SUBSET of micro-batches with nothing to indicate it -- dropping L_kl on precisely
+        # the batches where beta*KL is the entire loss.
+        _empty_kl = torch.where(response_mask, beta * kl, torch.zeros_like(log_probs))
+        _zero = torch.zeros((), device=log_probs.device, dtype=torch.float32)
+        return _empty_kl, {
+            "omniopd/L_chunk": Metric(AggregationType.MEAN, _zero),
+            "omniopd/L_kl": Metric(AggregationType.MEAN, kl[response_mask].sum()),
+            "omniopd/n_chunks": Metric(AggregationType.MEAN, _zero),
+            "omniopd/n_unaudited": Metric(AggregationType.MEAN, response_mask.sum().float()),
+            "omniopd/target_mean": Metric(AggregationType.MEAN, _zero),
+            "omniopd/k_sem_mean": Metric(AggregationType.MEAN, _zero),
+            "omniopd/pi_bar_mean": Metric(AggregationType.MEAN, _zero),
+            "omniopd/rows_without_audit": Metric(AggregationType.MEAN,
+                                                 torch.tensor(float(response_mask.shape[0]))),
         }
 
     lp = torch.stack(chunk_logp)                                   # (n_chunks, C)
@@ -746,12 +768,17 @@ def compute_distillation_loss_omniopd(
 
     metrics = {
         "omniopd/L_chunk": Metric(AggregationType.MEAN, per_tok.sum()),
-        "omniopd/L_kl": Metric(AggregationType.MEAN, (beta * kl)[unaudited].sum()),
+        # WITHOUT beta, matching the oracle (scripts/omniopd_step.py reports kl_tok.sum()). Reporting
+        # beta*KL under the same name made the two artifacts differ by exactly 1/beta = 10x.
+        "omniopd/L_kl": Metric(AggregationType.MEAN, kl[unaudited].sum()),
         "omniopd/n_chunks": Metric(AggregationType.MEAN, torch.tensor(float(len(k_sem_flat)))),
         "omniopd/n_unaudited": Metric(AggregationType.MEAN, unaudited.sum().float()),
         "omniopd/target_mean": Metric(AggregationType.MEAN, target.mean()),
         "omniopd/k_sem_mean": Metric(AggregationType.MEAN, k_sem_t.mean()),
         "omniopd/pi_bar_mean": Metric(AggregationType.MEAN, pi_bar.mean().detach()),
+        "omniopd/rows_without_audit": Metric(
+            AggregationType.MEAN,
+            torch.tensor(float(sum(1 for a in anchors_all if len(a) == 0)))),
     }
     return losses, metrics
 

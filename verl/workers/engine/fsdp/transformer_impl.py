@@ -570,8 +570,31 @@ class FSDPEngine(BaseEngine):
         # which is exactly the checkpoint this engine just loaded. Enabled by an explicit env var
         # rather than inferred, so a run's log records unambiguously whether the anchor was active:
         # a silently-absent anchor trains a different objective and looks entirely healthy.
-        self._omniopd_ref_path = os.environ.get("OPD_OMNIOPD_REF_PATH") or (
-            self.model_config.local_path if os.environ.get("OPD_OMNIOPD_ANCHOR") == "1" else None
+        # GATED ON THE LOSS TOO, not on the env var alone. The anchor is only ever read by
+        # loss_mode=omniopd; a leaked OPD_OMNIOPD_ANCHOR=1 in a k1 or veRL baseline arm would load a
+        # second unsharded copy of the model on every trainer rank and compute a full-vocabulary KL
+        # on every forward whose result no loss consumes. Nothing raises and nothing reports it -- it
+        # would simply make the baseline arm slower, which is precisely the quantity these runs
+        # exist to compare.
+        _anchor_wanted = bool(os.environ.get("OPD_OMNIOPD_REF_PATH")) or os.environ.get("OPD_OMNIOPD_ANCHOR") == "1"
+        _loss_mode = None
+        try:
+            _loss_mode = str(self.config.distillation.distillation_loss.loss_mode)
+        except Exception:
+            try:
+                _loss_mode = str(os.environ.get("DISTILLATION_LOSS_MODE") or "")
+            except Exception:
+                _loss_mode = None
+        if _anchor_wanted and _loss_mode is not None and _loss_mode not in ("", "omniopd"):
+            print(
+                f"[omniopd] anchor requested but loss_mode={_loss_mode!r} never reads it; NOT loading "
+                f"a reference. Set loss_mode=omniopd, or unset OPD_OMNIOPD_ANCHOR to silence this.",
+                flush=True,
+            )
+            _anchor_wanted = False
+        self._omniopd_ref_path = (
+            (os.environ.get("OPD_OMNIOPD_REF_PATH") or self.model_config.local_path)
+            if _anchor_wanted else None
         )
         self._omniopd_ref_module = None
         if self._omniopd_ref_path:
@@ -1358,7 +1381,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
             # student logits: logprobs_from_logits runs with inplace_backward=True and mutates them.
             # Computing the KL afterwards would silently anchor against a corrupted distribution.
             omniopd_kl = None
-            if getattr(self, "_omniopd_ref_path", None):
+            # forward_only passes (old_log_prob, ref log-prob, any scoring forward) have no loss
+            # function and nothing reads the anchor, so computing it there buys a full reference
+            # forward plus a discarded full-vocabulary KL on every such pass. Left ungated it lands
+            # entirely in omniopd's measured actor time and makes any omniopd-vs-k1 wall-clock
+            # comparison unfair in omniopd's disfavour, while changing no number anyone reads.
+            if getattr(self, "_omniopd_ref_path", None) and not forward_only and loss_function is not None:
                 if getattr(self, "use_ulysses_sp", False) and self.ulysses_sequence_parallel_size > 1:
                     raise NotImplementedError(
                         "loss_mode=omniopd with Ulysses SP > 1: the student logits are sequence-"
