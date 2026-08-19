@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.trainer.distillation.omniopd_stage import attach_omniopd_audit, omniopd_enabled
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -446,6 +447,7 @@ class AgentLoopWorker:
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.config = config
+        self._omniopd_enabled = False   # set once distillation resolves; see below
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
@@ -466,6 +468,7 @@ class AgentLoopWorker:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
             self.teacher_key: str = config.distillation.teacher_key
+            self._omniopd_enabled = omniopd_enabled(self.config)
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
                 teacher_client=teacher_client,
@@ -543,6 +546,13 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+
+        # OmniOPD selects audit anchors by peak student entropy, computed in the patched sampler over
+        # the full unpadded vocabulary. Requested only when an audit will actually run: validation
+        # takes the early return in _compute_omniopd_audit, so paying the per-step reduction over B*V
+        # there would buy a series nothing reads.
+        if self._omniopd_enabled and not validate:
+            sampling_params["return_token_entropy"] = True
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
@@ -1188,14 +1198,26 @@ class AgentLoopWorker:
         if compute_score:
             await self._compute_score([output], kwargs=kwargs)
         if compute_teacher_logprobs:
-            await self._compute_teacher_logprobs(
-                output,
-                prompt_ids=output.prompt_ids,
-                response_ids=output.response_ids,
-                validate=validate,
-                sample_kwargs=kwargs,
-                chunk_is_final=chunk_is_final,
-            )
+            # OmniOPD replaces teacher SCORING with a teacher AUDIT: its objective reads k_sem and an
+            # exact KL against the frozen initial policy, and never a teacher logprob. Running both
+            # would pay for a full-sequence teacher forward whose result nothing consumes.
+            if self._omniopd_enabled:
+                await self._compute_omniopd_audit(
+                    output,
+                    prompt_ids=output.prompt_ids,
+                    response_ids=output.response_ids,
+                    validate=validate,
+                    sample_kwargs=kwargs,
+                )
+            else:
+                await self._compute_teacher_logprobs(
+                    output,
+                    prompt_ids=output.prompt_ids,
+                    response_ids=output.response_ids,
+                    validate=validate,
+                    sample_kwargs=kwargs,
+                    chunk_is_final=chunk_is_final,
+                )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
@@ -1372,6 +1394,43 @@ class AgentLoopWorker:
                 final_output.reward_score = result["reward_score"]
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
+
+    async def _compute_omniopd_audit(
+        self,
+        output: AgentLoopOutput,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        validate: bool,
+        sample_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Select audit anchors from student entropy, have the teacher rewrite them, score k_sem.
+
+        The audit is a whole-response operation -- anchors are a global argmax over the finished
+        response -- so unlike incremental scoring it has no per-chunk form and runs once, at the end.
+        """
+        if not (self.distillation_enabled and not validate):
+            return
+        routing_key = session_id = None
+        if sample_kwargs is not None:
+            routing_value = sample_kwargs.get(self.teacher_key)
+            if routing_value is not None:
+                routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            # Same per-response id the scoring path uses: it pins this trajectory's M nested chunk
+            # prefixes to one replica, which is what makes each prefill reuse the previous one's KV.
+            sid = sample_kwargs.get("xiaoshuai_sample_id")
+            if sid is not None:
+                session_id = sid.item() if hasattr(sid, "item") else sid
+        await attach_omniopd_audit(
+            output,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            teacher_manager=self.teacher_server_manager,
+            tokenizer=self.tokenizer,
+            omniopd_config=self.config.distillation.omniopd,
+            session_id=session_id,
+            routing_key=routing_key,
+            seed=abs(hash((session_id, "omniopd"))) % (2**31) if session_id is not None else None,
+        )
 
     async def _compute_teacher_logprobs(
         self,

@@ -35,6 +35,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.utils.config import omega_conf_to_dataclass
+from verl.trainer.distillation.token_entropy import EntropyAlignmentError
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
@@ -77,6 +78,33 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _with_token_entropy(sampling_params: dict) -> dict:
+    """Pass OmniOPD's per-token entropy request through to the patched sampler, or refuse.
+
+    The entropy is computed in the sampler over the full unpadded vocabulary (fork
+    opdflow/token-entropy-v0.15.1). It is requested per call rather than always on, because it costs
+    a reduction over B*V every step for runs that never read it.
+
+    ON AN UNPATCHED vLLM THIS RAISES. The selector picks audit anchors by entropy peak; without the
+    channel the only options are a different selection rule -- a different objective wearing the same
+    selector label -- or a crash somewhere less legible. vLLM's SamplingParams would itself reject the
+    unknown field, but its TypeError names a msgspec struct and reads like a verl bug.
+    """
+    if not sampling_params.pop("return_token_entropy", False):
+        return sampling_params
+    if "return_token_entropy" not in getattr(SamplingParams, "__struct_fields__", ()) and not hasattr(
+        SamplingParams, "return_token_entropy"
+    ):
+        raise RuntimeError(
+            "return_token_entropy was requested but this vLLM build does not support it. The OmniOPD "
+            "online-entropy selector requires the patched fork (opdflow/token-entropy-v0.15.1, see "
+            "patches/PROVENANCE.json). Refusing to fall back to a different anchor-selection rule "
+            "under the same selector label."
+        )
+    sampling_params["return_token_entropy"] = True
+    return sampling_params
 
 
 class vLLMHttpServer:
@@ -495,7 +523,7 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        sampling_params = SamplingParams(max_tokens=max_tokens, **_with_token_entropy(sampling_params))
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -564,6 +592,23 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
 
+        # One entropy per emitted token, in emission order. The length check IS the safety argument
+        # for the selector: a series off by one against token_ids shifts every anchor by a token, so
+        # the audited chunk no longer matches the span the teacher was asked to continue -- and
+        # nothing downstream can see that it happened.
+        _entropies = getattr(final_res.outputs[0], "token_entropies", None)
+        if getattr(sampling_params, "return_token_entropy", False):
+            if _entropies is None:
+                raise RuntimeError(
+                    f"request {request_id}: return_token_entropy was set but the engine returned no "
+                    f"token_entropies -- the build is not the patched fork, or the field was dropped."
+                )
+            if len(_entropies) != len(token_ids):
+                raise EntropyAlignmentError(
+                    f"request {request_id}: {len(token_ids)} tokens but {len(_entropies)} entropy "
+                    f"values. Anchor selection would be shifted against the tokens it indexes."
+                )
+
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
         extra_fields = {
@@ -573,6 +618,8 @@ class vLLMHttpServer:
             # slice to the engine that decoded it (Q3 per-replica refresh).
             "replica_rank": self.replica_rank,
         }
+        if _entropies is not None:
+            extra_fields["token_entropies"] = [float(x) for x in _entropies]
         # Teacher incremental scoring: an APC-reusing prompt_logprobs request (skip_reading_prefix_cache
         # explicitly False) returns full-length logprobs whose cached-prefix rows are GARBAGE. Extract
         # ONLY the valid recomputed suffix [num_cached_tokens:] and tell the teacher where it starts; the
@@ -675,6 +722,20 @@ class vLLMHttpServer:
             # Lets the trainer/analysis tell a continuous-stream chunk from a split-request one.
             "continuous_stream": True,
         }
+        # Cumulative, like token_ids, so a chunk's entropies are the same slice. Sliced here rather
+        # than reassembled downstream, so the two can never drift apart in transit.
+        _ent = getattr(out, "token_entropies", None)
+        if _ent is None:
+            if getattr(sampling_params, "return_token_entropy", False):
+                raise RuntimeError(
+                    "return_token_entropy was set but a streamed delta carried no token_entropies."
+                )
+        else:
+            if len(_ent) < end:
+                raise EntropyAlignmentError(
+                    f"delta [{start},{end}) needs {end} entropy values, output carries {len(_ent)}."
+                )
+            extra_fields["token_entropies"] = [float(x) for x in _ent[start:end]]
         # Engine queue wait, mirroring generate(). Absent here, the continuous arm cannot be
         # compared against the split arm on the one axis where an engine-side difference would
         # show up as scheduling delay rather than decode cost.
@@ -845,7 +906,7 @@ class vLLMHttpServer:
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        sampling_params = SamplingParams(max_tokens=max_tokens, **_with_token_entropy(sampling_params))
 
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
