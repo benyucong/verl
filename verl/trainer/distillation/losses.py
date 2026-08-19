@@ -614,9 +614,6 @@ def compute_forward_kl_topk(
     return distillation_losses, distillation_metrics
 
 
-@register_distillation_loss(
-    DistillationLossSettings(names=["omniopd"], use_teacher_generation=True)
-)  # type: ignore[arg-type]
 def _omniopd_column(data, key):
     """Read a per-sample OmniOPD column from a DataProto OR a bare TensorDict.
 
@@ -636,6 +633,11 @@ def _omniopd_column(data, key):
             f"audit did not run, the objective has no targets and must not silently train without "
             f"them."
         ) from e
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["omniopd"], use_teacher_generation=True)
+)  # type: ignore[arg-type]
 
 
 def compute_distillation_loss_omniopd(
