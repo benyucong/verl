@@ -164,7 +164,30 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
+            # token_entropies must be ACCUMULATED, like token_ids above and routed_experts before it.
+            # extra_fields.update() REPLACES it, so after a single partial-rollout resume the entropy
+            # series would cover only the final segment while token_ids covers every segment. OmniOPD
+            # selects audit anchors by indexing that series against the response, so the mismatch is
+            # not cosmetic: it is caught by the length check in omniopd_stage (which raises inside a
+            # gathered task, where the traceback is easy to misread) and would otherwise shift every
+            # anchor. Captured before the update and restored after it.
+            _prev_ent = final_output.extra_fields.get("token_entropies")
+            _new_ent = (output.extra_fields or {}).get("token_entropies")
             final_output.extra_fields.update(output.extra_fields or {})
+            if _prev_ent is not None or _new_ent is not None:
+                _merged = list(_prev_ent or []) + list(_new_ent or [])
+                final_output.extra_fields["token_entropies"] = _merged
+                # One entropy per generated token, across every resume. A segment that returned none
+                # (entropy not requested on the resumed call) leaves the series short, and a short
+                # series silently re-indexes every anchor -- so it fails here, next to the cause,
+                # rather than later next to the symptom.
+                if len(_merged) != len(final_output.token_ids):
+                    raise RuntimeError(
+                        f"partial-rollout resume desynchronised token_entropies: "
+                        f"{len(final_output.token_ids)} tokens but {len(_merged)} entropy values "
+                        f"(this segment contributed {len(_new_ent or [])}). Anchor selection indexes "
+                        f"this series against the response, so every anchor would be shifted."
+                    )
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
