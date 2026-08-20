@@ -134,6 +134,28 @@ def _hybrid_span_payload_enabled_safe() -> bool:
     except Exception:
         return False
 
+
+def _final_only_teacher_enabled_safe() -> bool:
+    """F mode: the final chunk is the ONLY chunk carrying supervision, and the ONLY one the hybrid
+    drain consumes (fully_async_trainer.py:620-638), so a whole-response rescan here is provably
+    discarded work (fully_async_rollouter.py:1609-1617 returns early once a chunk was emitted).
+
+    This is what makes OmniOPD streamable: its audit already runs once, on the final chunk, over the
+    cumulative response. Without this gate the rescan re-enters _agent_loop_postprocess with
+    chunk_is_final=None, whose only guard is `is False`, so the ENTIRE audit fires a second time --
+    M sequential teacher generations per trajectory, discarded. That is a 2x teacher cost on the
+    streaming arm alone, i.e. exactly the arm-asymmetric confound that has already invalidated a
+    result in this project.
+
+    Fail-closed like its sibling: if the gate cannot be read, keep the old additive behaviour.
+    """
+    try:
+        from verl.experimental.fully_async_policy.hybrid_assembler import final_only_teacher_enabled
+
+        return bool(final_only_teacher_enabled())
+    except Exception:
+        return False
+
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
@@ -676,7 +698,22 @@ class AgentLoopWorker:
             # Gated on span-payload mode: that is the configuration where the rescan's output is
             # PROVABLY discarded. Other modes keep the old behaviour rather than be changed untested.
             compute_final_teacher = True
-            if (stream_state is not None and _hybrid_span_payload_enabled_safe()
+            _final_only = _final_only_teacher_enabled_safe()
+            if stream_state is not None and not _force_additive_rescan() and _final_only:
+                # F mode ignores non-final chunks entirely, so coverage of the intermediate chunks is
+                # irrelevant -- the only precondition is that the final chunk actually published.
+                if stream_state.get("final_emitted"):
+                    compute_final_teacher = False
+                else:
+                    global _OPD_RESCAN_FALLBACKS
+                    _OPD_RESCAN_FALLBACKS += 1
+                    logger.warning(
+                        "[OPD_RESCAN_FALLBACK] sample_id=%s emitted=%d failures=%d "
+                        "reason=final_chunk_not_published total_fallbacks=%d",
+                        self._to_python_scalar(kwargs.get("xiaoshuai_sample_id")),
+                        stream_state["emitted"], stream_state["failures"], _OPD_RESCAN_FALLBACKS,
+                    )
+            elif (stream_state is not None and _hybrid_span_payload_enabled_safe()
                     and not _force_additive_rescan()):
                 _complete, _why = _streamed_coverage_complete(stream_state)
                 if _complete:
@@ -685,7 +722,8 @@ class AgentLoopWorker:
                     # Streamed labels are NOT provably complete (gap/overlap/failure/missing final):
                     # recover via whole-response scoring rather than train on a hole -- but never
                     # silently. This marker is what the run-validity invariant counts.
-                    global _OPD_RESCAN_FALLBACKS
+                    # (`global` is declared once for this function, in the F-mode branch above --
+                    # a second declaration here is a SyntaxError, not merely redundant.)
                     _OPD_RESCAN_FALLBACKS += 1
                     logger.warning(
                         "[OPD_RESCAN_FALLBACK] sample_id=%s emitted=%d failures=%d "
@@ -1030,6 +1068,16 @@ class AgentLoopWorker:
                     chunk_parent_payload = chunk_batch  # structural carrier (no big teacher tensors)
                 else:
                     chunk_parent_payload = None
+            elif (_final_only_teacher_enabled_safe() and not is_final
+                  and os.environ.get("OPD_HYBRID_FULL_SAMPLE", "0") not in ("0", "", "false", "False")):
+                # F mode: the drain skips non-final chunks outright (fully_async_trainer.py:624-625),
+                # so serialising a complete [1, P+R] DataProto for each is pure waste -- roughly
+                # response_length/chunk_tokens discarded payloads per trajectory, and all of it
+                # charged to the streaming arm, which is the arm under measurement. parent_payload
+                # None is already an exercised production state (see the span-payload branch above).
+                # Conjoined with OPD_HYBRID_FULL_SAMPLE so the legacy chunk-training path, which
+                # dereferences parent_payload.batch unconditionally, stays out of reach.
+                chunk_parent_payload = None
 
             chunk = ChunkSample(
                 sample_id=str(sample_id),

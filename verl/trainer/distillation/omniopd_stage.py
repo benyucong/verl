@@ -216,6 +216,13 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
     # picking the same chunk set in only 9 of 16 responses, so this trains on DIFFERENT spans -- it
     # is a declared variant with its own selector_hash, and an artifact that did not say so could be
     # read as published OmniOPD. Recorded per trajectory so the label travels with the data.
+    # Anchor INDICES appear in no other artifact -- the per-trajectory line below carries only the
+    # count and k_sem. Without them the central claim of the streaming arm ("the selector saw the
+    # whole finished response, so it picked what umem would have picked for that response") cannot
+    # be checked against anything. Default off: one line per trajectory carrying up to M indices.
+    if os.environ.get("OPD_OMNIOPD_DUMP_ANCHORS", "0") not in ("0", "", "false", "False"):
+        print("[OMNIOPD-ANCHORS] sid=%s T=%d anchors=%s" % (
+            session_id, len(response_ids), rec.get("omniopd_anchors")), flush=True)
     output.extra_fields["selector_hash"] = OMNIOPD_ONLINE_VARIANT.selector_hash()
     output.extra_fields["selector_variant"] = OMNIOPD_ONLINE_VARIANT.selector_variant
 
