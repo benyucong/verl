@@ -39,15 +39,18 @@ smaller number, and the objective cannot tell that apart from a teacher that dis
 
 import logging
 import os
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 try:  # as a package member
+    from .omniopd_speculation import seed_for_anchor
     from .omniopd_producer import assemble_omniopd_record, build_chunk_requests, select_anchors
     from .selector_spec import OMNIOPD_ONLINE_VARIANT
     from .token_entropy import to_signal_series
 except ImportError:  # or with the distillation dir on sys.path, which is how the tests import it
+    from omniopd_speculation import seed_for_anchor
     from omniopd_producer import assemble_omniopd_record, build_chunk_requests, select_anchors
     from selector_spec import OMNIOPD_ONLINE_VARIANT
     from token_entropy import to_signal_series
@@ -118,6 +121,7 @@ async def run_omniopd_audit(
     session_id: Optional[str] = None,
     routing_key: Optional[str] = None,
     seed: Optional[int] = None,
+    store=None,
 ) -> dict:
     """Audit one finished trajectory. Returns the two loss fields plus telemetry.
 
@@ -146,6 +150,7 @@ async def run_omniopd_audit(
     if len(response_ids) < C:
         return {"omniopd_anchors": [], "omniopd_k_sem": [], "omniopd_telemetry": {"skipped": "short_response"}}
 
+    t_eos = time.time()          # the audit begins the moment the response is complete
     signal = to_signal_series(entropies, prompt_len=len(prompt_ids))
     anchors = select_anchors(signal, len(prompt_ids), len(response_ids), M, C)
     if not anchors:
@@ -153,10 +158,37 @@ async def run_omniopd_audit(
 
     prefixes = build_chunk_requests(prompt_ids, response_ids, anchors)
 
+    # RECONCILIATION. `store` holds continuations launched speculatively at earlier chunk
+    # boundaries. Each committed anchor is taken from it when a proposal matched, and executed here
+    # when none did. The commit's selection above is untouched -- the store can only ever answer for
+    # an anchor this function already chose, which is why speculation cannot move the objective.
+    #
+    # THE LAST ANCHOR IS ALWAYS EXECUTED HERE, never reused. generate_chunk_continuations releases
+    # the sticky parent on is_final=True, and that release must happen exactly once per session; if
+    # every anchor were served from the store, no call would be issued and the parent would leak --
+    # the same class of defect as the stranding hang. Costing one anchor's overlap buys an
+    # accounting invariant that holds by construction rather than by bookkeeping.
+    last_i = len(prefixes) - 1
+
     continuations: list[list[str]] = []
     tele = {"teacher_gen_seconds": 0.0, "teacher_gen_tokens": 0, "teacher_prefix_tokens": 0,
             "teacher_cached_tokens": 0, "chunks": len(anchors)}
     for i, (t0, prefix) in enumerate(zip(anchors, prefixes, strict=True)):   # ascending: KV reuse
+        if store is not None and i != last_i:
+            taken = await store.take(int(t0))
+            if taken is not None:
+                seqs, t = taken
+                if len(seqs) != N:
+                    raise RuntimeError(
+                        f"OmniOPD audit: reused proposal for anchor {t0} carried {len(seqs)} "
+                        f"continuations, expected {N}."
+                    )
+                continuations.append([tokenizer.decode(x, skip_special_tokens=True) for x in seqs])
+                for k in ("teacher_gen_seconds", "teacher_gen_tokens", "teacher_prefix_tokens"):
+                    tele[k] += t.get(k) or 0
+                tele["teacher_cached_tokens"] += t.get("teacher_cached_tokens") or 0
+                continue
+            store.relaunched += 1
         # SEED KEYED ON ANCHOR POSITION, STRIDE N -- not on the chunk's rank i.
         #
         # Two things were wrong with `seed + i`. First, vLLM expands an n=N request into N children
@@ -174,7 +206,10 @@ async def run_omniopd_audit(
             max_tokens=C,
             routing_key=routing_key,
             session_id=session_id,
-            seed=None if seed is None else (seed + N * int(t0)) % (2**31),
+            # ONE definition, shared with the speculative launcher. If these two ever compute the
+            # seed differently a proposal stops being the same unit of work and silently never
+            # matches -- speculation would appear to run and hide nothing.
+            seed=seed_for_anchor(seed, int(t0), N),
             is_final=(i == len(prefixes) - 1),                 # releases this parent's sticky debt
         )
         if len(seqs) != N:
@@ -201,12 +236,16 @@ async def run_omniopd_audit(
     if tele["teacher_prefix_tokens"]:
         tele["cached_token_ratio_unreliable"] = (
             tele["teacher_cached_tokens"] / tele["teacher_prefix_tokens"])
+    if store is not None:
+        await store.drain_unused()
+        tele.update(store.telemetry(t_eos=t_eos))
     record["omniopd_telemetry"] = tele
     return record
 
 
 async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_manager, tokenizer,
-                               omniopd_config, session_id=None, routing_key=None, seed=None) -> None:
+                               omniopd_config, session_id=None, routing_key=None, seed=None,
+                               store=None) -> None:
     """Run the audit and hang it on the agent-loop output.
 
     Everything in AgentLoopOutput.extra_fields becomes a non_tensor_batch column (agent_loop.py
@@ -223,6 +262,7 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
         session_id=session_id,
         routing_key=routing_key,
         seed=seed,
+        store=store,
     )
     output.extra_fields["omniopd_anchors"] = rec["omniopd_anchors"]
     output.extra_fields["omniopd_k_sem"] = rec["omniopd_k_sem"]

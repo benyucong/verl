@@ -46,6 +46,9 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.trainer.distillation.omniopd_producer import build_chunk_requests
+from verl.trainer.distillation.omniopd_speculation import (SpeculativeStore, propose_anchors,
+                                                           seed_for_anchor, speculation_enabled)
 from verl.trainer.distillation.omniopd_stage import (attach_omniopd_audit, omniopd_enabled,
                                                       resolve_omniopd_config)
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -133,6 +136,19 @@ def _hybrid_span_payload_enabled_safe() -> bool:
         return bool(hybrid_span_payload_enabled())
     except Exception:
         return False
+
+
+def _omniopd_base_seed(session_id):
+    """The trajectory's base seed. ONE definition, shared by the speculative launcher and the
+    commit -- if they disagree, every proposal is a different unit of work and silently never
+    matches, so speculation would run, cost teacher decode, and hide nothing.
+
+    A sha256 digest rather than hash(): Python's str hash is PYTHONHASHSEED-salted, so the base seed
+    differed between two runs of an identical config unless that variable happened to be pinned.
+    """
+    if session_id is None:
+        return None
+    return int.from_bytes(hashlib.sha256(str(session_id).encode()).digest()[:4], "little") % (2**31)
 
 
 def _final_only_teacher_enabled_safe() -> bool:
@@ -1445,6 +1461,59 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
+    def _omniopd_store(self, session_id, base_seed, om):
+        """One store per trajectory, created on first use and handed to the commit."""
+        if not hasattr(self, "_omniopd_spec_stores"):
+            self._omniopd_spec_stores = {}
+        key = str(session_id)
+        st = self._omniopd_spec_stores.get(key)
+        if st is None:
+            st = SpeculativeStore(base_seed, int(om.N), int(om.C))
+            self._omniopd_spec_stores[key] = st
+        return st
+
+    async def _omniopd_speculate(self, output, *, sample_kwargs=None) -> None:
+        """Propose anchors from the entropy prefix and launch their teacher work early.
+
+        Writes nothing to output. The commit on the final chunk selects from the COMPLETE series,
+        exactly as it always has, and consults the store only for anchors it has already chosen.
+        """
+        ents = output.extra_fields.get("token_entropies")
+        resp = output.response_ids
+        if not ents or not resp or len(ents) != len(resp):
+            return                                   # nothing to propose from; commit is unaffected
+        om = resolve_omniopd_config(self.config)
+        routing_key = session_id = None
+        if sample_kwargs is not None:
+            rv = sample_kwargs.get(self.teacher_key)
+            if rv is not None:
+                routing_key = rv.item() if hasattr(rv, "item") else rv
+            sid = sample_kwargs.get("xiaoshuai_sample_id")
+            if sid is not None:
+                session_id = sid.item() if hasattr(sid, "item") else sid
+        if session_id is None:
+            return
+        base_seed = _omniopd_base_seed(session_id)
+        store = self._omniopd_store(session_id, base_seed, om)
+
+        margin = float(os.environ.get("OPD_OMNIOPD_SPEC_MARGIN", "0") or 0.0)
+        proposed = propose_anchors(ents, len(output.prompt_ids), len(resp),
+                                   int(om.M), int(om.C), margin=margin)
+        fresh = store.pending(proposed)
+        if not fresh:
+            return
+        prefixes = build_chunk_requests(output.prompt_ids, resp, fresh)
+        for t0, prefix in zip(fresh, prefixes, strict=True):
+            def _factory(_p=prefix, _t=int(t0)):
+                # is_final is ALWAYS False here. The sticky-parent release belongs to the commit's
+                # last call, which is why the commit never reuses its final anchor.
+                return self.teacher_server_manager.generate_chunk_continuations(
+                    prefix_ids=_p, n=int(om.N), max_tokens=int(om.C),
+                    routing_key=routing_key, session_id=session_id,
+                    seed=seed_for_anchor(base_seed, _t, int(om.N)), is_final=False,
+                )
+            store.launch(int(t0), _factory)
+
     async def _compute_omniopd_audit(
         self,
         output: AgentLoopOutput,
@@ -1468,6 +1537,17 @@ class AgentLoopWorker:
         if not (self.distillation_enabled and not validate):
             return
         if chunk_is_final is False:
+            # NON-FINAL CHUNK. Never the audit -- this path writes no supervision at all. It only
+            # proposes anchors from the entropy prefix and launches teacher work for them, so that
+            # by the time the commit runs the answer may already exist. Off by default.
+            if speculation_enabled():
+                try:
+                    await self._omniopd_speculate(output, sample_kwargs=sample_kwargs)
+                except Exception:
+                    # Speculation is an optimisation. A failure here must never cost the trajectory
+                    # its audit, which still runs in full on the final chunk.
+                    logger.warning("[OMNIOPD-SPEC] proposal pass failed; commit is unaffected",
+                                   exc_info=True)
             return
         routing_key = session_id = None
         if sample_kwargs is not None:
@@ -1479,6 +1559,9 @@ class AgentLoopWorker:
             sid = sample_kwargs.get("xiaoshuai_sample_id")
             if sid is not None:
                 session_id = sid.item() if hasattr(sid, "item") else sid
+        _store = None
+        if speculation_enabled() and session_id is not None:
+            _store = getattr(self, "_omniopd_spec_stores", {}).pop(str(session_id), None)
         await attach_omniopd_audit(
             output,
             prompt_ids=prompt_ids,
@@ -1488,16 +1571,8 @@ class AgentLoopWorker:
             omniopd_config=resolve_omniopd_config(self.config),
             session_id=session_id,
             routing_key=routing_key,
-            # STABLE DIGEST, not hash(). Python's str hash is PYTHONHASHSEED-salted, so the base
-            # seed -- and therefore every teacher draw -- differed between two runs of the identical
-            # config unless PYTHONHASHSEED happened to be pinned. That makes the sampling
-            # irreproducible across runs by default, and leaves no fixed reference for any claim
-            # about reusing a previously computed continuation.
-            seed=(
-                int.from_bytes(hashlib.sha256(str(session_id).encode()).digest()[:4], "little")
-                % (2**31)
-                if session_id is not None else None
-            ),
+            store=_store,
+            seed=_omniopd_base_seed(session_id),
         )
 
     async def _compute_teacher_logprobs(
