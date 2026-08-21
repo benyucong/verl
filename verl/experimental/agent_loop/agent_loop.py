@@ -1488,7 +1488,16 @@ class AgentLoopWorker:
             omniopd_config=resolve_omniopd_config(self.config),
             session_id=session_id,
             routing_key=routing_key,
-            seed=abs(hash((session_id, "omniopd"))) % (2**31) if session_id is not None else None,
+            # STABLE DIGEST, not hash(). Python's str hash is PYTHONHASHSEED-salted, so the base
+            # seed -- and therefore every teacher draw -- differed between two runs of the identical
+            # config unless PYTHONHASHSEED happened to be pinned. That makes the sampling
+            # irreproducible across runs by default, and leaves no fixed reference for any claim
+            # about reusing a previously computed continuation.
+            seed=(
+                int.from_bytes(hashlib.sha256(str(session_id).encode()).digest()[:4], "little")
+                % (2**31)
+                if session_id is not None else None
+            ),
         )
 
     async def _compute_teacher_logprobs(

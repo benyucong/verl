@@ -156,14 +156,25 @@ async def run_omniopd_audit(
     continuations: list[list[str]] = []
     tele = {"teacher_gen_seconds": 0.0, "teacher_gen_tokens": 0, "teacher_prefix_tokens": 0,
             "teacher_cached_tokens": 0, "chunks": len(anchors)}
-    for i, prefix in enumerate(prefixes):                      # ascending: chunk k+1 reuses chunk k's KV
+    for i, (t0, prefix) in enumerate(zip(anchors, prefixes, strict=True)):   # ascending: KV reuse
+        # SEED KEYED ON ANCHOR POSITION, STRIDE N -- not on the chunk's rank i.
+        #
+        # Two things were wrong with `seed + i`. First, vLLM expands an n=N request into N children
+        # with seeds parent+0..parent+N-1, so consecutive chunks one apart in seed OVERLAP: chunk i's
+        # child j and chunk i+1's child j-1 draw the same stream. At M=N=10 that makes the per-chunk
+        # k_sem estimates correlated when the objective assumes N independent samples -- a live
+        # defect, independent of anything speculative. Stride N removes the overlap.
+        #
+        # Second, i is the anchor's RANK in the committed set, which is unknowable before the set
+        # exists. Keying on the position t0 makes the request a pure function of the anchor, which is
+        # what would let work launched early be reused by the commit rather than recomputed.
         seqs, t = await teacher_manager.generate_chunk_continuations(
             prefix_ids=prefix,
             n=N,
             max_tokens=C,
             routing_key=routing_key,
             session_id=session_id,
-            seed=None if seed is None else seed + i,
+            seed=None if seed is None else (seed + N * int(t0)) % (2**31),
             is_final=(i == len(prefixes) - 1),                 # releases this parent's sticky debt
         )
         if len(seqs) != N:
@@ -180,11 +191,16 @@ async def run_omniopd_audit(
     record = assemble_omniopd_record(
         prompt_ids, response_ids, anchors, continuations, tokenizer, N=N, C=C, phi_name=phi_name
     )
-    # The cache-hit fraction is the whole reason the calls are ordered rather than concurrent, so it
-    # is recorded per trajectory: if it collapses, sticky routing has broken and the audit silently
-    # costs several times what it should.
+    # DOES NOT MEASURE ORDERING, despite what the previous comment here claimed. num_cached_tokens
+    # is reported per REQUEST while an n=N request expands into N children sharing one prefix, so the
+    # ratio is dominated by intra-request sharing and sits at 0.97-0.98 whatever order the calls go
+    # out in (FID-11 measured the probe reporting 1488 cached where 992 were physically read). It
+    # therefore cannot support the claim it was being used for -- that sequential issue is what earns
+    # the KV reuse -- and I reported it several times as if it could. Renamed so nothing reads it as
+    # evidence of ordering; a real ordering metric has to count physical uncached prefill.
     if tele["teacher_prefix_tokens"]:
-        tele["prefix_cache_frac"] = tele["teacher_cached_tokens"] / tele["teacher_prefix_tokens"]
+        tele["cached_token_ratio_unreliable"] = (
+            tele["teacher_cached_tokens"] / tele["teacher_prefix_tokens"])
     record["omniopd_telemetry"] = tele
     return record
 
@@ -234,7 +250,7 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
     if os.environ.get("OPD_OMNIOPD_QUIET", "0") in ("0", "", "false", "False"):
         t = rec.get("omniopd_telemetry") or {}
         ks = rec.get("omniopd_k_sem") or []
-        pf = t.get("prefix_cache_frac")
+        pf = t.get("cached_token_ratio_unreliable")
         logger.info(
             "[OMNIOPD] sid=%s chunks=%d k_sem[min=%.3f mean=%.3f max=%.3f] cache=%s gen_tok=%s "
             "gen_s=%.2f variant=%s",
