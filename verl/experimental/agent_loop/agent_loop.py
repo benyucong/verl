@@ -1034,6 +1034,23 @@ class AgentLoopWorker:
                 chunk_is_final=is_final,
                 **sample_kwargs,
             )
+            # F MODE: A NON-FINAL CHUNK HAS NOTHING TO DELIVER. The drain skips it outright
+            # (fully_async_trainer: `if not chunk.is_final: continue`), so everything below is
+            # computed and then discarded -- and it is not cheap. _postprocess pads the CUMULATIVE
+            # response into a full DataProto, CPU-bound, ON THE ASYNCIO EVENT LOOP that is also
+            # dispatching generation; and the ChunkSample then occupies one slot of a queue bounded
+            # at 16.
+            #
+            # Measured cost of not skipping (jobs 44900600/601, q128, c512, ~1290-token responses,
+            # so ~3 chunks/trajectory): queue depth p95 14/16 against umem's 0.2, rollouter idle
+            # 6-7% against umem's 0.0, and timing_s/gen 8.79 -> 11.74 s for identical work -- the
+            # whole of the arm's -20.1%.
+            #
+            # _agent_loop_postprocess above still runs, so the speculative proposal pass still sees
+            # every chunk boundary. That is the part that has value; this part had none.
+            if _final_only and not is_final:
+                return True
+
             chunk_batch = self._postprocess(
                 [internal],
                 input_non_tensor_batch=self._single_item_non_tensor_batch(sample_kwargs),
