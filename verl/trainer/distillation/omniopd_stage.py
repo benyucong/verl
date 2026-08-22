@@ -292,7 +292,7 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
         ks = rec.get("omniopd_k_sem") or []
         pf = t.get("cached_token_ratio_unreliable")
         logger.info(
-            "[OMNIOPD] sid=%s chunks=%d k_sem[min=%.3f mean=%.3f max=%.3f] cache=%s gen_tok=%s "
+            "[OMNIOPD] sid=%s chunks=%d k_sem[min=%.3f mean=%.3f max=%.3f] cachratio=%s gen_tok=%s "
             "gen_s=%.2f variant=%s",
             session_id, len(rec.get("omniopd_anchors") or []),
             min(ks) if ks else float("nan"),
@@ -303,11 +303,18 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
             OMNIOPD_ONLINE_VARIANT.selector_variant,
         )
         print(
-            "[OMNIOPD] sid=%s chunks=%d k_sem_mean=%s cache=%s gen_tok=%s gen_s=%.2f skipped=%s"
+            # spec=... is UNCONDITIONAL. Without it there is no way to tell from a log whether
+            # speculation was actually applied: the controller writes its counters into
+            # non_tensor_batch, which nothing prints, and its only stdout line fires on FAILURE.
+            # A speculation A/B whose treatment cannot be verified is an A/A, and job 44900605 was
+            # exactly that -- the manifest said speculate=1 and the log could not confirm it.
+            "[OMNIOPD] sid=%s chunks=%d k_sem_mean=%s cachratio=%s gen_tok=%s gen_s=%.2f "
+            "spec=%s/%s skipped=%s"
             % (session_id, len(rec.get("omniopd_anchors") or []),
                ("%.3f" % (sum(ks) / len(ks))) if ks else "n/a",
                ("%.3f" % pf) if pf is not None else "n/a",
                t.get("teacher_gen_tokens"), t.get("teacher_gen_seconds") or 0.0,
+               t.get("spec_reused", "off"), t.get("spec_launched", "off"),
                t.get("skipped", "-")),
             flush=True,
         )
@@ -376,7 +383,7 @@ def aggregate_omniopd_telemetry(records: list) -> dict:
     cach = sum(t.get("teacher_cached_tokens") or 0 for t in tels)
     out["omniopd/teacher_prefix_tokens"] = pref
     out["omniopd/teacher_cached_tokens"] = cach
-    out["omniopd/prefix_cache_frac"] = (cach / pref) if pref else 0.0
+    out["omniopd/cached_token_ratio_unreliable"] = (cach / pref) if pref else 0.0
     out["omniopd/teacher_gen_tokens"] = sum(t.get("teacher_gen_tokens") or 0 for t in tels)
     out["omniopd/teacher_gen_seconds"] = sum(t.get("teacher_gen_seconds") or 0.0 for t in tels)
 

@@ -1541,6 +1541,9 @@ class AgentLoopWorker:
             # proposes anchors from the entropy prefix and launches teacher work for them, so that
             # by the time the commit runs the answer may already exist. Off by default.
             if speculation_enabled():
+                if not getattr(self, "_omniopd_spec_announced", False):
+                    self._omniopd_spec_announced = True
+                    print("[OMNIOPD-SPEC] speculative early teacher launch ENABLED", flush=True)
                 try:
                     await self._omniopd_speculate(output, sample_kwargs=sample_kwargs)
                 except Exception:
