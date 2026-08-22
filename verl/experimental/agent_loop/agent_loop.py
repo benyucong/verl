@@ -1262,6 +1262,27 @@ class AgentLoopWorker:
         )
         if compute_score:
             await self._compute_score([output], kwargs=kwargs)
+        # SPECULATION RUNS OUTSIDE compute_teacher_logprobs, and must.
+        #
+        # It targets NON-FINAL chunks, and in F mode -- the only mode omniopd streams in --
+        # compute_teacher_logprobs is False for exactly those chunks (see the call site: it passes
+        # `is_final or not _final_only`). Gating speculation behind that flag therefore meant it
+        # could never fire on any chunk it was written for: the controller was live, the manifest
+        # said speculate=1, and 96/96 trajectories reported spec=off/off. The first speculation A/B
+        # was an A/A and its +1.3% measured nothing.
+        if (self._omniopd_enabled and speculation_enabled() and chunk_is_final is False
+                and self.distillation_enabled and not validate):
+            if not getattr(self, "_omniopd_spec_announced", False):
+                self._omniopd_spec_announced = True
+                print("[OMNIOPD-SPEC] speculative early teacher launch ENABLED", flush=True)
+            try:
+                await self._omniopd_speculate(output, sample_kwargs=kwargs)
+            except Exception:
+                # An optimisation must never cost the trajectory its audit, which still runs in
+                # full on the final chunk.
+                logger.warning("[OMNIOPD-SPEC] proposal pass failed; commit is unaffected",
+                               exc_info=True)
+
         if compute_teacher_logprobs:
             # OmniOPD replaces teacher SCORING with a teacher AUDIT: its objective reads k_sem and an
             # exact KL against the frozen initial policy, and never a teacher logprob. Running both
@@ -1537,20 +1558,9 @@ class AgentLoopWorker:
         if not (self.distillation_enabled and not validate):
             return
         if chunk_is_final is False:
-            # NON-FINAL CHUNK. Never the audit -- this path writes no supervision at all. It only
-            # proposes anchors from the entropy prefix and launches teacher work for them, so that
-            # by the time the commit runs the answer may already exist. Off by default.
-            if speculation_enabled():
-                if not getattr(self, "_omniopd_spec_announced", False):
-                    self._omniopd_spec_announced = True
-                    print("[OMNIOPD-SPEC] speculative early teacher launch ENABLED", flush=True)
-                try:
-                    await self._omniopd_speculate(output, sample_kwargs=sample_kwargs)
-                except Exception:
-                    # Speculation is an optimisation. A failure here must never cost the trajectory
-                    # its audit, which still runs in full on the final chunk.
-                    logger.warning("[OMNIOPD-SPEC] proposal pass failed; commit is unaffected",
-                                   exc_info=True)
+            # Never the audit on a non-final chunk. Speculation is driven from
+            # _agent_loop_postprocess instead, because it must run on chunks whose
+            # compute_teacher_logprobs is False -- which is all of them in F mode.
             return
         routing_key = session_id = None
         if sample_kwargs is not None:
