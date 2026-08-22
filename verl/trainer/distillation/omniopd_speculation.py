@@ -95,6 +95,31 @@ def propose_anchors(entropies, prompt_len: int, resp_len: int, M: int, C: int,
     return [t for t in anchors if float(entropies[t]) >= cutoff]
 
 
+_SPEC_SEM: dict = {}
+
+
+def _spec_semaphore():
+    """Bound in-flight SPECULATIVE teacher requests, per event loop.
+
+    Without this a proposal is fired the instant a chunk closes, for every trajectory in flight. At
+    staleness=1 the in-flight budget is ppo_mini x (staleness+1) x sync = 32 trajectories, each
+    proposing up to M=10 anchors -- up to ~320 concurrent teacher requests against an engine that
+    admits max_num_seqs/N ~= 12 at a time. The proposals do not merely wait: they occupy the very
+    admission slots the COMMITS need, and a commit is what training is blocked on. Speculation then
+    makes the critical path longer, which is the -25.4% measured at q128 (job 44912520).
+
+    Speculation is only ever worth spare capacity, so it takes a small fixed budget and commits are
+    never gated. Default deliberately well under the engine's concurrent-request ceiling.
+    """
+    loop = asyncio.get_event_loop()
+    sem = _SPEC_SEM.get(loop)
+    if sem is None:
+        n = int(os.environ.get("OPD_OMNIOPD_SPEC_MAX_INFLIGHT", "4") or 4)
+        sem = asyncio.Semaphore(max(1, n))
+        _SPEC_SEM[loop] = sem
+    return sem
+
+
 class SpeculativeStore:
     """Per-trajectory record of launched proposals. Not shared across trajectories."""
 
@@ -115,7 +140,14 @@ class SpeculativeStore:
         """Start one proposal. Never awaited here -- that is the entire point."""
         if anchor in self.tasks:
             return
-        self.tasks[anchor] = asyncio.ensure_future(coro_factory())
+
+        async def _gated():
+            # The slot is held only for the request itself. A proposal that cannot get one waits
+            # rather than queueing inside the engine, which is what keeps commit latency flat.
+            async with _spec_semaphore():
+                return await coro_factory()
+
+        self.tasks[anchor] = asyncio.ensure_future(_gated())
         now = time.time()
         self.launched_at[anchor] = now
         self.launch_calls += 1
