@@ -1557,7 +1557,12 @@ class AgentLoopWorker:
                     routing_key=routing_key, session_id=session_id,
                     seed=seed_for_anchor(base_seed, _t, int(om.N)), is_final=False,
                 )
-            store.launch(int(t0), _factory)
+            # Same identity the commit will recompute. Built here from the same inputs the task
+            # will use, so the two agree by construction rather than by coincidence.
+            _k = SpeculativeStore.request_key(
+                _prompt + _resp[: int(t0)], int(om.N), int(om.C),
+                seed_for_anchor(base_seed, int(t0), int(om.N)))
+            store.launch(int(t0), _factory, key=_k)
 
     async def _compute_omniopd_audit(
         self,

@@ -175,7 +175,10 @@ async def run_omniopd_audit(
             "teacher_cached_tokens": 0, "chunks": len(anchors)}
     for i, (t0, prefix) in enumerate(zip(anchors, prefixes, strict=True)):   # ascending: KV reuse
         if store is not None and i != last_i:
-            taken = await store.take(int(t0))
+            # The commit states the identity it expects. take() refuses a stored result whose
+            # request differs, so a reuse can never quietly substitute a different sample.
+            _expect = store.request_key(prefix, N, C, seed_for_anchor(seed, int(t0), N))
+            taken = await store.take(int(t0), expect_key=_expect)
             if taken is not None:
                 seqs, t = taken
                 if len(seqs) != N:
@@ -309,12 +312,13 @@ async def attach_omniopd_audit(output, *, prompt_ids, response_ids, teacher_mana
             # A speculation A/B whose treatment cannot be verified is an A/A, and job 44900605 was
             # exactly that -- the manifest said speculate=1 and the log could not confirm it.
             "[OMNIOPD] sid=%s chunks=%d k_sem_mean=%s cachratio=%s gen_tok=%s gen_s=%.2f "
-            "spec=%s/%s skipped=%s"
+            "spec=%s/%s mism=%s skipped=%s"
             % (session_id, len(rec.get("omniopd_anchors") or []),
                ("%.3f" % (sum(ks) / len(ks))) if ks else "n/a",
                ("%.3f" % pf) if pf is not None else "n/a",
                t.get("teacher_gen_tokens"), t.get("teacher_gen_seconds") or 0.0,
                t.get("spec_reused", "off"), t.get("spec_launched", "off"),
+               t.get("spec_key_mismatch", 0),
                t.get("skipped", "-")),
             flush=True,
         )

@@ -44,7 +44,9 @@ result is dropped. Cancellation is a much larger piece of machinery (see specula
 and it is only worth building once the waste is measured and shown to matter.
 """
 
+import array
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -143,7 +145,9 @@ class SpeculativeStore:
     def __init__(self, base_seed: Optional[int], N: int, C: int):
         self.base_seed, self.N, self.C = base_seed, N, C
         self.tasks: dict[int, asyncio.Task] = {}       # anchor -> in-flight/finished launch
+        self.keys: dict[int, str] = {}                # anchor -> request identity at launch
         self.launched_at: dict[int, float] = {}
+        self.key_mismatch = 0
         self.t_first_launch: Optional[float] = None
         self.reused = 0
         self.relaunched = 0
@@ -153,7 +157,23 @@ class SpeculativeStore:
     def pending(self, anchors) -> list[int]:
         return [t for t in anchors if t not in self.tasks]
 
-    def launch(self, anchor: int, coro_factory) -> None:
+    @staticmethod
+    def request_key(prefix_ids, n: int, max_tokens: int, seed) -> str:
+        """Identity of one unit of teacher work.
+
+        Reuse is only fidelity-preserving if the stored result answers the SAME request the commit
+        would have issued. Matching on anchor position alone assumes that, and the assumption is
+        load-bearing: a prefix or seed that differed would substitute a different sample into k_sem
+        with nothing raising. Hashed rather than compared element-wise because the prefix is up to
+        a few thousand ids and this runs per anchor.
+        """
+        h = hashlib.sha256()
+        h.update(str(len(prefix_ids)).encode())
+        h.update(memoryview(array.array("l", prefix_ids)).cast("B"))
+        h.update(b"|%d|%d|%s" % (int(n), int(max_tokens), str(seed).encode()))
+        return h.hexdigest()[:16]
+
+    def launch(self, anchor: int, coro_factory, key: Optional[str] = None) -> None:
         """Start one proposal. Never awaited here -- that is the entire point.
 
         ensure_future makes the teacher CALL concurrent, but it does not move any of this off the
@@ -171,13 +191,15 @@ class SpeculativeStore:
                 return await coro_factory()
 
         self.tasks[anchor] = asyncio.ensure_future(_gated())
+        if key is not None:
+            self.keys[anchor] = key
         now = time.time()
         self.launched_at[anchor] = now
         self.launch_calls += 1
         if self.t_first_launch is None:
             self.t_first_launch = now
 
-    async def take(self, anchor: int):
+    async def take(self, anchor: int, expect_key: Optional[str] = None):
         """The committed set is asking for this anchor. Returns (seqs, telemetry) or None.
 
         Awaits a proposal that is still in flight rather than abandoning it: the work is already
@@ -186,6 +208,19 @@ class SpeculativeStore:
         """
         task = self.tasks.pop(anchor, None)
         if task is None:
+            return None
+        launched_key = self.keys.pop(anchor, None)
+        if expect_key is not None and launched_key is not None and launched_key != expect_key:
+            # NOT reusable. The stored result answers a different request than the commit is
+            # asking for, so using it would substitute a different sample into k_sem silently.
+            # Drop it and let the caller run the anchor fresh; the wasted work is already spent.
+            self.key_mismatch += 1
+            logger.warning("[OMNIOPD-SPEC] anchor %d key mismatch (launched %s, commit %s); "
+                           "relaunching rather than reusing", anchor, launched_key, expect_key)
+            try:
+                await task
+            except Exception:
+                pass
             return None
         try:
             seqs, tele = await task
@@ -216,6 +251,7 @@ class SpeculativeStore:
             "spec_reused": self.reused,
             "spec_relaunched": self.relaunched,
             "spec_wasted": self.wasted,
+            "spec_key_mismatch": self.key_mismatch,
         }
         committed = self.reused + self.relaunched
         out["spec_hit_rate"] = (self.reused / committed) if committed else 0.0
