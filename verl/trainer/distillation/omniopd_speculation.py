@@ -115,6 +115,38 @@ def propose_anchors(entropies, prompt_len: int, resp_len: int, M: int, C: int,
 
 
 _SPEC_SEM: dict = {}
+_SPEC_LOOP: dict = {}
+
+
+def _dispatch_loop():
+    """A dedicated event loop, on its own thread, for speculative teacher RPCs.
+
+    THIS IS THE CEILING ON THE WHOLE MECHANISM. Perfect overlap of a 22.5 s audit behind a 15.4 s
+    generation would be +68%; we measure +5.2%, and the gap is that only 4 of 10 anchors can be
+    speculated. Not because the teacher cannot take them -- because each proposal's RPC and its
+    completion callback are serviced on the SAME loop that drains the token stream, so proposal
+    count trades directly against generation speed. That is why top_k=4 beats top_k=0 (parity) and
+    top_k=2 is worse than both: it is an optimum of a tradeoff that should not exist.
+
+    Moving dispatch to its own loop breaks the coupling. The generation thread does not wait on it,
+    and RPC completions no longer interleave with token processing, so top_k can go to M.
+
+    Off by default. Enabled with OPD_OMNIOPD_SPEC_THREAD=1.
+    """
+    import threading
+    key = "dispatch"
+    ent = _SPEC_LOOP.get(key)
+    if ent is not None:
+        return ent
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_forever, name="omniopd-spec", daemon=True)
+    t.start()
+    _SPEC_LOOP[key] = (loop, t)
+    return _SPEC_LOOP[key]
+
+
+def dispatch_thread_enabled() -> bool:
+    return os.environ.get("OPD_OMNIOPD_SPEC_THREAD", "0") not in ("0", "", "false", "False")
 
 
 def _spec_semaphore():
@@ -131,7 +163,7 @@ def _spec_semaphore():
     never gated. Default deliberately well under the engine's concurrent-request ceiling.
     """
     loop = asyncio.get_event_loop()
-    sem = _SPEC_SEM.get(loop)
+    sem = _SPEC_SEM.get(loop)   # per-loop: the dispatch loop gets its own budget
     if sem is None:
         n = int(os.environ.get("OPD_OMNIOPD_SPEC_MAX_INFLIGHT", "4") or 4)
         sem = asyncio.Semaphore(max(1, n))
@@ -190,7 +222,14 @@ class SpeculativeStore:
             async with _spec_semaphore():
                 return await coro_factory()
 
-        self.tasks[anchor] = asyncio.ensure_future(_gated())
+        if dispatch_thread_enabled():
+            # Runs on the dispatch loop; the generation thread only hands over a coroutine. The
+            # returned future is bound to THIS loop so the commit can await it normally.
+            loop, _ = _dispatch_loop()
+            cfut = asyncio.run_coroutine_threadsafe(_gated(), loop)
+            self.tasks[anchor] = asyncio.wrap_future(cfut)
+        else:
+            self.tasks[anchor] = asyncio.ensure_future(_gated())
         if key is not None:
             self.keys[anchor] = key
         now = time.time()
