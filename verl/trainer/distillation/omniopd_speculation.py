@@ -74,8 +74,19 @@ def seed_for_anchor(base_seed: Optional[int], anchor: int, N: int) -> Optional[i
     return (int(base_seed) + int(N) * int(anchor)) % (2**31)
 
 
+def spec_top_k() -> int:
+    """How many anchors to speculate on per trajectory. 0 = all M.
+
+    Every proposal costs a teacher RPC whose completion callback lands on the generation event
+    loop, so the RPC count -- not the GPU work -- is what competes with token streaming. Speculating
+    on the highest-entropy few keeps most of the hideable work while cutting that traffic
+    proportionally.
+    """
+    return int(os.environ.get("OPD_OMNIOPD_SPEC_TOP_K", "0") or 0)
+
+
 def propose_anchors(entropies, prompt_len: int, resp_len: int, M: int, C: int,
-                    margin: float = 0.0) -> list[int]:
+                    margin: float = 0.0, top_k: int = 0) -> list[int]:
     """Anchors the commit would pick if the response ended here, optionally thinned by a margin.
 
     Same selection rule as the commit (select_anchors over the signal series), applied to the
@@ -88,11 +99,17 @@ def propose_anchors(entropies, prompt_len: int, resp_len: int, M: int, C: int,
         return []
     signal = to_signal_series(list(entropies)[:resp_len], prompt_len=prompt_len)
     anchors = select_anchors(signal, prompt_len, resp_len, M, C)
-    if margin <= 0.0 or not anchors:
+    if not anchors:
         return anchors
-    scores = sorted((float(entropies[t]) for t in anchors), reverse=True)
-    cutoff = scores[-1] + margin
-    return [t for t in anchors if float(entropies[t]) >= cutoff]
+    if margin > 0.0:
+        scores = sorted((float(entropies[t]) for t in anchors), reverse=True)
+        cutoff = scores[-1] + margin
+        anchors = [t for t in anchors if float(entropies[t]) >= cutoff]
+    if top_k and len(anchors) > top_k:
+        # keep the highest-entropy top_k, in ascending position order (prefix nesting)
+        keep = sorted(anchors, key=lambda t: float(entropies[t]), reverse=True)[:top_k]
+        anchors = sorted(keep)
+    return anchors
 
 
 _SPEC_SEM: dict = {}
@@ -137,13 +154,19 @@ class SpeculativeStore:
         return [t for t in anchors if t not in self.tasks]
 
     def launch(self, anchor: int, coro_factory) -> None:
-        """Start one proposal. Never awaited here -- that is the entire point."""
+        """Start one proposal. Never awaited here -- that is the entire point.
+
+        ensure_future makes the teacher CALL concurrent, but it does not move any of this off the
+        event loop that is also draining the generation stream. Everything the factory does before
+        its first await -- notably materialising the prefix -- runs synchronously on that loop, so
+        the factory is written to do its work INSIDE the coroutine, after the first yield point,
+        rather than in the caller.
+        """
         if anchor in self.tasks:
             return
 
         async def _gated():
-            # The slot is held only for the request itself. A proposal that cannot get one waits
-            # rather than queueing inside the engine, which is what keeps commit latency flat.
+            await asyncio.sleep(0)          # yield first: let the generation stream advance
             async with _spec_semaphore():
                 return await coro_factory()
 

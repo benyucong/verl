@@ -48,7 +48,8 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from verl.trainer.distillation.omniopd_producer import build_chunk_requests
 from verl.trainer.distillation.omniopd_speculation import (SpeculativeStore, propose_anchors,
-                                                           seed_for_anchor, speculation_enabled)
+                                                           seed_for_anchor, spec_top_k,
+                                                           speculation_enabled)
 from verl.trainer.distillation.omniopd_stage import (attach_omniopd_audit, omniopd_enabled,
                                                       resolve_omniopd_config)
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -1536,13 +1537,19 @@ class AgentLoopWorker:
 
         margin = float(os.environ.get("OPD_OMNIOPD_SPEC_MARGIN", "0") or 0.0)
         proposed = propose_anchors(ents, len(output.prompt_ids), len(resp),
-                                   int(om.M), int(om.C), margin=margin)
+                                   int(om.M), int(om.C), margin=margin, top_k=spec_top_k())
         fresh = store.pending(proposed)
         if not fresh:
             return
-        prefixes = build_chunk_requests(output.prompt_ids, resp, fresh)
-        for t0, prefix in zip(fresh, prefixes, strict=True):
-            def _factory(_p=prefix, _t=int(t0)):
+        # PREFIXES ARE BUILT INSIDE THE TASK, not here. build_chunk_requests materialises
+        # prompt + response[:anchor] per anchor -- ~10 x ~1300 element copies per chunk boundary --
+        # and doing that in this coroutine is a synchronous burst on the very event loop that is
+        # draining the generation stream. Deferring it spreads the copying across the scheduler
+        # instead of stalling token processing at every boundary.
+        _prompt, _resp = list(output.prompt_ids), list(resp)
+        for t0 in fresh:
+            def _factory(_t=int(t0)):
+                _p = _prompt + _resp[:_t]
                 # is_final is ALWAYS False here. The sticky-parent release belongs to the commit's
                 # last call, which is why the commit never reuses its final anchor.
                 return self.teacher_server_manager.generate_chunk_continuations(
