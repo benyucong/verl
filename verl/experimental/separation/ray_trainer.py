@@ -599,6 +599,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             response_lengths=lengths,
             max_response_len=int(resp_mask.shape[1]),
             min_survivors=int(sc.min_survivors),
+            M=int(sc.M),   # known; the noise floor must not have to guess it
         )
         batch.batch["state_credit_weights"] = _torch.as_tensor(
             W, dtype=_torch.float32, device=resp_mask.device)
