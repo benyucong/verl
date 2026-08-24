@@ -52,6 +52,9 @@ from verl.trainer.distillation.omniopd_speculation import (SpeculativeStore, pro
                                                            speculation_enabled)
 from verl.trainer.distillation.omniopd_stage import (attach_omniopd_audit, omniopd_enabled,
                                                       resolve_omniopd_config)
+from verl.trainer.distillation.state_credit_stage import (attach_state_credit,
+                                                          resolve_state_credit_config,
+                                                          state_credit_enabled)
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -488,6 +491,7 @@ class AgentLoopWorker:
     ):
         self.config = config
         self._omniopd_enabled = False   # set once distillation resolves; see below
+        self._state_credit_enabled = False
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
@@ -509,6 +513,7 @@ class AgentLoopWorker:
 
             self.teacher_key: str = config.distillation.teacher_key
             self._omniopd_enabled = omniopd_enabled(self.config)
+            self._state_credit_enabled = state_credit_enabled(self.config)
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
                 teacher_client=teacher_client,
@@ -1305,7 +1310,16 @@ class AgentLoopWorker:
             # OmniOPD replaces teacher SCORING with a teacher AUDIT: its objective reads k_sem and an
             # exact KL against the frozen initial policy, and never a teacher logprob. Running both
             # would pay for a full-sequence teacher forward whose result nothing consumes.
-            if self._omniopd_enabled:
+            if self._state_credit_enabled:
+                await self._compute_state_credit(
+                    output,
+                    prompt_ids=output.prompt_ids,
+                    response_ids=output.response_ids,
+                    validate=validate,
+                    sample_kwargs=kwargs,
+                    chunk_is_final=chunk_is_final,
+                )
+            elif self._omniopd_enabled:
                 await self._compute_omniopd_audit(
                     output,
                     prompt_ids=output.prompt_ids,
@@ -1563,6 +1577,52 @@ class AgentLoopWorker:
                 _prompt + _resp[: int(t0)], int(om.N), int(om.C),
                 seed_for_anchor(base_seed, int(t0), int(om.N)))
             store.launch(int(t0), _factory, key=_k)
+
+    async def _compute_state_credit(
+        self,
+        output: AgentLoopOutput,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        validate: bool,
+        sample_kwargs: Optional[dict[str, Any]] = None,
+        chunk_is_final: Optional[bool] = None,
+    ) -> None:
+        """Measure Phi at each interior depth. Runs once, on the finished response."""
+        if not (self.distillation_enabled and not validate):
+            return
+        if chunk_is_final is False:
+            return
+        routing_key = session_id = None
+        gt = None
+        if sample_kwargs is not None:
+            rv = sample_kwargs.get(self.teacher_key)
+            if rv is not None:
+                routing_key = rv.item() if hasattr(rv, "item") else rv
+            sid = sample_kwargs.get("xiaoshuai_sample_id")
+            if sid is not None:
+                session_id = sid.item() if hasattr(sid, "item") else sid
+            rm = sample_kwargs.get("reward_model")
+            rm = rm.item() if hasattr(rm, "item") else rm
+            if isinstance(rm, dict):
+                gt = rm.get("ground_truth")
+        if gt is None:
+            # Phi is DEFINED by the verifier, so no ground truth means no measurement. Raising here
+            # rather than scoring everything 0, which would look like a uniformly hopeless state.
+            raise ValueError(
+                "state-credit needs reward_model.ground_truth on the sample to evaluate Phi; it is "
+                "absent from this batch's non_tensor_batch.")
+        await attach_state_credit(
+            output,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            ground_truth=gt,
+            teacher_manager=self.teacher_server_manager,
+            tokenizer=self.tokenizer,
+            sc_config=resolve_state_credit_config(self.config),
+            session_id=session_id,
+            routing_key=routing_key,
+            seed=_omniopd_base_seed(session_id),
+        )
 
     async def _compute_omniopd_audit(
         self,

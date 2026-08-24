@@ -86,6 +86,34 @@ omniopd:
   # deviation: a truncated tail under-estimates H and selects DIFFERENT chunks.
   entropy_topk: 0
 
+# State-Credit OPD (loss_mode=state_credit). Present in the schema for the same reason the omniopd
+# node is: the agent loop reads it off the RAW DictConfig, where a missing key is a struct-mode
+# error raised mid-rollout rather than a fallback. _target_ is required or omega_conf_to_dataclass
+# hands DistillationConfig a plain dict.
+state_credit:
+  _target_: verl.workers.config.distillation.StateCreditConfig
+
+  # INTERIOR cut points, ascending. Empty disables it.
+  depths: []
+
+  # Continuations per Phi estimate. The dominant recurring cost -- it multiplies by depths, by
+  # rollouts per problem, and by every optimizer step.
+  M: 4
+
+  # Continuation budget, IDENTICAL at every depth. Per-depth budgets would make Phi a different
+  # functional at each depth and bias every Delta.
+  B: 20480
+
+  # Weight of the state term against the token-level OPD loss.
+  beta: 1.0
+
+  # Which teacher_models entry is the frozen continuation model.
+  pi_c_key: math
+
+  # Per-(group, depth) floor for leave-one-out. Below this the chunk is dropped, never centered
+  # against zero.
+  min_survivors: 3
+
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8
 

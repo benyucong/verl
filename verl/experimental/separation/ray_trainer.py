@@ -557,6 +557,57 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 batch = batch.union(values)
         return batch
 
+    def _maybe_build_state_credit(self, batch) -> None:
+        """Turn per-depth Phi into the dense weight the State-Credit loss consumes.
+
+        No-op unless the loss actually asks for teacher continuations, so every other objective is
+        byte-identical.
+        """
+        try:
+            from verl.trainer.distillation.losses import get_distillation_loss_settings
+            lm = self.config.distillation.distillation_loss.loss_mode
+            if not get_distillation_loss_settings(str(lm)).use_teacher_continuations:
+                return
+        except Exception:
+            return
+
+        import numpy as _np
+        import torch as _torch
+        from verl.trainer.distillation.state_credit_credit import build_state_credit_weights
+
+        ntb = batch.non_tensor_batch
+        need = ("state_credit_phi", "state_credit_depths")
+        missing = [k for k in need if k not in ntb]
+        if missing:
+            raise KeyError(
+                f"state-credit loss is configured but {missing} is absent from the batch. Phi is "
+                f"produced in the agent loop (state_credit_stage.attach_state_credit); if that did "
+                f"not run, there is no credit signal and training must not proceed without one.")
+
+        resp_mask = batch.batch["response_mask"]
+        lengths = resp_mask.sum(dim=-1).tolist()
+        # Phi(s_T) is the task reward, already on the batch as the per-token score
+        terminal = batch.batch["token_level_scores"].sum(dim=-1).tolist()
+        uids = ntb["uid"] if "uid" in ntb else _np.arange(len(lengths))
+        sc = self.config.distillation.state_credit
+
+        W, stats = build_state_credit_weights(
+            uids=list(uids),
+            phis=list(ntb["state_credit_phi"]),
+            depths=list(ntb["state_credit_depths"]),
+            terminal=terminal,
+            response_lengths=lengths,
+            max_response_len=int(resp_mask.shape[1]),
+            min_survivors=int(sc.min_survivors),
+        )
+        batch.batch["state_credit_weights"] = _torch.as_tensor(
+            W, dtype=_torch.float32, device=resp_mask.device)
+        for k, v in stats.items():
+            self.metrics[f"state_credit/{k}"] = v
+        print(f"[STATE-CREDIT] rows={stats['rows']} credited={stats['rows_credited']} "
+              f"chunks={stats['chunks_total']} dropped_small_group="
+              f"{stats['chunks_dropped_small_group']} groups={stats['groups']}", flush=True)
+
     def _fit_compute_advantage(self, batch) -> DataProto:
         metrics = self.metrics
         timing_raw = self.timing_raw
@@ -570,6 +621,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
             if reward_extra_infos_dict:
                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+            # STATE-CREDIT: build the per-token credit HERE, while a problem's rollouts are still
+            # together. After this point balance_batch reorders rows onto DP ranks by length, so
+            # two rollouts of one problem land on different GPUs and leave-one-out becomes
+            # impossible. Placed after the reward is on the batch, because Phi(s_T) IS the reward.
+            self._maybe_build_state_credit(batch)
 
             # compute rewards. apply_kl_penalty if available
             if self.config.algorithm.use_kl_in_reward:
