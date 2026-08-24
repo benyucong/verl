@@ -530,6 +530,22 @@ class RayPPOTrainer:
             reward_extra_infos_to_dump = {
                 k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in reward_extra_infos_dict.items()
             }
+            # The two batch_decode calls above pass skip_special_tokens=True, which makes `output`
+            # a LOSSY record of the rollout: the terminator is gone, and decode -> re-encode is not
+            # length-preserving, so a consumer that recovers the length by re-tokenizing the text
+            # can be off by tens of tokens. That is not hypothetical -- it is how a rollout which
+            # genuinely exhausted the generation horizon came back 36 tokens short and was
+            # misread as a natural stop, silently inverting the one bit (did this rollout STOP, or
+            # was it CUT OFF?) that any termination analysis depends on. The drift is concentrated
+            # in CJK-heavy text, so it is invisible on English-only eyeballing.
+            # Carrying the true count costs one column and removes the guesswork.
+            # compute_response_mask needs only `responses` and `attention_mask`, both of which are
+            # necessarily present here, so this does not depend on response_mask having been set.
+            try:
+                resp_lens = compute_response_mask(batch).sum(-1).cpu().tolist()
+                reward_extra_infos_to_dump.setdefault("response_length", resp_lens)
+            except Exception as e:  # never let a diagnostic column break a training run
+                print(f"[dump] could not record response_length: {type(e).__name__}: {e}")
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_to_dump.setdefault(
                     "request_id",

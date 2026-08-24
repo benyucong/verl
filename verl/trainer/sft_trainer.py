@@ -310,6 +310,19 @@ class SFTTrainer:
 
         # TODO: add a unified tracking
         if is_logging:
+            # Same per-experiment run id the PPO trainer uses. Without it an SFT arm launched from
+            # a shell that exported WANDB_RUN_ID for another arm would silently write into that
+            # arm's run, and a run whose process is torn down abruptly keeps a CRASHED badge that
+            # the next writer inherits. Deriving the id from experiment_name makes each arm its own
+            # honest run; WANDB_RUN_GROUP still groups them.
+            if os.environ.get("WANDB_RUN_ID") and self.config.trainer.experiment_name:
+                import hashlib
+
+                os.environ["WANDB_RUN_ID"] = hashlib.md5(
+                    self.config.trainer.experiment_name.encode()
+                ).hexdigest()[:16]
+                os.environ["WANDB_RESUME"] = "allow"
+
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
                 experiment_name=self.config.trainer.experiment_name,

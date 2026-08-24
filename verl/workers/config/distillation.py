@@ -66,6 +66,17 @@ class DistillationLossConfig(BaseConfig):
     topk: Optional[int] = 128
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
+    renormalize_teacher_topk: bool = False
+    """Divide the teacher's retained top-k probabilities by their own sum before the KL.
+
+    The shipped kernel weights by the RAW top-k probabilities, which sum to teacher_mass < 1.
+    That makes the target an unnormalised measure: the gradient scale then depends on how much
+    teacher mass happened to be retained at each position, and the 'KL' can go negative, which
+    is why fsdp/losses.py ends with clamp_min(0.0). Renormalising makes the target a genuine
+    distribution over the retained support, so the objective is a real forward KL and the clamp
+    becomes a no-op rather than a distortion. Off by default so existing arms are unchanged.
+    """
+
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 

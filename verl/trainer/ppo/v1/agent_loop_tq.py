@@ -49,6 +49,30 @@ async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseExce
     return [result for result in results if isinstance(result, BaseException)]
 
 
+# DENSE PREFIX CURRICULUM: rollout horizon as a pure function of the optimizer step.
+#
+# Deliberately duplicated from verl/trainer/distillation/losses.py rather than imported. This
+# module runs inside the ROLLOUT worker, and importing the trainer package here drags torch and
+# the whole verl.trainer tree into that process on the generation hot path. With a freshly
+# resumed 21 GB checkpoint already resident, that extra allocation was enough to get the worker
+# OOM-killed before the first generation -- observed as a core worker dying, then the raylet
+# taking SIGKILL, with "Processed prompts 0" and no training step, on every resume of both
+# curriculum arms while fresh starts succeeded. Seven tuples are not worth an import.
+#
+# KEEP IN SYNC with OPD_DENSE_STAGES in verl/trainer/distillation/losses.py.
+_OPD_DENSE_STAGES = ((20, 128), (40, 256), (60, 512), (80, 1024), (100, 2048), (120, 4096), (140, 8192))
+
+
+def _opd_stage_horizon(step: int) -> int:
+    """Horizon for this step; 0 means 'use the full configured horizon'. Opt-in via env."""
+    if (os.environ.get("OPD_DENSE_CURRICULUM", "") or "").strip() in ("", "0", "false", "False"):
+        return 0
+    for end, h in _OPD_DENSE_STAGES:
+        if step <= end:
+            return h
+    return 0
+
+
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
@@ -68,6 +92,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+
+        # DENSE PREFIX WARM-UP: cap generation at this stage's horizon.
+        # Truncating here rather than generating a full-length trajectory and masking it is the
+        # whole point of the curriculum -- the saving is real because V1 stores responses RAGGED,
+        # not padded to response_length. Applied only to TRAINING batches: validation must stay at
+        # the pinned evaluation budget or the eval numbers stop being comparable to the paper's.
+        # opd_stage_horizon() returns 0 unless OPD_DENSE_CURRICULUM is set, so every other arm is
+        # untouched by this code path.
+        if not validate:
+            _h = _opd_stage_horizon(int(batch["global_steps"]))
+            if _h:
+                sampling_params["max_tokens"] = _h
 
         # override sampling params for validation
         if validate:

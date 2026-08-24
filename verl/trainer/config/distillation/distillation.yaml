@@ -36,6 +36,13 @@ distillation_loss:
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 
+  # Divide the teacher's retained top-k probabilities by their own sum before the KL, making the
+  # target a genuine distribution over the retained support. Without this the objective is
+  # weighted by the RAW top-k probabilities, which sum to teacher_mass < 1, so the gradient scale
+  # depends on how much teacher mass happened to be retained and the "KL" can go negative (hence
+  # the clamp_min(0.0) at the end of the top-k path). Off by default: existing arms are unchanged.
+  renormalize_teacher_topk: false
+
   # Optional min clamp value for log probabilities for stability, e.g., log q - log p where p or q are very close to zero.
   log_prob_min_clamp: null
 

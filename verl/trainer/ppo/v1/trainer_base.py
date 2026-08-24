@@ -1728,6 +1728,10 @@ class PPOTrainer(ABC):
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            # Needed by the dense-prefix curriculum so the loss can log which stage and horizon
+            # it is in. Reconstructed from the checkpoint directory name on resume, so it stays
+            # correct across arbitrary job chaining without any extra checkpointed state.
+            "global_steps": self.global_steps,
         }
         batch.extra_info.update(extra_info)
 

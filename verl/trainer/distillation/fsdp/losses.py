@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -124,6 +125,13 @@ def compute_forward_kl_topk(
         student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
+    # RENORMALISE the teacher over its retained support, AFTER teacher_mass has been recorded
+    # (so the diagnostic still reports the true retained mass) and BEFORE the clamp, so the
+    # clamp acts on the quantity that actually enters the loss.
+    if getattr(loss_config, "renormalize_teacher_topk", False):
+        teacher_topk_log_probs = teacher_topk_log_probs - torch.logsumexp(
+            teacher_topk_log_probs.float(), dim=-1, keepdim=True
+        ).to(teacher_topk_log_probs.dtype)
     if loss_config.log_prob_min_clamp is not None:
         student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
@@ -140,10 +148,25 @@ def compute_forward_kl_topk(
         overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
     )
 
+    # CLOSING-TOKEN COVERAGE.
+    # The spec wants the support to be TopK(p_T) union {</think>, EOS}. We cannot ADD them: if
+    # the teacher ranks a token outside its top-k, vLLM never returned that token's probability
+    # at all (workers/rollout/vllm_rollout/utils.py discards rank > k), so there is nothing to
+    # insert and no way to renormalise over a support containing it. What we CAN do is measure
+    # how often they are absent, which bounds how much closing supervision this target is able
+    # to carry. For a study about when the model stops, a target that routinely omits </think>
+    # is carrying no signal about stopping, and that has to be visible rather than assumed.
+    _close_id = int(os.environ.get("OPD_THINK_CLOSE_ID", "151668"))
+    _eos_id = int(os.environ.get("OPD_EOS_ID", "151645"))
+    has_close = (teacher_topk_ids == _close_id).any(dim=-1)
+    has_eos = (teacher_topk_ids == _eos_id).any(dim=-1)
+
     return {
         "distillation_losses": distillation_losses,
         "student_mass": student_mass,
         "teacher_mass": teacher_mass,
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
+        "has_close_token": has_close,
+        "has_eos_token": has_eos,
     }

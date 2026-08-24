@@ -228,6 +228,39 @@ def distillation_ppo_loss(
     return policy_loss, policy_metrics
 
 
+# --- DENSE PREFIX WARM-UP CURRICULUM -------------------------------------------------------
+# (end_step, rollout horizon). The stage is a PURE FUNCTION of global_step, deliberately: any
+# stage held as state -- an env var, a checkpointed counter -- goes missing on resubmission,
+# and a chained curriculum then silently runs the wrong objective while every log line still
+# looks healthy. global_step is already reconstructed from the checkpoint directory name on
+# resume, so deriving the stage from it survives arbitrary job chaining for free.
+OPD_DENSE_STAGES = ((20, 128), (40, 256), (60, 512), (80, 1024), (100, 2048), (120, 4096), (140, 8192))
+
+
+def opd_dense_enabled() -> bool:
+    """Opt-in. Unset for every other arm, so their rollout length is untouched."""
+    return (os.environ.get("OPD_DENSE_CURRICULUM", "") or "").strip() not in ("", "0", "false", "False")
+
+
+def opd_stage_horizon(step: int) -> int:
+    """Rollout horizon for this optimizer step; 0 means 'use the full configured horizon'.
+
+    Returns 0 for every step past the dense curriculum (141+), which is the vanilla PG phase and
+    must use the unmodified baseline rollout length.
+    """
+    if not opd_dense_enabled():
+        return 0
+    for end, h in OPD_DENSE_STAGES:
+        if step <= end:
+            return h
+    return 0
+
+
+def opd_stage_name(step: int) -> str:
+    h = opd_stage_horizon(step)
+    return f"dense_H{h}" if h else "vanilla_pg"
+
+
 def apply_forward_horizon(response_mask: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Forward-Horizon curriculum: grade only the first H tokens the policy generated.
 
@@ -270,6 +303,49 @@ def apply_forward_horizon(response_mask: torch.Tensor) -> tuple[torch.Tensor, in
         idx = torch.arange(1, dense.shape[-1] + 1, device=dense.device)
         position = idx.expand_as(dense)
     return dense * (position <= horizon).to(dense.dtype), horizon
+
+
+
+def teacher_length_prior(response_mask: torch.Tensor, ref_len: float, lam: float) -> tuple:
+    """Trajectory-level length prior calibrated to the TEACHER'S OWN rollout lengths.
+
+    WHY THIS TERM EXISTS
+    --------------------
+    The diagnosis (results/length_explosion/DIAGNOSIS.md) establishes that teacher-forced local
+    scoring carries no instruction to close earlier:
+
+      * in 0 of 125 trajectories does the teacher put >1e-3 on `</think>` anywhere before the
+        student's own close, though it endorses that close at p=1.0 once reached;
+      * teacher surprisal and student-teacher disagreement both FALL over the redundant tail, so
+        no per-token quantity distinguishes productive reasoning from re-derivation;
+      * the k1 advantage is 25-35% less negative in the tail, so the objective discourages
+        redundant continuation least.
+
+    The information that IS missing sits in the teacher's own trajectory-length distribution:
+    29,505 correct teacher traces close at a median of 6,621 think-tokens (~8,624 full response),
+    implying a per-token closing hazard of ~1.9e-4 past 6k. The student assigns ~1e-12 there.
+    That is 8 orders of magnitude, and it cannot be recovered from any teacher score on student
+    text -- which is exactly why this term is trajectory-level rather than token-level.
+
+    WHY NOT THE PER-TOKEN HAZARD FORM. The principled version supervises p_S(</think>|c_t) toward
+    the empirical hazard directly, but that needs the `</think>` logit column inside the loss.
+    These runs use use_remove_padding with ulysses_sequence_parallel_size=2, so a new per-token
+    tensor would have to be threaded through the rmpad + SP gather + fused-kernel paths. That is
+    the highest-risk edit available and this file has already produced several silent, plausible
+    failures. This form tests the same hypothesis with a dense, post-gather, padded input.
+
+    Returns (per_sequence_penalty[bsz], metrics). Penalty is 0 for sequences at or under ref_len,
+    so a model that is already short is not pushed shorter.
+    """
+    lengths = response_mask.sum(dim=-1).to(torch.float32)
+    excess = torch.clamp(lengths / max(ref_len, 1.0) - 1.0, min=0.0)
+    penalty = lam * excess
+    return penalty, {
+        "distillation/len_prior_mean_excess": excess.mean().detach().item(),
+        "distillation/len_prior_frac_over": (excess > 0).float().mean().detach().item(),
+        "distillation/len_prior_mean_penalty": penalty.mean().detach().item(),
+        "distillation/len_prior_mean_length": lengths.mean().detach().item(),
+    }
 
 
 def mixed_sft_term(log_prob: torch.Tensor, response_mask: torch.Tensor) -> tuple:
@@ -344,10 +420,62 @@ def distillation_loss(
     response_mask = data["response_mask"]
     loss_agg_mode = config.loss_agg_mode
 
+    # TRUE GLOBAL TOKEN MEAN -- fixes two bugs at once.
+    #
+    # (1) config.global_batch_info is populated in exactly ONE place, inside ppo_loss
+    #     (workers/utils/losses.py:65-68). The supervised branch below skips ppo_loss entirely
+    #     when use_task_rewards and use_policy_gradient are both False -- which is precisely the
+    #     distillation-only configuration -- so the dict is empty forever, agg_loss falls back to
+    #     dp_size=1 and batch_num_tokens=loss_mask.sum(), and "token-mean" silently degrades to a
+    #     LOCAL micro-batch mean whose scale rides on how many micro-batches dynamic batching
+    #     happened to produce.
+    # (2) In the policy-gradient branch, distillation_loss() is called BEFORE ppo_loss(), so even
+    #     when ppo_loss does run, the value read here is one call stale -- and empty on the very
+    #     first backward of every process, fresh run and every resume alike.
+    #
+    # The engine already computed the globally all-reduced count and put it on the batch
+    # (workers/engine/fsdp/transformer_impl.py:691-696). Read that, with the same accessor
+    # ppo_loss uses, and fall back silently only if a call path lacks the keys.
+    # OPT-IN, deliberately. This is a genuine bug fix, but switching it on mid-flight would
+    # change the loss normalisation of an experiment already in progress -- the four R_max clip
+    # arms pick up this file on their next chained stage. Changing the objective under a running
+    # comparison is worse than carrying a small known bug through it consistently, so arms opt in.
+    if (os.environ.get("OPD_FIX_GLOBAL_TOKEN_MEAN", "") or "").strip() not in ("", "0", "false", "False"):
+        try:
+            config.global_batch_info["dp_size"] = data["dp_size"]
+            config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+            config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+            config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+        except (KeyError, TypeError):
+            pass
+
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
     )
     if loss_config.loss_max_clamp is not None:
+        # HOW OFTEN DOES THE CLAMP ACTUALLY BIND?
+        # Without this, a null result from tightening loss_max_clamp is uninterpretable: it
+        # cannot be told apart from a threshold that never fired.
+        #
+        # CAREFUL: the dataclass default is 10.0 but config/distillation/distillation.yaml
+        # ships `loss_max_clamp: null`, and the YAML wins through hydra. So unless a run passes
+        # it EXPLICITLY, this whole branch is dead and there is no clip at all -- which was the
+        # case for every arm in this study before 2026-08-22. Setting it turns clamping ON
+        # against an unclamped baseline; it does not "tighten" an existing 10.0.
+        # Note compute_distillation_loss_range above is deliberately computed PRE-clamp, so
+        # loss_min/loss_max keep reporting the raw range while these report the clipping.
+        _c = loss_config.loss_max_clamp
+        _m = response_mask.bool().to_padded_tensor(False) if response_mask.is_nested else response_mask.bool()
+        _resp = distillation_losses[_m]
+        if _resp.numel() > 0:
+            distillation_metrics["distillation/clamp_frac_hi"] = Metric(
+                aggregation=AggregationType.MEAN, value=(_resp > _c).float().mean())
+            distillation_metrics["distillation/clamp_frac_lo"] = Metric(
+                aggregation=AggregationType.MEAN, value=(_resp < -_c).float().mean())
+            distillation_metrics["distillation/clamp_frac"] = Metric(
+                aggregation=AggregationType.MEAN, value=(_resp.abs() > _c).float().mean())
+            distillation_metrics["distillation/clamp_threshold"] = Metric(
+                aggregation=AggregationType.MEAN, value=torch.tensor(float(_c)))
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
@@ -363,10 +491,22 @@ def distillation_loss(
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
+        _adv = -distillation_losses.detach()
+        # INTERVENTION D: subtract a trajectory-level penalty for exceeding the teacher's own
+        # typical length. Broadcast over tokens so every token in an over-long sequence carries
+        # it, which is what makes it a TRAJECTORY signal rather than another local one.
+        _lam_len = float(os.environ.get("OPD_LAMBDA_LEN", "0") or 0)
+        if _lam_len:
+            _ref = float(os.environ.get("OPD_REF_LEN", "8624") or 8624)
+            _pen, _lm = teacher_length_prior(response_mask, _ref, _lam_len)
+            _adv = _adv - _pen.unsqueeze(-1)
+            distillation_metrics.update(_lm)
+            distillation_metrics["distillation/len_prior_lambda"] = _lam_len
+            distillation_metrics["distillation/len_prior_ref"] = _ref
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
+            advantages=_adv,
             response_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
@@ -461,6 +601,48 @@ def compute_forward_kl_topk(
         **overlap_metrics,
     }
 
+    # CLOSING-TOKEN COVERAGE: what fraction of supervised positions had </think> / EOS inside
+    # the teacher's retained top-k at all. Positions where they are absent receive ZERO gradient
+    # about closing, however large K is.
+    for _key, _name in (("has_close_token", "think_close"), ("has_eos_token", "eos")):
+        _v = model_output.get(_key)
+        if _v is None:
+            continue
+        _v = no_padding_2_padding(_v, data)
+        _v = _v[response_mask_bool]
+        if _v.numel() > 0:
+            distillation_metrics[f"distillation/topk_covers_{_name}"] = _v.float().mean().item()
+
+    # RETAINED TEACHER MASS, the quantity that says how good an approximation top-k is.
+    # mean/min/max alone hide the tail; the fractions below 0.95 and 0.99 are what tell you
+    # whether a position was effectively supervised by a truncated target.
+    _tm = teacher_mass.float()
+    if _tm.numel() > 0:
+        distillation_metrics["distillation/teacher_mass_frac_lt_0.95"] = (_tm < 0.95).float().mean().item()
+        distillation_metrics["distillation/teacher_mass_frac_lt_0.99"] = (_tm < 0.99).float().mean().item()
+        # torch.quantile refuses inputs above ~16M elements; sort is exact and cheap here.
+        _sorted = torch.sort(_tm).values
+        _n = _sorted.numel()
+        distillation_metrics["distillation/teacher_mass_median"] = _sorted[_n // 2].item()
+        distillation_metrics["distillation/teacher_mass_p10"] = _sorted[max(0, int(0.10 * _n) - 1)].item()
+
+    _renorm = bool(getattr(distillation_config.distillation_loss, "renormalize_teacher_topk", False))
+    distillation_metrics["distillation/teacher_renormalized"] = float(_renorm)
+    # Curriculum stage and horizon, so the objective in force at each step is visible in wandb
+    # rather than inferred from the step number by a reader months later.
+    try:
+        _gs = int(data["global_steps"])
+        distillation_metrics["distillation/curriculum_step"] = float(_gs)
+        distillation_metrics["distillation/curriculum_horizon"] = float(opd_stage_horizon(_gs))
+    except (KeyError, TypeError, ValueError):
+        pass
+    if _renorm:
+        # With a renormalised target the divergence is a genuine KL and is non-negative up to
+        # float error, so clamping should never bind. Record it if it ever does rather than
+        # silently hiding a bug behind the clamp.
+        _neg = (distillation_losses < 0)
+        distillation_metrics["distillation/kl_negative_frac"] = _neg.float().mean().item()
+        distillation_metrics["distillation/kl_most_negative"] = distillation_losses.min().item()
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)
 
@@ -498,8 +680,35 @@ def compute_distillation_loss_reverse_kl_estimator(
     distillation_losses = kl_penalty(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
+    # All of the following are computed on the RAW estimator, before loss_max_clamp, so they
+    # describe the teacher-student relationship rather than the clipped training signal.
+    _d = distillation_losses[response_mask_bool].float()      # log p_S - log p_T, per token
+    _t = teacher_log_probs[response_mask_bool].float()
+    _s = student_log_probs[response_mask_bool].float()
+
     # Since k1 can be negative, log the mean absolute loss.
     metrics = {
-        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+        "distillation/abs_loss": Metric(AggregationType.MEAN, _d.abs().mean()),
     }
+    if _d.numel() > 0:
+        # THE ACTUAL KL, WHICH abs_loss IS NOT.
+        # Tokens are sampled from the student, so the SIGNED mean of (log p_S - log p_T) is the
+        # k1 single-sample estimator of the reverse KL, KL(pi_S || pi_T). abs_loss throws the
+        # sign away, and therefore cannot distinguish "teacher and student disagree a lot, in
+        # both directions" from "the student is systematically more confident than the teacher"
+        # -- which are opposite situations for distillation.
+        metrics["distillation/kl_k1"] = Metric(AggregationType.MEAN, _d.mean())
+
+        # k3 = (r - 1) - log r  with  r = p_T/p_S.  Non-negative by construction and much lower
+        # variance than k1, so it is the better convergence read even though k1 is what the
+        # gradient actually uses. The exponent is clamped only to keep the METRIC finite: on our
+        # runs the raw k1 reaches -15, and exp(15) is already 3e6.
+        _r = torch.exp((-_d).clamp(max=20.0))
+        metrics["distillation/kl_k3"] = Metric(AggregationType.MEAN, ((_r - 1.0) - (-_d)).mean())
+
+        # The two halves separately, so a moving KL can be attributed to the student drifting
+        # or to the teacher scoring the student's new tokens differently.
+        metrics["distillation/teacher_logprob_mean"] = Metric(AggregationType.MEAN, _t.mean())
+        metrics["distillation/student_logprob_mean"] = Metric(AggregationType.MEAN, _s.mean())
+        metrics["distillation/teacher_ppl"] = Metric(AggregationType.MEAN, torch.exp(-_t.mean()))
     return distillation_losses, metrics
