@@ -17,6 +17,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from omegaconf import OmegaConf
+
 from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
 
@@ -491,6 +493,70 @@ class DistillationConfig(BaseConfig):
                 f"({self.n_gpus_per_node=} * {self.nnodes=} = {total_pool_size})."
             )
 
+    #: The only `inference` fields that describe the STUDENT rather than the teacher's own engine.
+    #: validate_and_prepare_for_distillation reads them as INPUT and then OVERWRITES them with the
+    #: engine's budget, so a wrong value here cannot be caught downstream -- it can only make the
+    #: boot check meaningless.
+    _STUDENT_DERIVED_INFERENCE_FIELDS = ("prompt_length", "response_length")
+
+    @staticmethod
+    def _node_get(node, key, default=None):
+        """Read `key` off a node that may be a dict, a DictConfig, or a BaseConfig."""
+        if isinstance(node, dict):
+            return node.get(key, default)
+        return getattr(node, key, default)
+
+    def _seed_student_lengths(self, template) -> None:
+        """Give every '+'-added teacher the student's prompt/response lengths.
+
+        Only the YAML `teacher_model` entry interpolates
+
+            prompt_length:   ${oc.select:actor_rollout_ref.rollout.prompt_length}
+            response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
+
+        A teacher added as `+distillation.teacher_models.<name>.*` -- the recipe this class's own
+        docstring recommends, and what every launcher here uses -- is a NEW sibling node that
+        inherits nothing from that template. Both lengths therefore fell back to RolloutConfig's
+        dataclass default of 512.
+
+        That was never cosmetic. validate_and_prepare_for_distillation reads the STUDENT's response
+        length out of exactly this field, and the scoring branch then collapses response_length to
+        1 -- so its boot check evaluated 512 + 512 + 1 <= max_model_len and passed against every
+        real engine. The 512 stayed invisible for the whole campaign and only surfaced when
+        state-credit compared a 2048-token depth against it.
+
+        Seeded on the RAW node, BEFORE omega_conf_to_dataclass: after the structured merge a 512
+        that came from the dataclass default is indistinguishable from one the user asked for, and
+        an explicit teacher-side length could no longer win.
+
+        ONLY these two fields. `temperature` is a student interpolation on the template too and is
+        deliberately NOT seeded: it would turn every run with a non-1.0 rollout temperature into a
+        hard NotImplementedError in the teacher sampling params -- a behaviour change wearing a bug
+        fix's clothes.
+        """
+        template_inference = self._node_get(template, "inference")
+        for name, teacher in self.teacher_models.items():
+            if isinstance(teacher, BaseConfig):
+                continue  # already-structured entry: hydra resolved its interpolations
+            inference = self._node_get(teacher, "inference")
+            if inference is None:
+                continue
+            if not isinstance(inference, dict):  # DictConfig: allow adding the absent keys
+                OmegaConf.set_struct(inference, False)
+            for fld in self._STUDENT_DERIVED_INFERENCE_FIELDS:
+                if self._node_get(inference, fld) is not None:
+                    continue  # explicitly configured on this teacher -- never override
+                seed = self._node_get(template_inference, fld)
+                if seed is None:
+                    raise ValueError(
+                        f"teacher {name!r} does not set inference.{fld}, and the `teacher_model` "
+                        f"template could not supply it. Refusing to fall back to RolloutConfig's "
+                        f"512: teacher dimensioning reads the STUDENT's lengths out of this field, "
+                        f"and a 512 makes the prompt + response + 1 <= max_model_len boot check "
+                        f"vacuous."
+                    )
+                inference[fld] = int(seed)
+
     def _resolve_teacher_models(self) -> dict[str, DistillationTeacherModelConfig]:
         assert "teacher_model" in self.teacher_models
         if len(self.teacher_models) == 1:
@@ -511,8 +577,10 @@ class DistillationConfig(BaseConfig):
             teacher_model.num_replicas = pool_size // per_replica
             teacher_model.key = "default"
         else:
-            # Multiple teachers: remove default single teacher config
-            self.teacher_models.pop("teacher_model")
+            # Multiple teachers: `teacher_model` stops being a teacher and becomes the TEMPLATE that
+            # the explicitly-added entries inherit their student-derived lengths from. Popping it
+            # without reading it first is what silently reverted those lengths to 512.
+            self._seed_student_lengths(self.teacher_models.pop("teacher_model"))
 
         # Teacher models dict is keyed by teacher_key instead of YAML entry name
         teacher_models = {}
