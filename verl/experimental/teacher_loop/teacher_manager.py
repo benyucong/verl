@@ -176,6 +176,20 @@ class AsyncTeacherLLMServerManager:
         self._fifo = PerParentFifo(timeout_s=_to)
         self._fifo_warned = False
 
+    def release_parent(self, session_id) -> None:
+        """Release per-parent FIFO ordering state for a session that will issue no further calls.
+
+        Only meaningful when OPD_TEACHER_PER_PARENT_FIFO is on; a no-op otherwise, so callers do not
+        have to know which mode they are in.
+        """
+        f = getattr(self, "_fifo", None)
+        if f is None or session_id is None:
+            return
+        try:
+            f.release(str(session_id))
+        except Exception:          # releasing a parent must never fail a trajectory
+            logging.getLogger(__name__).debug("release_parent(%s) failed", session_id, exc_info=True)
+
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
             # Single-teacher path: route everything to the one teacher regardless of the sample's key.

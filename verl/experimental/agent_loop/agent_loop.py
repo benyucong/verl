@@ -54,7 +54,7 @@ from verl.trainer.distillation.omniopd_stage import (attach_omniopd_audit, omnio
                                                       resolve_omniopd_config)
 from verl.trainer.distillation.state_credit_stage import (attach_state_credit,
                                                           resolve_state_credit_config,
-                                                          state_credit_enabled)
+                                                          state_credit_enabled, launch_state_credit_early)
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -1306,6 +1306,20 @@ class AgentLoopWorker:
                 logger.warning("[OMNIOPD-SPEC] proposal pass failed; commit is unaffected",
                                exc_info=True)
 
+        # OUTSIDE `if compute_teacher_logprobs`. F mode sets that False on every non-final chunk,
+        # so a hook placed inside it never runs while streaming -- which is exactly how the OmniOPD
+        # speculation pass silently measured an A/A. The early launch's whole purpose is the
+        # non-final chunks, so it cannot live under that flag.
+        if (self._state_credit_enabled and chunk_is_final is False
+                and self.distillation_enabled and not validate):
+            try:
+                self._state_credit_early_launch(output, sample_kwargs=kwargs)
+            except Exception:
+                # An overlap optimisation must never cost the trajectory its measurement; the
+                # commit still issues every depth it does not find in the store.
+                logger.warning("[STATE-CREDIT] early launch failed; commit is unaffected",
+                               exc_info=True)
+
         if compute_teacher_logprobs:
             # OmniOPD replaces teacher SCORING with a teacher AUDIT: its objective reads k_sem and an
             # exact KL against the frozen initial policy, and never a teacher logprob. Running both
@@ -1525,6 +1539,56 @@ class AgentLoopWorker:
             self._omniopd_spec_stores[key] = st
         return st
 
+    def _state_credit_store(self, session_id, base_seed, sc):
+        """One store per trajectory, created on first use and popped by the commit."""
+        if not hasattr(self, "_state_credit_stores"):
+            self._state_credit_stores = {}
+        key = str(session_id)
+        st = self._state_credit_stores.get(key)
+        if st is None:
+            st = SpeculativeStore(base_seed, int(sc.M), int(sc.B), label="STATE-CREDIT-EARLY")
+            self._state_credit_stores[key] = st
+        return st
+
+    def _state_credit_early_launch(self, output, *, sample_kwargs=None) -> None:
+        """Issue each depth's continuation as the stream crosses it, not after the response ends.
+
+        Phi(s_d) reads prompt + response[:d], which is FINAL the moment the student has emitted d
+        tokens -- generation only appends. With depth 2048 inside a 20480-token response the
+        teacher's work can therefore start after ~10% of generation and run underneath the rest,
+        instead of beginning when the response is already complete.
+
+        Deliberately synchronous and fire-and-forget. It must not await: this runs on the loop that
+        drains the token stream, and the whole point is to hand the teacher call away rather than
+        wait on it. SpeculativeStore.launch yields before touching the prefix and, with
+        OPD_OMNIOPD_SPEC_THREAD=1, runs the call on a separate dispatch loop entirely.
+        """
+        sc = resolve_state_credit_config(self.config)
+        if not (sc.depths or []):
+            return
+        session_id = routing_key = None
+        if sample_kwargs is not None:
+            sid = sample_kwargs.get("xiaoshuai_sample_id")
+            if sid is not None:
+                session_id = sid.item() if hasattr(sid, "item") else sid
+            rv = sample_kwargs.get(self.teacher_key)
+            if rv is not None:
+                routing_key = rv.item() if hasattr(rv, "item") else rv
+        store = self._state_credit_store(session_id, _omniopd_base_seed(session_id), sc)
+        n = launch_state_credit_early(
+            store,
+            prompt_ids=output.prompt_ids,
+            response_ids=output.response_ids,
+            sc_config=sc,
+            teacher_manager=self.teacher_server_manager,
+            session_id=session_id,
+            routing_key=routing_key,
+            seed=_omniopd_base_seed(session_id),
+        )
+        if n and not getattr(self, "_sc_early_announced", False):
+            self._sc_early_announced = True
+            print("[STATE-CREDIT] early async teacher continuation ENABLED", flush=True)
+
     async def _omniopd_speculate(self, output, *, sample_kwargs=None) -> None:
         """Propose anchors from the entropy prefix and launch their teacher work early.
 
@@ -1611,6 +1675,9 @@ class AgentLoopWorker:
             raise ValueError(
                 "state-credit needs reward_model.ground_truth on the sample to evaluate Phi; it is "
                 "absent from this batch's non_tensor_batch.")
+        # Pop rather than read: the trajectory is finishing, and a store left in the dict would
+        # keep this session's launched tasks alive for the life of the worker.
+        store = getattr(self, "_state_credit_stores", {}).pop(str(session_id), None)
         await attach_state_credit(
             output,
             prompt_ids=prompt_ids,
@@ -1622,6 +1689,7 @@ class AgentLoopWorker:
             session_id=session_id,
             routing_key=routing_key,
             seed=_omniopd_base_seed(session_id),
+            store=store,
         )
 
     async def _compute_omniopd_audit(

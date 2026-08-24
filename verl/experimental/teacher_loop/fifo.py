@@ -187,6 +187,17 @@ class PerParentFifo:
             self._cleanup(session_id)
         return result, wait_s, score_s
 
+    def release(self, session_id: str) -> None:
+        """Drop a parent's ordering state without issuing a call.
+
+        Normally the last chunk carries is_final=True and cleans up on its way out. State-credit
+        launches its continuations EARLY, before the response is finished, so no call can know it is
+        the last one -- the depth set is only settled once the true response length is known. The
+        commit therefore releases explicitly. Without this the parent sits in _parents until
+        _reap_stale times it out, which is bounded but keeps dead sessions in the metrics.
+        """
+        self._cleanup(session_id)
+
     @staticmethod
     def _pct(xs, q: float) -> float:
         if not xs:

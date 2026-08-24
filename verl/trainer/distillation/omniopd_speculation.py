@@ -174,7 +174,10 @@ def _spec_semaphore():
 class SpeculativeStore:
     """Per-trajectory record of launched proposals. Not shared across trajectories."""
 
-    def __init__(self, base_seed: Optional[int], N: int, C: int):
+    def __init__(self, base_seed: Optional[int], N: int, C: int, label: str = "OMNIOPD-SPEC"):
+        # Tag on every log line. The store is shared with state-credit's early launch, and a
+        # mismatch there reported as [OMNIOPD-SPEC] sends you reading the wrong subsystem.
+        self.label = label
         self.base_seed, self.N, self.C = base_seed, N, C
         self.tasks: dict[int, asyncio.Task] = {}       # anchor -> in-flight/finished launch
         self.keys: dict[int, str] = {}                # anchor -> request identity at launch
@@ -254,8 +257,8 @@ class SpeculativeStore:
             # asking for, so using it would substitute a different sample into k_sem silently.
             # Drop it and let the caller run the anchor fresh; the wasted work is already spent.
             self.key_mismatch += 1
-            logger.warning("[OMNIOPD-SPEC] anchor %d key mismatch (launched %s, commit %s); "
-                           "relaunching rather than reusing", anchor, launched_key, expect_key)
+            logger.warning("[%s] anchor %d key mismatch (launched %s, commit %s); relaunching "
+                           "rather than reusing", self.label, anchor, launched_key, expect_key)
             try:
                 await task
             except Exception:
@@ -264,7 +267,7 @@ class SpeculativeStore:
         try:
             seqs, tele = await task
         except Exception as e:                       # a failed proposal is not a failed trajectory
-            logger.warning("[OMNIOPD-SPEC] proposal for anchor %d failed, relaunching: %s", anchor, e)
+            logger.warning("[%s] proposal for anchor %d failed, relaunching: %s", self.label, anchor, e)
             return None
         self.reused += 1
         return seqs, tele

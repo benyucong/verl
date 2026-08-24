@@ -114,8 +114,13 @@ async def run_state_credit(
     session_id: Optional[str] = None,
     routing_key: Optional[str] = None,
     seed: Optional[int] = None,
+    store=None,
 ) -> dict:
-    """Phi at every interior depth this trajectory actually reaches."""
+    """Phi at every interior depth this trajectory actually reaches.
+
+    `store` holds continuations launched EARLY, as the stream crossed each depth. Reusing them is
+    what makes the teacher's work overlap generation instead of following it.
+    """
     depths = [int(d) for d in (sc_config.depths or [])]
     M, B = int(sc_config.M), int(sc_config.B)
     T = len(response_ids)
@@ -131,19 +136,35 @@ async def run_state_credit(
         return {"state_credit_phi": [], "state_credit_depths": [], "state_credit_telemetry": tele}
 
     phis: list[float] = []
+    n_reused = 0
     for i, d in enumerate(reached):
         prefix = list(prompt_ids) + list(response_ids[:d])
-        seqs, t = await teacher_manager.generate_chunk_continuations(
-            prefix_ids=prefix,
-            n=M,
-            max_tokens=B,
-            routing_key=routing_key,
-            session_id=session_id,
-            # keyed on DEPTH, stride M, so the M children of one depth never share a stream with
-            # another depth's (vLLM seeds children parent+0..parent+M-1)
-            seed=None if seed is None else (seed + M * d) % (2**31),
-            is_final=(i == len(reached) - 1),      # releases this parent's sticky routing debt
-        )
+        # keyed on DEPTH, stride M, so the M children of one depth never share a stream with
+        # another depth's (vLLM seeds children parent+0..parent+M-1)
+        d_seed = sc_seed_for_depth(seed, M, d)
+        got = None
+        if store is not None:
+            # Awaits an in-flight early launch rather than racing it: that work is already paid
+            # for. Returns None when the key does not match what the commit is asking for -- a
+            # partial-rollout rewind is the only way that happens -- and we then issue it fresh
+            # rather than substituting a prefix nobody asked for.
+            got = await store.take(d, expect_key=store.request_key(prefix, M, B, d_seed))
+        if got is not None:
+            seqs, t = got
+            n_reused += 1
+        else:
+            seqs, t = await teacher_manager.generate_chunk_continuations(
+                prefix_ids=prefix,
+                n=M,
+                max_tokens=B,
+                routing_key=routing_key,
+                session_id=session_id,
+                seed=d_seed,
+                # An EARLY launch cannot know which depth is last: the set is only settled once the
+                # true response length is known. So no call carries is_final and the parent's FIFO
+                # state is released explicitly once every depth is in hand.
+                is_final=False,
+            )
         if len(seqs) != M:
             raise RuntimeError(
                 f"state-credit: depth {d} returned {len(seqs)} continuations, asked for {M}. Phi "
@@ -167,13 +188,27 @@ async def run_state_credit(
 
     n_cont = len(reached) * M
     tele["sc_trunc_frac"] = tele["sc_truncated"] / max(1, n_cont)
+    # How much of the teacher's work was already done by the time the response finished. This is
+    # THE metric for the mechanism: sc_early_frac near 1.0 means the continuations overlapped
+    # generation, near 0.0 means they followed it and the run is the sequential arm wearing the
+    # streaming label. Reported even when the store is absent, so the two arms stay comparable.
+    tele["sc_reused_early"] = n_reused
+    tele["sc_early_frac"] = n_reused / max(1, len(reached))
+    if store is not None:
+        # Every depth is accounted for; no call carried is_final, so release the parent's ordering
+        # state here rather than leaving it for the stale reaper.
+        await store.drain_unused()
+        try:
+            teacher_manager.release_parent(session_id)
+        except AttributeError:
+            pass       # older manager without the explicit release; the reaper still collects it
     return {"state_credit_phi": phis, "state_credit_depths": reached,
             "state_credit_telemetry": tele}
 
 
 async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth, teacher_manager,
                               tokenizer, sc_config, session_id=None, routing_key=None,
-                              seed=None) -> None:
+                              seed=None, store=None) -> None:
     """Run the measurement and hang it on the agent-loop output.
 
     Everything in extra_fields becomes a non_tensor_batch column, which is where the driver reads
@@ -183,7 +218,7 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
     rec = await run_state_credit(
         prompt_ids=prompt_ids, response_ids=response_ids, ground_truth=ground_truth,
         teacher_manager=teacher_manager, tokenizer=tokenizer, sc_config=sc_config,
-        session_id=session_id, routing_key=routing_key, seed=seed)
+        session_id=session_id, routing_key=routing_key, seed=seed, store=store)
     output.extra_fields["state_credit_phi"] = rec["state_credit_phi"]
     output.extra_fields["state_credit_depths"] = rec["state_credit_depths"]
     output.extra_fields["state_credit_telemetry"] = rec["state_credit_telemetry"]
@@ -195,3 +230,73 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
                  ["%.3f" % p for p in rec["state_credit_phi"]],
                  te.get("sc_trunc_frac", 0.0), te["sc_gen_seconds"],
                  te["sc_verifier_failed"], time.time() - t0), flush=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# EARLY ASYNC CONTINUATION
+#
+# Phi(s_d) depends on prompt + response[:d] and nothing else. Once the student has emitted d
+# tokens that prefix is FINAL -- it cannot change, because generation only appends. So the
+# continuation for depth d can be issued the moment the stream crosses d, and by the time the
+# response finishes ~10x later the answer is already sitting in the store.
+#
+# This is not speculation. OmniOPD's anchors are a global argmax over the FINISHED response, so an
+# early launch there is a guess that can miss (top_k=4 of 10, mism>0 possible). State-credit's
+# depths are configured constants, so every early launch is a request the commit is guaranteed to
+# make, and every launched depth is one the trajectory actually reaches (we only launch after
+# crossing it). Nothing is wasted and nothing is guessed -- the key check below exists only to
+# catch a rewind, not an ordinary miss.
+# ---------------------------------------------------------------------------------------------
+
+def sc_seed_for_depth(base_seed, M: int, depth: int):
+    """Seed for a depth's M children. Must match run_state_credit's exactly or the key check fires."""
+    return None if base_seed is None else (base_seed + int(M) * int(depth)) % (2**31)
+
+
+def launch_state_credit_early(store, *, prompt_ids, response_ids, sc_config, teacher_manager,
+                              session_id=None, routing_key=None, seed=None) -> int:
+    """Issue continuations for every depth the stream has just passed. Returns how many started.
+
+    THE GENERATION LOOP PAYS ONE COPY PER DEPTH, ONCE. `response_ids` is referenced rather than
+    snapshotted, and the factory's slice runs inside the coroutine -- which SpeculativeStore.launch
+    starts after an `await asyncio.sleep(0)` and, with OPD_OMNIOPD_SPEC_THREAD=1, on a separate
+    dispatch loop entirely. What remains here is the request key, which needs the prefix bytes and
+    so must materialise prompt + response[:d] synchronously. That is d+|prompt| elements once per
+    depth per trajectory -- not the whole response at every chunk boundary, which is the cost that
+    capped the OmniOPD version at +5.2%.
+
+    Referencing the live list is safe because response[:d] is immutable once len(response) > d:
+    generation appends. A partial-rollout rewind is the one case that could violate it, and that is
+    exactly what the request key catches at commit -- take() relaunches rather than substituting a
+    prefix the commit never asked for.
+    """
+    depths = sorted({int(d) for d in (sc_config.depths or [])})
+    if not depths:
+        return 0
+    M, B = int(sc_config.M), int(sc_config.B)
+    n_launched = 0
+    resp_len = len(response_ids)
+    for d in depths:
+        if d >= resp_len or d in store.tasks:
+            continue
+
+        def _factory(_d=int(d)):
+            # Runs on the dispatch loop, after the first yield -- see the note above.
+            _p = list(prompt_ids) + list(response_ids[:_d])
+            return teacher_manager.generate_chunk_continuations(
+                prefix_ids=_p, n=M, max_tokens=B,
+                routing_key=routing_key, session_id=session_id,
+                seed=sc_seed_for_depth(seed, M, _d),
+                # No early call can know it is the last: the depth set is only settled once the
+                # true response length is known. The commit releases the parent explicitly instead.
+                is_final=False,
+            )
+
+        # Same identity the commit recomputes, built from the same inputs, so the two agree by
+        # construction. The prefix IS materialised here -- unavoidable, the hash needs the bytes --
+        # but only for the first _d tokens, not the whole response.
+        key = store.request_key(list(prompt_ids) + list(response_ids[:d]), M, B,
+                                sc_seed_for_depth(seed, M, d))
+        store.launch(d, _factory, key=key)
+        n_launched += 1
+    return n_launched
