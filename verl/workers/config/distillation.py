@@ -191,7 +191,8 @@ class DistillationTeacherModelConfig(BaseConfig):
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
     def validate_and_prepare_for_distillation(
-        self, use_topk: bool, topk: Optional[int], generation_tokens: Optional[int] = None
+        self, use_topk: bool, topk: Optional[int], generation_tokens: Optional[int] = None,
+        prefix_length: Optional[int] = None,
     ) -> None:
         """Dimension the teacher engine for how this objective actually uses it.
 
@@ -218,6 +219,33 @@ class DistillationTeacherModelConfig(BaseConfig):
                 f"response, and one generated token, but got {student_prompt_length=}, "
                 f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
             )
+
+        if prefix_length is not None:
+            # STATE-CREDIT. Unlike OmniOPD, whose prefix + generation always sums back to
+            # prompt + response, this reads prompt + response[:max_depth] and then writes a FULL
+            # continuation of B tokens -- so the engine needs prompt + max_depth + B, which can
+            # exceed the scoring total above. Asserted here, at boot: generate_n RAISES rather than
+            # clamping when the budget does not fit (vllm_async_server), and discovering that
+            # mid-rollout means the whole trajectory has already been paid for.
+            if generation_tokens is None or generation_tokens < 1:
+                raise ValueError(f"state-credit needs a continuation budget B >= 1, got {generation_tokens}")
+            if prefix_length >= student_response_length:
+                raise ValueError(
+                    f"state_credit depth {prefix_length} must be strictly inside the student "
+                    f"response ({student_response_length}); a depth at or past the end has no "
+                    f"interior state to evaluate.")
+            need = student_prompt_length + prefix_length + generation_tokens
+            if max_model_len is not None and need > max_model_len:
+                raise ValueError(
+                    f"state-credit continuations need {need} tokens of context "
+                    f"(prompt {student_prompt_length} + depth {prefix_length} + B "
+                    f"{generation_tokens}) but the teacher engine has max_model_len={max_model_len}. "
+                    f"Raise max_model_len, lower the deepest depth, or lower B -- but do NOT lower B "
+                    f"per depth, which would make Phi a different functional at each depth.")
+            self.inference.prompt_length = student_prompt_length + prefix_length
+            self.inference.response_length = generation_tokens
+            self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+            return
 
         if generation_tokens is not None:
             if generation_tokens < 1:
@@ -313,6 +341,58 @@ class OmniOPDConfig(BaseConfig):
 
 
 @dataclass
+class StateCreditConfig(BaseConfig):
+    """State-Credit OPD: credit a reasoning chunk by the change in how solvable the state becomes.
+
+        Phi(s) = E_{c ~ pi_C(.|s)} [ Q(x, s||c) ]      estimated with M continuations
+        Delta_j = Phi(s_{k_j}) - Phi(s_{k_{j-1}})      progress made by chunk j
+
+    depths: INTERIOR cut points, ascending. The terminal state is not listed -- Phi(s_T) is the
+        task reward itself and needs no continuations. Phi(s_0) is not computed either: it cancels
+        exactly under leave-one-out centering.
+    M: continuations per Phi estimate. The dominant recurring cost -- it multiplies by depths, by
+        rollouts per problem, and by every optimizer step. Measured separation at M=4 was +0.104
+        against a per-problem sampling sd of ~0.35, so this is the floor rather than a default.
+    B: continuation budget, IDENTICAL at every depth. A depth-varying budget would make Phi a
+        different functional per depth and bias Delta -- a deeper prefix would be scored on its
+        ability to finish sooner rather than on its quality. Must be large enough that
+        continuations reach an answer: at 20k thinking-on traces, a probe at B=1024 truncated 99.3%
+        of continuations and measured nothing, while B=20480 truncated 6.9%.
+    beta: weight of the state term against the token-level OPD loss.
+    pi_c_key: which teacher_models entry serves as the FROZEN continuation model.
+    min_survivors: per-(group, depth) floor for leave-one-out. Below this the chunk is DROPPED, not
+        centered against zero -- an absent baseline would otherwise become a maximal-magnitude
+        target.
+    """
+
+    depths: list[int] = field(default_factory=list)
+    M: int = 4
+    B: int = 20480
+    beta: float = 1.0
+    pi_c_key: str = "math"
+    min_survivors: int = 3
+
+    _mutable_fields = {"depths"}
+
+    def __post_init__(self):
+        if not self.depths:
+            return
+        self.depths = [int(d) for d in self.depths]
+        if any(d <= 0 for d in self.depths):
+            raise ValueError(f"state_credit.depths must be positive, got {self.depths}")
+        if self.depths != sorted(self.depths) or len(set(self.depths)) != len(self.depths):
+            raise ValueError(f"state_credit.depths must be strictly ascending, got {self.depths}")
+        if self.M < 2:
+            raise ValueError(f"state_credit.M must be >= 2 to estimate Phi, got {self.M}")
+        if self.B < 1:
+            raise ValueError(f"state_credit.B must be >= 1, got {self.B}")
+        if self.min_survivors < 2:
+            raise ValueError(
+                f"state_credit.min_survivors must be >= 2: leave-one-out needs at least one other "
+                f"trajectory to center against, got {self.min_survivors}")
+
+
+@dataclass
 class DistillationConfig(BaseConfig):
     """Configuration for on-policy distillation.
 
@@ -360,10 +440,38 @@ class DistillationConfig(BaseConfig):
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
     omniopd: "OmniOPDConfig" = field(default_factory=lambda: OmniOPDConfig())
+    state_credit: "StateCreditConfig" = field(default_factory=lambda: StateCreditConfig())
+
+    def _teacher_generation_tokens(self):
+        """How many tokens the teacher must be able to GENERATE, or None if it only scores."""
+        ls = self.distillation_loss.loss_settings
+        if getattr(ls, "use_teacher_continuations", False):
+            return self.state_credit.B
+        if ls.use_teacher_generation:
+            return self.omniopd.C
+        return None
+
+    def _teacher_prefix_length(self):
+        """Longest prompt the teacher will be handed, or None to keep the rollout's default.
+
+        State-Credit continues from prompt + response[:max(depths)], so the engine must be
+        dimensioned for that prefix PLUS B. Asserting it here fails at boot; discovering it at
+        runtime means generate_n raises mid-rollout after the work is already paid for.
+        """
+        ls = self.distillation_loss.loss_settings
+        if getattr(ls, "use_teacher_continuations", False) and self.state_credit.depths:
+            return max(self.state_credit.depths)
+        return None
 
     def __post_init__(self):
         if not self.enabled:
             return
+        ls = self.distillation_loss.loss_settings
+        if getattr(ls, "use_teacher_continuations", False) and not self.state_credit.depths:
+            raise ValueError(
+                "loss_mode requires teacher continuations but state_credit.depths is empty: there "
+                "are no interior states to evaluate, so the objective would be identical to the "
+                "token-level loss while paying for a continuation engine.")
 
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
@@ -371,9 +479,8 @@ class DistillationConfig(BaseConfig):
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
-                generation_tokens=(
-                    self.omniopd.C if self.distillation_loss.loss_settings.use_teacher_generation else None
-                ),
+                generation_tokens=self._teacher_generation_tokens(),
+                prefix_length=self._teacher_prefix_length(),
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

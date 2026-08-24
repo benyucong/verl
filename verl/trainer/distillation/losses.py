@@ -68,6 +68,7 @@ class DistillationLossSettings(BaseConfig):
     use_topk: bool = False
     use_estimator: bool = False
     use_teacher_generation: bool = False
+    use_teacher_continuations: bool = False
 
     _mutable_fields = {"names"}
 
@@ -78,10 +79,17 @@ class DistillationLossSettings(BaseConfig):
         # WROTE. The third is not a variant of the first two: it needs the teacher to generate
         # rather than score, which changes how its engine must be dimensioned, so it has to be
         # declared here where the teacher config can see it.
-        if sum([self.use_topk, self.use_estimator, self.use_teacher_generation]) != 1:
+        # A fourth way: teacher CONTINUATIONS run to a verifiable answer (State-Credit). It is not a
+        # variant of use_teacher_generation -- that writes a fixed C-token chunk to compare wording,
+        # this writes a whole completion so an external verifier can say whether the state was
+        # solvable. The engine dimensioning differs (prompt + depth + B, which can exceed
+        # prompt + response), so it must be declared where the teacher config can see it.
+        if sum([self.use_topk, self.use_estimator, self.use_teacher_generation,
+                self.use_teacher_continuations]) != 1:
             raise ValueError(
-                f"Expected exactly one of use_estimator, use_topk, use_teacher_generation, but got "
-                f"{self.use_estimator=}, {self.use_topk=}, {self.use_teacher_generation=}."
+                f"Expected exactly one of use_estimator, use_topk, use_teacher_generation, "
+                f"use_teacher_continuations, but got {self.use_estimator=}, {self.use_topk=}, "
+                f"{self.use_teacher_generation=}, {self.use_teacher_continuations=}."
             )
 
 
@@ -624,6 +632,24 @@ def compute_forward_kl_topk(
     return distillation_losses, distillation_metrics
 
 
+def _state_credit_column(data, key):
+    """Same container problem as _omniopd_column: the trainer hands the loss a TensorDict, where
+    non-tensor columns live as NonTensorStacks reached by data[key], while a DataProto exposes
+    .non_tensor_batch. state_credit_weights is a real tensor, so it rides the tensor batch -- but
+    the lookup still has to work on both containers."""
+    ntb = getattr(data, "non_tensor_batch", None)
+    if ntb is not None and key in ntb:
+        return ntb[key]
+    try:
+        return data[key]
+    except (KeyError, IndexError) as e:
+        raise KeyError(
+            f"State-Credit loss needs {key!r} and it is absent from this batch. It is built in the "
+            f"driver (_fit_compute_advantage) from the per-depth Phi columns; if that stage did not "
+            f"run, the objective has no credit signal and must not silently train without one."
+        ) from e
+
+
 def _omniopd_column(data, key):
     """Read a per-sample OmniOPD column from a DataProto OR a bare TensorDict.
 
@@ -643,6 +669,78 @@ def _omniopd_column(data, key):
             f"audit did not run, the objective has no targets and must not silently train without "
             f"them."
         ) from e
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["state_credit"], use_teacher_continuations=True)
+)  # type: ignore[arg-type]
+def compute_distillation_loss_state_credit(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output,
+    data: TensorDict,
+):
+    """State-Credit: reinforce a chunk in proportion to the progress it made.
+
+        S[b,t] = -W[b,t] * log pi_theta(y_t | s_<t)
+
+    where W is a DENSE per-token weight the driver has already built:
+
+        W[b,t] = Delta_tilde_j / (m_b * l_j)     for t in chunk j of row b
+
+    with Delta_tilde the leave-one-out-centered progress of that chunk, m_b the number of chunks
+    the row actually has, and l_j the chunk's true token count. Summing S over a row therefore
+    reproduces -(1/m_b) * sum_j Delta_tilde_j * logbar_j exactly.
+
+    WHY THE WEIGHT ARRIVES PRE-BUILT. Centering is leave-one-out ACROSS the rollouts of one problem,
+    and by the time a micro-batch reaches this function those siblings are gone: balance_batch
+    reorders rows onto DP ranks by length, mini-batching slices, and dynamic-bsz repartitions again.
+    A micro-batch is an arbitrary length-selected subset of one rank's slice. So the centering is
+    done in the driver, where the whole batch is present and grouping is by key, and this function
+    receives a row-local tensor that is exactly invariant to all three reorderings.
+
+    W IS DETACHED BY CONSTRUCTION -- it is built from Phi values produced by a FROZEN continuation
+    model and an external verifier, neither of which is on the autograd graph. Asserted rather than
+    assumed: a W that carried gradient would add a term the method does not have.
+    """
+    log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    W = _state_credit_column(data, "state_credit_weights")
+    if not torch.is_tensor(W):
+        W = torch.as_tensor(W, device=log_probs.device, dtype=log_probs.dtype)
+    W = W.to(device=log_probs.device, dtype=log_probs.dtype)
+    if W.requires_grad:
+        raise ValueError(
+            "state_credit_weights carries gradient; Phi comes from a frozen continuation model and "
+            "a verifier, so the weight must be a constant multiplier (cf. FID-5 for the OmniOPD "
+            "target).")
+
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    response_mask = response_mask.bool()
+    if W.shape != log_probs.shape:
+        raise ValueError(
+            f"state_credit_weights {tuple(W.shape)} does not match log_probs "
+            f"{tuple(log_probs.shape)}; the driver must emit one weight per response position.")
+
+    losses = -(W * log_probs)
+    losses = torch.where(response_mask, losses, torch.zeros_like(losses))
+
+    nz = (W != 0) & response_mask
+    metrics = {
+        "state_credit/L_state": Metric(AggregationType.MEAN, losses.sum()),
+        "state_credit/weighted_tokens": Metric(AggregationType.MEAN, nz.sum().float()),
+        "state_credit/w_absmean": Metric(
+            AggregationType.MEAN,
+            (W[nz].abs().mean() if bool(nz.any()) else torch.zeros((), device=W.device))),
+        "state_credit/w_pos_frac": Metric(
+            AggregationType.MEAN,
+            ((W[nz] > 0).float().mean() if bool(nz.any()) else torch.zeros((), device=W.device))),
+        "state_credit/rows_without_credit": Metric(
+            AggregationType.MEAN,
+            (~nz.any(dim=-1)).float().sum()),
+    }
+    return losses, metrics
 
 
 @register_distillation_loss(
