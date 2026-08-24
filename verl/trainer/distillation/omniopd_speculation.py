@@ -174,10 +174,20 @@ def _spec_semaphore():
 class SpeculativeStore:
     """Per-trajectory record of launched proposals. Not shared across trajectories."""
 
-    def __init__(self, base_seed: Optional[int], N: int, C: int, label: str = "OMNIOPD-SPEC"):
+    def __init__(self, base_seed: Optional[int], N: int, C: int, label: str = "OMNIOPD-SPEC",
+                 max_inflight: Optional[int] = None):
         # Tag on every log line. The store is shared with state-credit's early launch, and a
         # mismatch there reported as [OMNIOPD-SPEC] sends you reading the wrong subsystem.
         self.label = label
+        # None => the shared speculative budget (small, deliberately). 0 => NO throttle.
+        #
+        # The shared budget exists because a SPECULATIVE proposal can miss, so it must never occupy
+        # an admission slot a commit needs. That argument does not transfer to work the commit is
+        # guaranteed to ask for: throttling it does not protect the commit, it IS the commit,
+        # issued early and then serialised. And the arm it is compared against -- issuing the same
+        # calls at commit time -- has no throttle at all, so a bound here handicaps the early arm
+        # against its own baseline rather than measuring the mechanism.
+        self.max_inflight = max_inflight
         self.base_seed, self.N, self.C = base_seed, N, C
         self.tasks: dict[int, asyncio.Task] = {}       # anchor -> in-flight/finished launch
         self.keys: dict[int, str] = {}                # anchor -> request identity at launch
@@ -220,10 +230,15 @@ class SpeculativeStore:
         if anchor in self.tasks:
             return
 
-        async def _gated():
-            await asyncio.sleep(0)          # yield first: let the generation stream advance
-            async with _spec_semaphore():
+        if self.max_inflight == 0:
+            async def _gated():
+                await asyncio.sleep(0)      # yield first: let the generation stream advance
                 return await coro_factory()
+        else:
+            async def _gated():
+                await asyncio.sleep(0)      # yield first: let the generation stream advance
+                async with _spec_semaphore():
+                    return await coro_factory()
 
         if dispatch_thread_enabled():
             # Runs on the dispatch loop; the generation thread only hands over a coroutine. The

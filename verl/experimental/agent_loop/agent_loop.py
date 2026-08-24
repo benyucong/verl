@@ -1546,7 +1546,11 @@ class AgentLoopWorker:
         key = str(session_id)
         st = self._state_credit_stores.get(key)
         if st is None:
-            st = SpeculativeStore(base_seed, int(sc.M), int(sc.B), label="STATE-CREDIT-EARLY")
+            st = SpeculativeStore(
+                base_seed, int(sc.M), int(sc.B), label="STATE-CREDIT-EARLY",
+                # Unthrottled: these are not proposals, they are the commit's own requests
+                # issued early, and the sequential arm issues them with no bound either.
+                max_inflight=int(os.environ.get("OPD_STATE_CREDIT_MAX_INFLIGHT", "0") or 0))
             self._state_credit_stores[key] = st
         return st
 
