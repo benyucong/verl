@@ -265,6 +265,11 @@ class AsyncTeacherLLMServerManager:
             "teacher_prefix_tokens": len(prefix_ids),
             "teacher_cached_tokens": out.num_cached_tokens,
             "teacher_n": len(out.sequences),
+            # Consumed by state-credit's truncation gate. Dropping it did not make the gate fail --
+            # it made the gate report 0.000 truncation unconditionally, which reads as an
+            # affirmative all-clear on the one check that distinguishes "Phi is meaningless because
+            # B is too small" from "the method does not work".
+            "finish_reasons": list(getattr(out, "finish_reasons", None) or []),
         }
         return out.sequences, telemetry
 

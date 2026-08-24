@@ -128,7 +128,8 @@ async def run_state_credit(
     reached = [d for d in depths if d < T]
     tele = {"sc_depths_requested": len(depths), "sc_depths_reached": len(reached),
             "sc_response_len": T, "sc_gen_seconds": 0.0, "sc_gen_tokens": 0,
-            "sc_truncated": 0, "sc_scored": 0, "sc_verifier_failed": 0}
+            "sc_truncated": 0, "sc_scored": 0, "sc_verifier_failed": 0,
+            "sc_trunc_unmeasured": 0}
     if not reached:
         # Not an error: a short trajectory has no interior state to evaluate. The driver drops it
         # from every LOO group rather than crediting it against a baseline it never joined.
@@ -170,6 +171,9 @@ async def run_state_credit(
                 f"state-credit: depth {d} returned {len(seqs)} continuations, asked for {M}. Phi "
                 f"from a short sample is a different estimator, not a noisier one.")
         fr = (t or {}).get("finish_reasons") or []
+        if len(fr) < len(seqs):
+            # No finish reasons for these rows: truncation is UNMEASURED here, not zero.
+            tele["sc_trunc_unmeasured"] += len(seqs) - len(fr)
         prefix_text = tokenizer.decode(response_ids[:d], skip_special_tokens=True)
         qs = []
         for j, sq in enumerate(seqs):
@@ -187,7 +191,10 @@ async def run_state_credit(
         phis.append(sum(qs) / len(qs) if qs else float("nan"))
 
     n_cont = len(reached) * M
-    tele["sc_trunc_frac"] = tele["sc_truncated"] / max(1, n_cont)
+    # NaN, not 0.0, when any continuation came back without a finish reason. A gate that cannot see
+    # truncation must say so: reporting 0.000 is how this silently passed for a whole campaign.
+    tele["sc_trunc_frac"] = (float("nan") if tele["sc_trunc_unmeasured"]
+                             else tele["sc_truncated"] / max(1, n_cont))
     # How much of the teacher's work was already done by the time the response finished. This is
     # THE metric for the mechanism: sc_early_frac near 1.0 means the continuations overlapped
     # generation, near 0.0 means they followed it and the run is the sequential arm wearing the
