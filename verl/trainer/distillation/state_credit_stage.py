@@ -225,11 +225,18 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
 
     if os.environ.get("OPD_STATE_CREDIT_QUIET", "0") in ("0", "", "false", "False"):
         te = rec["state_credit_telemetry"]
-        print("[STATE-CREDIT] sid=%s T=%d depths=%s phi=%s trunc=%.3f gen_s=%.1f vfail=%d wall=%.1f"
+        # `early` is the arm's metric and the ONLY place it surfaces: state_credit_telemetry has no
+        # aggregator consumer, so anything absent from this line is invisible in the run.
+        # reused/reached near 1.0 means the continuations overlapped generation; 0/n means they
+        # followed it and the run is the sequential arm wearing a streaming label. `wall` minus
+        # `gen_s` is the part the overlap actually removes.
+        print("[STATE-CREDIT] sid=%s T=%d depths=%s phi=%s trunc=%.3f gen_s=%.1f vfail=%d "
+              "early=%d/%d wall=%.1f"
               % (session_id, te["sc_response_len"], rec["state_credit_depths"],
                  ["%.3f" % p for p in rec["state_credit_phi"]],
                  te.get("sc_trunc_frac", 0.0), te["sc_gen_seconds"],
-                 te["sc_verifier_failed"], time.time() - t0), flush=True)
+                 te["sc_verifier_failed"], te.get("sc_reused_early", 0),
+                 len(rec["state_credit_depths"]), time.time() - t0), flush=True)
 
 
 # ---------------------------------------------------------------------------------------------
