@@ -284,7 +284,16 @@ def launch_state_credit_early(store, *, prompt_ids, response_ids, sc_config, tea
     n_launched = 0
     resp_len = len(response_ids)
     for d in depths:
-        if d >= resp_len or d in store.tasks:
+        # `>=`, not `>`. response[:d] is COMPLETE the instant the stream reaches d tokens, so the
+        # boundary at exactly d is launchable. Requiring resp_len > d slipped every launch a full
+        # chunk later (2048 -> 3072 at CHUNK=1024) and, worse, meant a response landing in [d, d+CHUNK)
+        # never launched early at all -- its next boundary is the final one, where the hook does not
+        # run. That is what produced reused=0/2 on the first trajectories of job 45007334.
+        #
+        # A depth exactly equal to the FINAL length is still not credited (run_state_credit keeps
+        # d < T, since the chunk from d to T would be empty); such a launch is simply dropped by
+        # drain_unused. Launching it is the cheaper error.
+        if resp_len < d or d in store.tasks:
             continue
 
         def _factory(_d=int(d)):
