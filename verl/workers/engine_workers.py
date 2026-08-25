@@ -758,6 +758,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return metrics or {}
 
         set_expandable_segments(False)
+
+        # RETURN TORCH'S RESERVED-BUT-UNUSED PAGES BEFORE THE WAKE, NOT AFTER.
+        #
+        # resume(tags=["weights"]) below re-maps the rollout weights through cuMem
+        # (~3.2 GiB for Qwen3-1.7B bf16 at TP=1), and cuMem needs FREE PHYSICAL pages -- it
+        # cannot borrow from torch's caching allocator. Coming out of update_actor, torch holds
+        # 57-61 GB of the 64 GB card reserved, most of it cached rather than live, leaving
+        # ~3 GB against a 3.2 GiB ask. Every arm runs about 1 GB from this edge; on 2026-08-24
+        # dense_s1_h01024 crossed it and died with
+        #   "CUDA Error: out of memory at cumem_allocator.cpp:151" (python_create_and_map),
+        # as did p4_pg_h31744 twice before it. Outcomes across context sizes were non-monotone
+        # (ctx 2049/5121/9217 died, 20481 survived, 32769 died), which is the signature of a
+        # threshold being straddled, not of any config being wrong.
+        #
+        # aggressive_empty_cache already existed in this function, but ~30 lines BELOW, after
+        # the very call that needs the headroom. Until now the only thing that freed memory in
+        # time was FSDP param offload, which calls empty_cache on its way out -- which is why
+        # offload "fixed" the OOM and made the real defect look like a memory-budget problem.
+        aggressive_empty_cache(force_sync=True)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
