@@ -129,7 +129,7 @@ async def run_state_credit(
     tele = {"sc_depths_requested": len(depths), "sc_depths_reached": len(reached),
             "sc_response_len": T, "sc_gen_seconds": 0.0, "sc_gen_tokens": 0,
             "sc_truncated": 0, "sc_scored": 0, "sc_verifier_failed": 0,
-            "sc_trunc_unmeasured": 0}
+            "sc_trunc_unmeasured": 0, "sc_cont_max_tokens": 0}
     if not reached:
         # Not an error: a short trajectory has no interior state to evaluate. The driver drops it
         # from every LOO group rather than crediting it against a baseline it never joined.
@@ -188,6 +188,14 @@ async def run_state_credit(
         tele["sc_scored"] += len(qs)
         tele["sc_gen_seconds"] += (t or {}).get("teacher_gen_seconds") or 0.0
         tele["sc_gen_tokens"] += (t or {}).get("teacher_gen_tokens") or 0
+        # LONGEST single continuation, which is what actually bounds B -- and through B the teacher's
+        # max_model_len, its KV per sequence, and therefore how many sequences the pool can hold.
+        # sc_gen_tokens is a SUM over the M continuations and cannot answer that. With trunc=0 the
+        # cap is never reached, so B is pure KV reservation: at B=20480 an 8B teacher reserves
+        # ~3.5 GB per sequence and the pool fits ~12 against max_num_seqs=16. Knowing the real
+        # maximum is what licenses lowering B, which costs no generated tokens at all.
+        tele["sc_cont_max_tokens"] = max(tele["sc_cont_max_tokens"],
+                                         max((len(x) for x in seqs), default=0))
         phis.append(sum(qs) / len(qs) if qs else float("nan"))
 
     n_cont = len(reached) * M
@@ -238,12 +246,13 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
         # followed it and the run is the sequential arm wearing a streaming label. `wall` minus
         # `gen_s` is the part the overlap actually removes.
         print("[STATE-CREDIT] sid=%s T=%d depths=%s phi=%s trunc=%.3f gen_s=%.1f vfail=%d "
-              "early=%d/%d wall=%.1f"
+              "early=%d/%d maxcont=%d wall=%.1f"
               % (session_id, te["sc_response_len"], rec["state_credit_depths"],
                  ["%.3f" % p for p in rec["state_credit_phi"]],
                  te.get("sc_trunc_frac", 0.0), te["sc_gen_seconds"],
                  te["sc_verifier_failed"], te.get("sc_reused_early", 0),
-                 len(rec["state_credit_depths"]), time.time() - t0), flush=True)
+                 len(rec["state_credit_depths"]), te.get("sc_cont_max_tokens", 0),
+                 time.time() - t0), flush=True)
 
 
 # ---------------------------------------------------------------------------------------------
