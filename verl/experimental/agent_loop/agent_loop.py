@@ -1591,7 +1591,16 @@ class AgentLoopWorker:
         )
         if n and not getattr(self, "_sc_early_announced", False):
             self._sc_early_announced = True
-            print("[STATE-CREDIT] early async teacher continuation ENABLED", flush=True)
+            # Record the DISPATCH MODE, not just that the feature is on. "async" has two very
+            # different meanings here: off-thread, the RPC and its completion callback never touch
+            # the loop draining the token stream; on-thread, they interleave with token processing
+            # and proposal count trades directly against generation speed. Without this in the log
+            # the two are indistinguishable after the fact.
+            from verl.trainer.distillation.omniopd_speculation import dispatch_thread_enabled
+            print("[STATE-CREDIT] early async teacher continuation ENABLED "
+                  "dispatch=%s inflight_cap=%s"
+                  % ("off-thread" if dispatch_thread_enabled() else "same-loop",
+                     store.max_inflight if store.max_inflight else "unbounded"), flush=True)
 
     async def _omniopd_speculate(self, output, *, sample_kwargs=None) -> None:
         """Propose anchors from the entropy prefix and launch their teacher work early.
