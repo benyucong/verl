@@ -585,7 +585,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 last_progress_rows = collected_rows
                 last_progress_t = time.time()
             try:
-                result = await asyncio.wait_for(self.message_queue_client.get_sample(), timeout=get_timeout_s)
+                # RETAINED get: a plain wait_for here dispatches a new actor-side pop each
+                # attempt and abandons the previous one mid-flight, destroying the item it
+                # returns. get_sample_retained keeps the in-flight request across timeouts,
+                # so the reclaim below still runs on schedule but no row is lost to it.
+                result = await self.message_queue_client.get_sample_retained(timeout=get_timeout_s)
             except asyncio.TimeoutError:
                 # No chunk within the window -> the pipeline may be wedged on stranded parents whose
                 # lost chunk will never arrive. Reclaim them so the drain can progress (or fail cleanly)

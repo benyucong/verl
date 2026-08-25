@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Optional
 
 import ray
 from omegaconf import DictConfig
@@ -258,6 +258,9 @@ class MessageQueueClient:
 
     def __init__(self, queue_actor: Any):
         self.queue_actor = queue_actor
+        # A get_sample request that has been DISPATCHED but whose result the caller has not yet
+        # taken. See get_sample_retained: this is what makes a timed-out wait non-destructive.
+        self._pending_get: Optional[asyncio.Future] = None
 
     async def put_sample(self, sample: Any) -> bool:
         """Put batch into queue (async)"""
@@ -272,9 +275,43 @@ class MessageQueueClient:
         return ray.get(self.queue_actor.get_validate.remote())
 
     async def get_sample(self) -> Any | None:
-        """Get single sample from queue, wait until one is available (async)"""
+        """Get single sample from queue, wait until one is available (async).
+
+        DESTRUCTIVE UNDER A TIMEOUT. `.remote()` dispatches before the await, so wrapping this call
+        in asyncio.wait_for cancels only the local await -- the actor-side coroutine stays parked on
+        its condition, later pops an item, and returns it into a future nobody holds. The item is
+        lost. Use get_sample_retained() anywhere a timeout is applied.
+        """
         future = self.queue_actor.get_sample.remote()
         return await asyncio.wrap_future(future.future())
+
+    async def get_sample_retained(self, timeout: Optional[float] = None) -> Any | None:
+        """get_sample() that a timeout cannot make lose an item. SINGLE CONSUMER only.
+
+        The actor pops whether or not anyone is still waiting, so abandoning the await abandons the
+        item. Here the dispatched request is RETAINED on the client: a timeout abandons the wait but
+        not the request, and the next call awaits the SAME in-flight request instead of issuing a
+        second one. asyncio.shield keeps wait_for from cancelling it.
+
+        Measured cost of getting this wrong (job 45025260, chunk-streaming drain at a 30 s timeout):
+        65 items popped and never delivered, plus 31 more discarded by the all-or-nothing batch rule
+        -- exactly 96 rows, three whole optimizer updates, followed by a 31-minute terminal stall on
+        a batch that could never be completed. Losses compound because asyncio.Condition waiters are
+        FIFO, so each orphan is served ahead of the live caller.
+
+        The timeout still fires and still returns control, so the stranded-parent reclaim that the
+        bounded wait exists for is unaffected.
+        """
+        if self._pending_get is None:
+            self._pending_get = asyncio.ensure_future(
+                asyncio.wrap_future(self.queue_actor.get_sample.remote().future()))
+        if timeout is None:
+            result = await self._pending_get
+        else:
+            # shield: on timeout the inner task keeps running and stays retained below
+            result = await asyncio.wait_for(asyncio.shield(self._pending_get), timeout)
+        self._pending_get = None      # consumed -- the next call issues a fresh request
+        return result
 
     async def get_queue_size(self) -> int:
         """Get queue size (async)"""
