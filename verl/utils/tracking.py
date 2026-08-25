@@ -81,7 +81,43 @@ class Tracking:
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            _init_kw = dict(
+                project=project_name, name=experiment_name, entity=entity,
+                config=config, settings=settings,
+            )
+            try:
+                wandb.init(**_init_kw)
+            except wandb.errors.CommError as _e:
+                # A DELETED wandb run id is a TOMBSTONE -- the server refuses to recreate it,
+                # permanently: "run <id> was previously created and deleted; try a new run id".
+                # Because trainer_base derives the id from experiment_name (md5[:16]), a run that
+                # was deleted once would otherwise take down EVERY later stage of that chain at
+                # startup, before a single training step, with no way to route around it from the
+                # environment. Losing an arm to a tidy-up in the wandb UI is not an acceptable
+                # failure mode.
+                # The replacement is DERIVED rather than random, so all later stages independently
+                # compute the same successor and keep landing in one run.
+                if "previously created and deleted" not in str(_e):
+                    raise
+                import hashlib
+
+                _dead = os.environ.get("WANDB_RUN_ID", "")
+                for _n in range(2, 12):
+                    os.environ["WANDB_RUN_ID"] = hashlib.md5(
+                        f"{experiment_name}|v{_n}".encode()
+                    ).hexdigest()[:16]
+                    try:
+                        wandb.init(**_init_kw)
+                        break
+                    except wandb.errors.CommError as _e2:
+                        if "previously created and deleted" not in str(_e2):
+                            raise
+                else:
+                    raise
+                print(
+                    f"[tracking] wandb id {_dead} is deleted/tombstoned; "
+                    f"using {os.environ['WANDB_RUN_ID']} instead"
+                )
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
