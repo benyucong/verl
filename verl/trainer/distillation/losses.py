@@ -417,7 +417,27 @@ def distillation_loss(
         model_output=model_output,
         data=data,
     )
-    response_mask = data["response_mask"]
+    response_mask_full = data["response_mask"]
+    # FORWARD-HORIZON: narrow the GRADED span here, and ONLY here.
+    #
+    # This line is the whole arm. transformer_impl.py:686-688 narrows data["loss_mask"], but in
+    # this path loss_mask feeds only batch_num_tokens -- the token-mean DENOMINATOR -- while the
+    # loss masks with data["response_mask"], which nothing narrows. So before this, OPD_FH_HORIZON
+    # graded every token exactly as vanilla OPD and merely rescaled the loss by N_all/N_H, a
+    # positive per-batch scalar that AdamW and clip_grad=1.0 absorb. The arm measured NOTHING,
+    # and a null result would have been indistinguishable from a real "horizon does not matter".
+    #
+    # Narrow the LOCAL variable, not data["response_mask"]: compute_forward_kl_topk asserts shape
+    # equality against data["response_mask"], and the engine call site runs before
+    # prepare_micro_batches, so a mini-batch-width mask would not match per-micro-batch
+    # distillation_losses. Keep transformer_impl.py's narrowing too -- with both, numerator and
+    # denominator cover the same graded set, which is a true token-mean over the first H. Removing
+    # it would leave the denominator counting tokens the numerator no longer includes, degrading
+    # the horizon into an unintended learning-rate cut.
+    #
+    # Unset / empty / <= 0 returns the same object untouched, so every existing arm and the
+    # full-horizon endpoint stage stay bit-identical to vanilla.
+    response_mask, _fh_horizon = apply_forward_horizon(response_mask_full)
     loss_agg_mode = config.loss_agg_mode
 
     # TRUE GLOBAL TOKEN MEAN -- fixes two bugs at once.
@@ -450,8 +470,20 @@ def distillation_loss(
             pass
 
     distillation_metrics.update(
-        compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
+        compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask_full)
     )
+    if _fh_horizon:
+        # POSITIVE CONTROL. If the fix is ever deployed but inert (stale file on the cluster,
+        # wrong branch), fh_graded_frac reads ~1.0 and the arm is silently vanilla again. At
+        # stage 1 of the ladder it should read ~0.1. Check it at step 1 before trusting the arm.
+        _full_m = (
+            response_mask_full.to_padded_tensor(0) if response_mask_full.is_nested else response_mask_full
+        )
+        distillation_metrics["distillation/fh_horizon"] = float(_fh_horizon)
+        distillation_metrics["distillation/fh_graded_frac"] = (
+            response_mask.sum() / _full_m.sum().clamp(min=1)
+        ).item()
+
     if loss_config.loss_max_clamp is not None:
         # HOW OFTEN DOES THE CLAMP ACTUALLY BIND?
         # Without this, a null result from tightening loss_max_clamp is uninterpretable: it
@@ -465,7 +497,7 @@ def distillation_loss(
         # Note compute_distillation_loss_range above is deliberately computed PRE-clamp, so
         # loss_min/loss_max keep reporting the raw range while these report the clipping.
         _c = loss_config.loss_max_clamp
-        _m = response_mask.bool().to_padded_tensor(False) if response_mask.is_nested else response_mask.bool()
+        _m = response_mask_full.bool().to_padded_tensor(False) if response_mask_full.is_nested else response_mask_full.bool()
         _resp = distillation_losses[_m]
         if _resp.numel() > 0:
             distillation_metrics["distillation/clamp_frac_hi"] = Metric(
@@ -496,6 +528,16 @@ def distillation_loss(
         # typical length. Broadcast over tokens so every token in an over-long sequence carries
         # it, which is what makes it a TRAJECTORY signal rather than another local one.
         _lam_len = float(os.environ.get("OPD_LAMBDA_LEN", "0") or 0)
+        if _lam_len and _fh_horizon:
+            # These two cannot be combined: the length prior measures each trajectory's length
+            # FROM THE MASK, and under a horizon that mask stops at H, so every sequence longer
+            # than H reports length exactly H. The penalty would compare a clipped length against
+            # the teacher reference and read as "no sequence is over-long" -- silently disabling
+            # the intervention rather than erroring.
+            raise ValueError(
+                f"OPD_LAMBDA_LEN={_lam_len} cannot be combined with OPD_FH_HORIZON={_fh_horizon}: "
+                "the length prior would measure horizon-clipped lengths, not true ones."
+            )
         if _lam_len:
             _ref = float(os.environ.get("OPD_REF_LEN", "8624") or 8624)
             _pen, _lm = teacher_length_prior(response_mask, _ref, _lam_len)
