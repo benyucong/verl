@@ -94,7 +94,16 @@ def get_chunk_token_size(config) -> int:
     `OPD_STAGE1_REAL_CHUNKS=1` is set, so the old synthetic A/B mode remains
     opt-in and non-invasive.
     """
-    chunk_tokens = int(config.async_training.get("chunk_tokens", 0) or 0)
+    # OmegaConf under STRUCT MODE raises on a missing key -- for attribute access AND for
+    # .get(key, default), where the default is never reached. The SYNCHRONOUS trainer's config
+    # (verl/trainer/config/ppo_trainer.yaml) has no async_training node at all, so this threw
+    # ConfigAttributeError there. Invisible until state-credit's boundaries-only streaming asked
+    # the question from main_ppo -- and asymmetric, since only the early arm reaches this call.
+    try:
+        _at = config.async_training
+    except Exception:
+        _at = None
+    chunk_tokens = int((_at.get("chunk_tokens", 0) if _at is not None else 0) or 0)
     real_chunks_env = os.environ.get("OPD_STAGE1_REAL_CHUNKS", "0").strip().lower() in {"1", "true", "yes", "on"}
     if chunk_tokens <= 0 and real_chunks_env:
         try:

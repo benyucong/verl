@@ -32,7 +32,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 def _resolve_streaming_chunk_tokens(config) -> int:
     """Resolve chunk size without importing the fully-async stack from the generic agent loop."""
-    async_training = config.get("async_training", {}) if hasattr(config, "get") else {}
+    # Same struct-mode trap as detach_utils.get_chunk_token_size: .get(key, default) RAISES on a
+    # missing key rather than returning the default, and the synchronous trainer's config has no
+    # async_training node.
+    try:
+        async_training = config.get("async_training", {}) if hasattr(config, "get") else {}
+    except Exception:
+        async_training = {}
+    async_training = async_training or {}
     chunk_tokens = 0
     try:
         chunk_tokens = int(async_training.get("chunk_tokens", 0) or 0)
