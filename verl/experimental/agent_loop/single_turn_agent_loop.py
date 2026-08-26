@@ -55,6 +55,16 @@ def _resolve_streaming_chunk_tokens(config) -> int:
     return max(0, chunk_tokens)
 
 
+def _boundaries_only_enabled() -> bool:
+    """State-credit's boundaries-only streaming: chunks are OBSERVED, never published.
+
+    Read from the env rather than imported from the agent-loop worker, to keep this generic loop
+    free of a dependency on the fully-async stack (the same reason
+    _resolve_streaming_chunk_tokens exists here rather than being imported).
+    """
+    return os.environ.get("OPD_STATE_CREDIT_EARLY_SYNC", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _continuous_stream_enabled() -> bool:
     """OPD_CONTINUOUS_STREAM=1: stream chunks out of ONE engine request (default off).
 
@@ -462,7 +472,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 cut_min_gs = _gs if cut_min_gs is None else min(cut_min_gs, _gs)
                 cut_max_gs = _gs if cut_max_gs is None else max(cut_max_gs, _gs)
 
-            if chunk_idx == 0:
+            # The param-version fields are the ASYNC trainer's staleness bookkeeping, supplied by
+            # the fully-async rollouter. Boundaries-only streaming publishes nothing and assembles
+            # nothing, so assemble_batch_from_rollout_samples -- the path whose unhelpful NoneType
+            # error this assertion exists to pre-empt -- is never reached, and the synchronous
+            # trainer has no notion of a param version to supply.
+            if chunk_idx == 0 and not _boundaries_only_enabled():
                 # Fail loudly, by name, on the first chunk. A version field missing from a delta does
                 # not degrade gracefully: it surfaces ~7 minutes later as "unsupported operand
                 # type(s) for -: 'NoneType' and 'NoneType'" out of
