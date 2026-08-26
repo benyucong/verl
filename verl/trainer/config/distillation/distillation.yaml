@@ -100,11 +100,30 @@ state_credit:
   # rollouts per problem, and by every optimizer step.
   M: 4
 
-  # Continuation budget, IDENTICAL at every depth. Per-depth budgets would make Phi a different
-  # functional at each depth and bias every Delta.
+  # The total response HORIZON a continuation is scored against, in tokens. Set it to the
+  # student's own data.max_response_length: under budget_mode=remaining the teacher shares that
+  # budget rather than getting a fresh one.
   B: 20480
 
-  # Weight of the state term against the token-level OPD loss.
+  # How B becomes a per-depth budget.
+  #   remaining: depth d writes B - d tokens, so prefix + continuation obeys the same horizon the
+  #     student trains under. Phi is then one functional at every depth -- "still solvable inside
+  #     the task's budget?" -- and the teacher's context is flat at prompt + B.
+  #   fixed: every depth gets a full B on top of its prefix. A different, budget-free Phi, and a
+  #     deep state is scored with more room than the task ever allows.
+  budget_mode: remaining
+
+  # How a chunk's centered credit reaches its tokens.
+  #   broadcast: every token in the chunk gets the same G~ (Sec 7); the loss aggregator owns 1/T.
+  #   per_chunk: divide by (chunks in row * chunk length), giving each chunk equal TOTAL weight
+  #     (Sec 7.1). That also over-weights a short terminal chunk's tokens, so it is an ablation.
+  credit_norm: broadcast
+
+  # Token-level OPD estimator supplying a_t^OPD in u_t = a_t^OPD + beta * G~. "none" drops the
+  # base signal entirely, which is the credit-only diagnostic arm and not the method.
+  base_loss_mode: k1
+
+  # Weight of the state term against the token-level OPD advantage.
   beta: 1.0
 
   # Which teacher_models entry is the frozen continuation model.

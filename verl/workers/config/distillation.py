@@ -194,7 +194,7 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     def validate_and_prepare_for_distillation(
         self, use_topk: bool, topk: Optional[int], generation_tokens: Optional[int] = None,
-        prefix_length: Optional[int] = None,
+        prefix_length: Optional[int] = None, total_horizon: Optional[int] = None,
     ) -> None:
         """Dimension the teacher engine for how this objective actually uses it.
 
@@ -236,14 +236,25 @@ class DistillationTeacherModelConfig(BaseConfig):
                     f"state_credit depth {prefix_length} must be strictly inside the student "
                     f"response ({student_response_length}); a depth at or past the end has no "
                     f"interior state to evaluate.")
-            need = student_prompt_length + prefix_length + generation_tokens
+            if total_horizon is not None:
+                # budget_mode='remaining': depth d writes B - d tokens, so EVERY sequence is
+                # prompt + d + (B - d) = prompt + B regardless of depth. The context is flat in
+                # depth, which is why this mode is far cheaper to serve than the sum below.
+                need = student_prompt_length + total_horizon
+                detail = (f"prompt {student_prompt_length} + horizon B {total_horizon}, flat in "
+                          f"depth under budget_mode='remaining'")
+                remedy = "Raise max_model_len or lower B."
+            else:
+                # budget_mode='fixed': the deepest prefix still gets a full B on top of it.
+                need = student_prompt_length + prefix_length + generation_tokens
+                detail = (f"prompt {student_prompt_length} + deepest depth {prefix_length} + B "
+                          f"{generation_tokens}")
+                remedy = ("Raise max_model_len, lower the deepest depth, lower B, or switch to "
+                          "budget_mode='remaining', whose context does not grow with depth.")
             if max_model_len is not None and need > max_model_len:
                 raise ValueError(
-                    f"state-credit continuations need {need} tokens of context "
-                    f"(prompt {student_prompt_length} + depth {prefix_length} + B "
-                    f"{generation_tokens}) but the teacher engine has max_model_len={max_model_len}. "
-                    f"Raise max_model_len, lower the deepest depth, or lower B -- but do NOT lower B "
-                    f"per depth, which would make Phi a different functional at each depth.")
+                    f"state-credit continuations need {need} tokens of context ({detail}) but the "
+                    f"teacher engine has max_model_len={max_model_len}. {remedy}")
             self.inference.prompt_length = student_prompt_length + prefix_length
             self.inference.response_length = generation_tokens
             self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
@@ -342,6 +353,11 @@ class OmniOPDConfig(BaseConfig):
             )
 
 
+# Under budget_mode='remaining' the deepest state must still have room to reach an answer.
+# Below this, a Phi of 0 means "did not fit", not "not solvable".
+_MIN_REMAINING_BUDGET = 1024
+
+
 @dataclass
 class StateCreditConfig(BaseConfig):
     """State-Credit OPD: credit a reasoning chunk by the change in how solvable the state becomes.
@@ -355,12 +371,30 @@ class StateCreditConfig(BaseConfig):
     M: continuations per Phi estimate. The dominant recurring cost -- it multiplies by depths, by
         rollouts per problem, and by every optimizer step. Measured separation at M=4 was +0.104
         against a per-problem sampling sd of ~0.35, so this is the floor rather than a default.
-    B: continuation budget, IDENTICAL at every depth. A depth-varying budget would make Phi a
-        different functional per depth and bias Delta -- a deeper prefix would be scored on its
-        ability to finish sooner rather than on its quality. Must be large enough that
-        continuations reach an answer: at 20k thinking-on traces, a probe at B=1024 truncated 99.3%
-        of continuations and measured nothing, while B=20480 truncated 6.9%.
-    beta: weight of the state term against the token-level OPD loss.
+    B: the total response horizon the continuation is scored against, in tokens. Must be large
+        enough that continuations reach an answer: at 20k thinking-on traces, a probe at B=1024
+        truncated 99.3% of continuations and measured nothing, while B=20480 truncated 6.9%.
+    budget_mode: how B converts into a per-depth continuation budget.
+        "remaining" (default) gives depth d exactly B - d tokens, so prefix + continuation obeys the
+            SAME horizon the student trains under. Phi is then one functional everywhere -- "is this
+            state still solvable within the task's budget" -- and Delta measures progress toward
+            finishing on time. It also makes the teacher's context constant at prompt + B.
+        "fixed" gives every depth a full B tokens on top of its prefix. Phi is then a different,
+            budget-free question, and a deep state is scored with more total room than the task ever
+            allows: prompt + max(depths) + B of teacher context, and an optimistic Phi at depth.
+        Neither is "unbiased" in the abstract -- they estimate different Phi. "remaining" is the one
+        that matches the training objective, so it is the default.
+    beta: weight of the state term against the token-level OPD loss, in
+        u_t = a_t^OPD + beta * G_tilde_{j(t)}.
+    credit_norm: how a chunk's centered credit reaches its tokens.
+        "broadcast" (default) gives every token in the chunk the same G_tilde, leaving the 1/T
+            normalisation to the loss aggregator.
+        "per_chunk" divides by (chunks in the row * chunk length), giving every chunk equal TOTAL
+            weight. That also gives a token in a short terminal chunk more weight than one in a full
+            fixed-length chunk, so it is an ablation rather than the default.
+    base_loss_mode: the token-level OPD estimator that supplies a_t^OPD. "k1" is vanilla OPD and
+        keeps the dense base signal. "none" drops it, leaving state credit alone -- a diagnostic
+        arm, not the method.
     pi_c_key: which teacher_models entry serves as the FROZEN continuation model.
     min_survivors: per-(group, depth) floor for leave-one-out. Below this the chunk is DROPPED, not
         centered against zero -- an absent baseline would otherwise become a maximal-magnitude
@@ -370,7 +404,10 @@ class StateCreditConfig(BaseConfig):
     depths: list[int] = field(default_factory=list)
     M: int = 4
     B: int = 20480
+    budget_mode: str = "remaining"
     beta: float = 1.0
+    credit_norm: str = "broadcast"
+    base_loss_mode: str = "k1"
     pi_c_key: str = "math"
     min_survivors: int = 3
 
@@ -388,6 +425,28 @@ class StateCreditConfig(BaseConfig):
             raise ValueError(f"state_credit.M must be >= 2 to estimate Phi, got {self.M}")
         if self.B < 1:
             raise ValueError(f"state_credit.B must be >= 1, got {self.B}")
+        if self.credit_norm not in ("broadcast", "per_chunk"):
+            raise ValueError(
+                f"state_credit.credit_norm must be 'broadcast' or 'per_chunk', got "
+                f"{self.credit_norm!r}")
+        if self.base_loss_mode not in ("k1", "kl", "abs", "mse", "k2", "low_var_kl", "k3", "none"):
+            raise ValueError(
+                f"state_credit.base_loss_mode must be a KL estimator name or 'none', got "
+                f"{self.base_loss_mode!r}")
+        if self.budget_mode not in ("remaining", "fixed"):
+            raise ValueError(
+                f"state_credit.budget_mode must be 'remaining' or 'fixed', got {self.budget_mode!r}")
+        if self.budget_mode == "remaining":
+            # B is the shared horizon here, so it has to leave the DEEPEST state something to write
+            # with. A budget of a few hundred tokens measures truncation, not solvability, so this
+            # refuses at boot rather than returning a Phi of ~0 that looks like a hard state.
+            deepest = max(self.depths)
+            if self.B - deepest < _MIN_REMAINING_BUDGET:
+                raise ValueError(
+                    f"state_credit.budget_mode='remaining' leaves depth {deepest} only "
+                    f"{self.B - deepest} tokens (B={self.B}), under the {_MIN_REMAINING_BUDGET}-token "
+                    f"floor. At that budget Phi measures whether the continuation fits, not whether "
+                    f"the state is solvable. Raise B, or drop the deepest depth.")
         if self.min_survivors < 2:
             raise ValueError(
                 f"state_credit.min_survivors must be >= 2: leave-one-out needs at least one other "
@@ -448,9 +507,29 @@ class DistillationConfig(BaseConfig):
         """How many tokens the teacher must be able to GENERATE, or None if it only scores."""
         ls = self.distillation_loss.loss_settings
         if getattr(ls, "use_teacher_continuations", False):
-            return self.state_credit.B
+            sc = self.state_credit
+            if sc.budget_mode == "remaining" and sc.depths:
+                # The SHALLOWEST depth gets the most room, so that is what the engine's generation
+                # limit has to cover. Sizing it from the deepest instead would clamp the shallow
+                # continuations, and a clamped Phi at depth 0 is exactly the baseline every Delta
+                # is measured against.
+                return sc.B - min(int(d) for d in sc.depths)
+            return sc.B
         if ls.use_teacher_generation:
             return self.omniopd.C
+        return None
+
+    def _teacher_total_horizon(self):
+        """The flat prompt+B context bound under budget_mode='remaining', else None.
+
+        None means the caller falls back to prompt + deepest depth + B, which is the correct (and
+        strictly larger) bound for budget_mode='fixed'.
+        """
+        ls = self.distillation_loss.loss_settings
+        sc = self.state_credit
+        if (getattr(ls, "use_teacher_continuations", False) and sc.depths
+                and sc.budget_mode == "remaining"):
+            return sc.B
         return None
 
     def _teacher_prefix_length(self):
@@ -474,6 +553,16 @@ class DistillationConfig(BaseConfig):
                 "loss_mode requires teacher continuations but state_credit.depths is empty: there "
                 "are no interior states to evaluate, so the objective would be identical to the "
                 "token-level loss while paying for a continuation engine.")
+        if getattr(ls, "use_teacher_continuations", False) and not self.distillation_loss.use_policy_gradient:
+            # The state term enters as an ADVANTAGE (u_t = a^OPD + beta*G~) and only becomes an
+            # objective through the clipped ratio. Backpropagated as a supervised loss it is a
+            # constant with zero gradient: the run trains on the token term alone and reports
+            # perfectly healthy state_credit/* metrics the whole time.
+            raise ValueError(
+                "state_credit requires actor_rollout_ref.actor.distillation_loss.use_policy_gradient"
+                "=True. The state term is an advantage, not a supervised target, and with the "
+                "policy-gradient wrap off it would contribute exactly zero gradient while every "
+                "state_credit metric still looked correct.")
 
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
@@ -483,6 +572,7 @@ class DistillationConfig(BaseConfig):
                 topk=self.distillation_loss.topk,
                 generation_tokens=self._teacher_generation_tokens(),
                 prefix_length=self._teacher_prefix_length(),
+                total_horizon=self._teacher_total_horizon(),
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

@@ -103,6 +103,27 @@ def score_answer(text: str, ground_truth) -> float:
         return float("nan")
 
 
+def sc_budget_for_depth(sc_config, d: int) -> int:
+    """Continuation budget for a probe launched at depth `d`.
+
+    budget_mode='remaining' (default): B is the SHARED horizon, so the continuation gets B - d and
+    prefix + continuation obeys the same total budget the student trains under. Phi then answers one
+    question at every depth -- "is this state still solvable in the budget the task allows" -- and
+    the teacher's context is flat at prompt + B instead of growing with depth.
+
+    budget_mode='fixed': every depth gets a full B on top of its prefix. That is a different Phi
+    (budget-free), and a deep state is scored with more room than the task ever grants it.
+
+    Both call sites -- the early launch and the commit -- MUST route through here. The store's
+    request key includes the budget, so a disagreement between them would not corrupt anything
+    silently: it would simply miss every early launch and quietly re-issue the work.
+    """
+    B = int(sc_config.B)
+    if getattr(sc_config, "budget_mode", "remaining") != "remaining":
+        return B
+    return max(1, B - int(d))
+
+
 async def run_state_credit(
     *,
     prompt_ids: list[int],
@@ -122,7 +143,7 @@ async def run_state_credit(
     what makes the teacher's work overlap generation instead of following it.
     """
     depths = [int(d) for d in (sc_config.depths or [])]
-    M, B = int(sc_config.M), int(sc_config.B)
+    M = int(sc_config.M)
     T = len(response_ids)
 
     reached = [d for d in depths if d < T]
@@ -143,6 +164,7 @@ async def run_state_credit(
         # keyed on DEPTH, stride M, so the M children of one depth never share a stream with
         # another depth's (vLLM seeds children parent+0..parent+M-1)
         d_seed = sc_seed_for_depth(seed, M, d)
+        B = sc_budget_for_depth(sc_config, d)
         got = None
         if store is not None:
             # Awaits an in-flight early launch rather than racing it: that work is already paid
@@ -296,7 +318,7 @@ def launch_state_credit_early(store, *, prompt_ids, response_ids, sc_config, tea
     depths = sorted({int(d) for d in (sc_config.depths or [])})
     if not depths:
         return 0
-    M, B = int(sc_config.M), int(sc_config.B)
+    M = int(sc_config.M)
     n_launched = 0
     resp_len = len(response_ids)
     for d in depths:
@@ -312,11 +334,13 @@ def launch_state_credit_early(store, *, prompt_ids, response_ids, sc_config, tea
         if resp_len < d or d in store.tasks:
             continue
 
-        def _factory(_d=int(d)):
+        B = sc_budget_for_depth(sc_config, d)
+
+        def _factory(_d=int(d), _B=int(B)):
             # Runs on the dispatch loop, after the first yield -- see the note above.
             _p = list(prompt_ids) + list(response_ids[:_d])
             return teacher_manager.generate_chunk_continuations(
-                prefix_ids=_p, n=M, max_tokens=B,
+                prefix_ids=_p, n=M, max_tokens=_B,
                 routing_key=routing_key, session_id=session_id,
                 seed=sc_seed_for_depth(seed, M, _d),
                 # No early call can know it is the last: the depth set is only settled once the

@@ -723,7 +723,46 @@ def compute_distillation_loss_state_credit(
             f"state_credit_weights {tuple(W.shape)} does not match log_probs "
             f"{tuple(log_probs.shape)}; the driver must emit one weight per response position.")
 
-    losses = -(W * log_probs)
+    # ---- the combined advantage, Sec 7 --------------------------------------------------------
+    #   u_t = a_t^OPD + beta * G_tilde_{j(t)},   a_t^OPD = log pi_T(y_t|s_t) - log pi_b(y_t|s_t)
+    #
+    # This function returns a LOSS matrix, and the caller forms advantages = -losses before handing
+    # them to the clipped surrogate. So the loss it needs is (-a^OPD) - beta*W, and (-a^OPD) is
+    # exactly what the k1 estimator already computes: kl_penalty(student, teacher, "k1") =
+    # log pi_S - log pi_T. Reusing it verbatim is what keeps design goal 1 honest -- the base signal
+    # here is the SAME tensor vanilla OPD trains on, not a re-derivation of it.
+    #
+    # pi_b vs pi_theta: the estimator uses the recomputed current-policy logprob, which equals the
+    # behaviour logprob on the first pass over a synchronous batch. At ppo_epochs=1 -- the setting
+    # this objective is specified for -- the two coincide and this IS Sec 7. Above one epoch it is
+    # verl's existing k1 convention, shared with the vanilla-OPD baseline, so the arms stay
+    # comparable; it is not silently a different objective for state-credit alone.
+    sc_cfg = distillation_config.state_credit
+    base_mode = str(getattr(sc_cfg, "base_loss_mode", "k1"))
+    beta = float(getattr(sc_cfg, "beta", 1.0))
+    if base_mode == "none":
+        # Arm D of the design table: state credit with NO token-level teacher supervision. A
+        # diagnostic, not the method -- it answers whether the credit alone carries signal.
+        base = torch.zeros_like(log_probs)
+    else:
+        if "teacher_logprobs" not in data.keys():
+            raise KeyError(
+                "state_credit needs teacher_logprobs for its token-level OPD base term (Sec 7) and "
+                "the batch has none. Either teacher scoring did not run, or this was meant to be "
+                "the credit-only diagnostic -- which must be requested explicitly with "
+                "distillation.state_credit.base_loss_mode=none, not inferred from a missing column.")
+        teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+        if teacher_log_probs.shape != log_probs.shape:
+            raise ValueError(
+                f"teacher_logprobs {tuple(teacher_log_probs.shape)} does not match log_probs "
+                f"{tuple(log_probs.shape)}.")
+        base = kl_penalty(logprob=log_probs, ref_logprob=teacher_log_probs, kl_penalty=base_mode)
+
+    # NOTE: this matrix is only an objective under use_policy_gradient=True, where the caller forms
+    # advantages = -losses. Backpropagated directly, the -beta*W term carries no log pi and would
+    # contribute a constant with exactly zero gradient -- silently, on a run that otherwise looks
+    # healthy. That is refused at config time (DistillationConfig.__post_init__), not here.
+    losses = base - beta * W
     losses = torch.where(response_mask, losses, torch.zeros_like(losses))
 
     nz = (W != 0) & response_mask

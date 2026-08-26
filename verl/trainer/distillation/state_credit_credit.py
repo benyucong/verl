@@ -14,11 +14,18 @@
 """Turn per-depth Phi into a dense per-token credit weight.
 
     Delta_j      = Phi(s_{k_j}) - Phi(s_{k_{j-1}})          progress made by chunk j
-    Delta~_j     = Delta_j - mean_{other rollouts} Delta_j   leave-one-out centering
-    W[b,t]       = Delta~_j / (m_b * l_j)                    for t in chunk j of row b
+    Delta~_j     = Delta_j - mean_{other rollouts of the SAME transition} Delta_j    (leave-one-out)
+    W[b,t]       = Delta~_{j(t)}                             for t in chunk j of row b
 
-so that sum_t W[b,t]*(-log pi) reproduces -(1/m_b) sum_j Delta~_j * logbar_j, with logbar the
-chunk's MEAN log-prob.
+W is the state term of the combined advantage u_t = a_t^OPD + beta * W[b,t] (Sec 7). It is
+broadcast to the chunk's tokens unchanged; the 1/T normalisation belongs to the loss aggregator.
+
+credit_norm="per_chunk" instead spreads it as Delta~_j / (m_b * l_j), so summing over a row gives
+-(1/m_b) sum_j Delta~_j * logbar_j with logbar the chunk's MEAN log-prob. That is the Sec 7.1
+equal-per-chunk objective: it weights a short terminal chunk's tokens more heavily than a full
+fixed-length chunk's, which is why it is the ablation and not the default.
+
+CENTERING IS PER TRANSITION, not per ordinal chunk index -- see the comment at the grouping loop.
 
 WHY THIS LIVES IN THE DRIVER AND NOT THE LOSS. Centering is across the rollouts OF ONE PROBLEM, and
 by the time a micro-batch reaches the loss those siblings are gone: balance_batch reorders rows onto
@@ -101,6 +108,7 @@ def build_state_credit_weights(
     terminal,                 # (n_rows,) task reward = Phi(s_T)
     response_lengths,         # (n_rows,) true token count, NOT response_length
     max_response_len: int,
+    credit_norm: str = "broadcast",
     min_survivors: int = 3,
     M: int | None = None,     # continuations per state; None => infer from Phi's lattice
 ):
@@ -113,7 +121,7 @@ def build_state_credit_weights(
     # ---- per row: the chunk boundaries and the RAW progress of each chunk ----------------------
     # Chunk j spans (k_{j-1}, k_j]; the last chunk runs from the deepest reached depth to the end,
     # and its Phi target is the terminal reward.
-    raw = []          # list of (row, [(lo, hi, delta_raw, n_sampled)])
+    raw = []          # list of (row, [(lo, hi, delta_raw, n_sampled, transition_key)])
     phi_obs: list[float] = []   # the Phi values themselves, for the sampling-noise floor
     for b in range(n):
         d = [int(x) for x in (depths[b] or [])]
@@ -128,49 +136,66 @@ def build_state_credit_weights(
         for k, ph in zip(d, p):
             k = min(k, T)
             if prev_phi is not None and k > prev_k:
-                # interior: BOTH ends are Phi-hats, so this delta carries two draws of noise
-                bounds.append((prev_k, k, ph - prev_phi, 2))
+                # interior: BOTH ends are Phi-hats, so this delta carries two draws of noise.
+                # Keyed by the DEPTH PAIR, which comes from the fixed schedule and so means the same
+                # transition ("2560 -> 5120") in every trajectory that reached it.
+                bounds.append((prev_k, k, ph - prev_phi, 2, ("i", prev_k, k)))
             prev_phi, prev_k = ph, k
         if prev_phi is not None and T > prev_k:
-            # terminal: the far end is the verifier's exact reward, so only ONE sampled term
-            bounds.append((prev_k, T, _phi_terminal(terminal[b]) - prev_phi, 1))
+            # terminal: the far end is the verifier's exact reward, so only ONE sampled term. T is
+            # not on the fixed schedule, so the key carries only the PRECEDING anchor -- two rows
+            # are comparable here if they left the same fixed depth, whatever length they ran to.
+            bounds.append((prev_k, T, _phi_terminal(terminal[b]) - prev_phi, 1, ("t", prev_k)))
         raw.append(bounds)
         stats["chunks_total"] += len(bounds)
 
-    # ---- leave-one-out per (problem, chunk index) ----------------------------------------------
+    # ---- leave-one-out per (problem, TRANSITION) ------------------------------------------------
+    # Keyed by the transition, NOT by ordinal chunk index. Ordinal index is not a comparable label
+    # once responses differ in length: with a fixed 2560 schedule, chunk 2 of a 6k response is its
+    # terminal chunk while chunk 2 of a 17k response is the interior 5120->7680. Centering those
+    # against each other subtracts a baseline drawn from a different quantity, which shows up as
+    # credit that tracks response length rather than progress.
     groups: dict = {}
     for b, u in enumerate(uids):
-        groups.setdefault(str(u), []).append(b)
-    stats["groups"] = len(groups)
+        for idx, ent in enumerate(raw[b]):
+            groups.setdefault((str(u), ent[4]), []).append((b, idx))
+    stats["groups"] = len({g[0] for g in groups})
+    stats["transitions"] = len(groups)
 
     centered_all: list[float] = []
     n_sampled: list[int] = []
     group_sizes: list[int] = []
-    for _u, rows in groups.items():
-        depth_count = max((len(raw[b]) for b in rows), default=0)
-        for j in range(depth_count):
-            vals = [(b, raw[b][j][2]) for b in rows
-                    if j < len(raw[b]) and raw[b][j][2] == raw[b][j][2]]   # drop NaN
-            if len(vals) < min_survivors:
-                stats["chunks_dropped_small_group"] += len(vals)
-                if len(vals):
-                    stats["groups_too_small"] += 1
-                continue
-            total = sum(v for _, v in vals)
-            k = len(vals)
-            group_sizes.append(k)
-            n_sampled.extend(raw[b][j][3] for b, _ in vals)
-            for b, v in vals:
-                # leave-one-out: this row's delta against the mean of the OTHERS
-                baseline = (total - v) / (k - 1)
-                centered = v - baseline
-                centered_all.append(centered)
-                lo, hi, _, _ = raw[b][j]
-                m_b = len(raw[b])
-                l_j = max(1, hi - lo)
-                hi_c = min(hi, max_response_len)
-                if hi_c > lo:
+    for _key, members in groups.items():
+        vals = [(b, idx) for b, idx in members if raw[b][idx][2] == raw[b][idx][2]]  # drop NaN
+        stats["chunks_dropped_nan"] += len(members) - len(vals)
+        if len(vals) < min_survivors:
+            stats["chunks_dropped_small_group"] += len(vals)
+            if len(vals):
+                stats["groups_too_small"] += 1
+            continue
+        total = sum(raw[b][idx][2] for b, idx in vals)
+        k = len(vals)
+        group_sizes.append(k)
+        n_sampled.extend(raw[b][idx][3] for b, idx in vals)
+        for b, idx in vals:
+            lo, hi, v, _, _ = raw[b][idx]
+            # leave-one-out: this row's delta against the mean of the OTHERS
+            baseline = (total - v) / (k - 1)
+            centered = v - baseline
+            centered_all.append(centered)
+            hi_c = min(hi, max_response_len)
+            if hi_c > lo:
+                if credit_norm == "per_chunk":
+                    # Sec 7.1 ablation: equal TOTAL weight per chunk, which also hands a token in a
+                    # short terminal chunk more weight than one in a full fixed-length chunk.
+                    m_b = max(1, len(raw[b]))
+                    l_j = max(1, hi - lo)
                     W[b, lo:hi_c] = centered / (m_b * l_j)
+                else:
+                    # Sec 7 default: broadcast the chunk credit to each of its tokens unchanged, so
+                    # u_t = a_t^OPD + beta * G_tilde_{j(t)}. The 1/T normalisation is the loss
+                    # aggregator's, not this function's.
+                    W[b, lo:hi_c] = centered
     stats["rows_credited"] = int((np.abs(W).sum(axis=1) > 0).sum())
     # Magnitude of the centered credit, BEFORE the 1/(m_b*l_j) spread over tokens. Without this the
     # objective cannot be told apart from its own sampling noise: Phi is a mean over M continuations,
@@ -236,6 +261,7 @@ def attach_state_credit_weights(batch, config, metrics: dict) -> None:
         terminal=terminal,
         response_lengths=lengths,
         max_response_len=int(resp_mask.shape[1]),
+        credit_norm=str(getattr(sc, "credit_norm", "broadcast")),
         min_survivors=int(sc.min_survivors),
         M=int(sc.M),   # known; the noise floor must not have to guess it
     )
@@ -245,5 +271,7 @@ def attach_state_credit_weights(batch, config, metrics: dict) -> None:
         metrics[f"state_credit/{k}"] = v
     print(f"[STATE-CREDIT] rows={stats['rows']} credited={stats['rows_credited']} "
           f"chunks={stats['chunks_total']} dropped_small_group="
-          f"{stats['chunks_dropped_small_group']} groups={stats['groups']}", flush=True)
+          f"{stats['chunks_dropped_small_group']} groups={stats['groups']} "
+          f"transitions={stats['transitions']} norm={getattr(sc, 'credit_norm', 'broadcast')}",
+          flush=True)
 
