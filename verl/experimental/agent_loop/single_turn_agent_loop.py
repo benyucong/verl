@@ -539,7 +539,18 @@ class SingleTurnAgentLoop(AgentLoopBase):
             # `keep = chunk_tokens` cuts only when MORE than a full chunk is buffered, so at least
             # one token always survives to be staged as final. It costs one token of emit latency
             # per chunk and makes the boundary case impossible by construction rather than caught.
-            keep = chunk_tokens
+            #
+            # BOUNDARIES-ONLY keeps nothing back. The hold-back exists to guarantee a final chunk
+            # for the ASSEMBLER; the failure it prevents runs assembler -> additive rescan -> FIFO
+            # duplicate, and every step of that chain requires the chunk to be PUBLISHED. This mode
+            # publishes nothing and skips is_final entirely, so none of it is reachable.
+            #
+            # It costs a full chunk of latency on the only thing this mode exists for: with
+            # keep=chunk_tokens a cut needs MORE than a chunk buffered, so depth d is first observed
+            # at d + chunk_tokens generated tokens -- 3072 for d=2048, c=1024. Any response shorter
+            # than that could never launch early at all, and every longer one launched a full chunk
+            # late.
+            keep = 0 if _boundaries_only_enabled() else chunk_tokens
             while len(buf_ids) > keep:
                 if not _stage(buf_ids[:chunk_tokens], buf_lps[:chunk_tokens], False,
                               ents=buf_ents[:chunk_tokens] if buf_ents else None):

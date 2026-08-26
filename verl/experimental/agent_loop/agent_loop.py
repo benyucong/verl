@@ -694,6 +694,25 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            # PER-TRAJECTORY IDENTITY. xiaoshuai_sample_id is written in exactly one place --
+            # fully_async_rollouter -- so on the SYNCHRONOUS trainer it is absent and every
+            # trajectory reports sid=None. _state_credit_store keys on str(session_id), so all
+            # rollout.n siblings in a worker then shared ONE store with ONE slot per depth, and
+            # `if d in store.tasks` silently dropped all but the first. Verified: 29/29 rows
+            # sid=None on job 45074068, against 128 distinct sids on the async arm.
+            #
+            # Mirrors the async id shape (sample_<step>_<index>_r<n>) so logs and the store key
+            # look the same on both paths. Only synthesised when absent, so the async path is
+            # untouched.
+            #
+            # Side effect, deliberate: a non-None session_id turns on stable teacher routing
+            # (teacher_manager: use_stable_routing = session_id is not None). With one replica
+            # that is a no-op, and per-parent FIFO is off unless OPD_TEACHER_PER_PARENT_FIFO is
+            # set, so nothing serialises.
+            if kwargs.get("xiaoshuai_sample_id") in (None, ""):
+                kwargs["xiaoshuai_sample_id"] = (
+                    f"sample_{trajectory['step']}_{trajectory['sample_index']}"
+                    f"_r{trajectory['rollout_n']}")
             run_kwargs = dict(kwargs)
             stream_state = None
             if self._should_stream_chunks(agent_name=agent_name, validate=trajectory["validate"]):
