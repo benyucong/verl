@@ -127,7 +127,13 @@ def score_answer(text: str, ground_truth, fast: bool = False) -> float:
         logger.error("[STATE-CREDIT] verifier unavailable; Phi cannot be computed")
         raise
     try:
-        s = compute_score(text, ground_truth, fast=fast)
+        # str(), because the TERMINAL reward does: custom_reward.ttrl_math.reward_func calls
+        # compute_score(solution_str, str(ground_truth)). compute_score branches on the type --
+        # a list ground truth is graded with OR-over-elements, a string literally -- so passing the
+        # raw object here and a stringified one there would make the two ends of every terminal
+        # delta different functions of the same answer. Latent on DAPO-Math (17917/17917 ground
+        # truths are already str) and NOT latent on the AIME/AMC sets, which carry lists.
+        s = compute_score(text, str(ground_truth), fast=fast)
         return float(s["score"] if isinstance(s, dict) else s)
     except Exception as e:
         # A verifier failure is NOT evidence the state was bad. Counted separately so it cannot be
