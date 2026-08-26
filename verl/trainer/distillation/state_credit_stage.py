@@ -60,6 +60,27 @@ def state_credit_enabled(config) -> bool:
         return False
 
 
+def state_credit_needs_teacher_scores(config) -> bool:
+    """True when the state-credit objective also needs token-level teacher scores.
+
+    Sec 7's advantage is u_t = a_t^OPD + beta * G~, so arm C consumes BOTH halves of the Sec 8
+    probe: the prefill that scores the completed chunk AND the continuations that value the state.
+    Only base_loss_mode='none' -- the credit-only diagnostic, arm D -- can do without the first.
+
+    Read off the RAW config rather than a resolved dataclass: the agent loop runs before the
+    trainer's dataclass conversion, and this decides whether a teacher RPC is issued at all.
+    """
+    if not state_credit_enabled(config):
+        return False
+    try:
+        mode = config.distillation.state_credit.base_loss_mode
+    except Exception:
+        # The key is in the schema; its absence means an older composed config, where the objective
+        # had no base term at all. Defaulting to False there would silently reproduce arm D.
+        return True
+    return str(mode) != "none"
+
+
 def resolve_state_credit_config(config):
     """The state_credit node from the raw DictConfig, or the dataclass defaults if absent.
 
@@ -81,12 +102,24 @@ def resolve_state_credit_config(config):
     return StateCreditConfig()
 
 
-def score_answer(text: str, ground_truth) -> float:
+def score_answer(text: str, ground_truth, fast: bool = False) -> float:
     """Q(x, y) in {0, 1}.
 
-    fast=True: grade_answer_mathd (a normalising string compare) runs first and short-circuits, so
-    the sympy path -- which forks a process for its timeout -- is reached only when the cheap check
-    fails. That matters at M continuations per depth per row.
+    `fast` MUST match the grader that produces the terminal reward, and it defaults to False for
+    that reason. Sec 4 makes Phi an operational quantity -- "solvable by this policy under this
+    budget, as judged by THIS verifier" -- and Sec 5's terminal delta subtracts the two directly:
+
+        Delta_m = Phi(s_T) - Phi(s_{k_{m-1}}) = Q_terminal(x, y) - Phi_hat_interior
+
+    fast=True is not a cheaper approximation of the same verdict, it is a strictly smaller one:
+    grade() runs the mathd/sympy pair either way and only the slow path adds the is_latex_equal
+    recall pass, so fast=True can turn a correct answer into a wrong one and never the reverse.
+    Grading the interior end fast and the terminal end fully therefore biases every terminal chunk
+    upward by the recall gap -- and biases it by a DIFFERENT amount per problem, so leave-one-out
+    does not remove it.
+
+    The cost this was avoiding is real and is paid only on continuations the cheap path already
+    rejected (roughly 1 - Phi of them), so it scales with how badly the student is doing.
     """
     try:
         from custom_reward.ttrl_math import compute_score
@@ -94,7 +127,7 @@ def score_answer(text: str, ground_truth) -> float:
         logger.error("[STATE-CREDIT] verifier unavailable; Phi cannot be computed")
         raise
     try:
-        s = compute_score(text, ground_truth, fast=True)
+        s = compute_score(text, ground_truth, fast=fast)
         return float(s["score"] if isinstance(s, dict) else s)
     except Exception as e:
         # A verifier failure is NOT evidence the state was bad. Counted separately so it cannot be
@@ -150,7 +183,8 @@ async def run_state_credit(
     tele = {"sc_depths_requested": len(depths), "sc_depths_reached": len(reached),
             "sc_response_len": T, "sc_gen_seconds": 0.0, "sc_gen_tokens": 0,
             "sc_truncated": 0, "sc_scored": 0, "sc_verifier_failed": 0,
-            "sc_trunc_unmeasured": 0, "sc_cont_max_tokens": 0}
+            "sc_trunc_unmeasured": 0, "sc_cont_max_tokens": 0,
+            "sc_prefix_tokens_logical": 0, "sc_prefix_tokens_cached": 0}
     if not reached:
         # Not an error: a short trajectory has no interior state to evaluate. The driver drops it
         # from every LOO group rather than crediting it against a baseline it never joined.
@@ -192,6 +226,14 @@ async def run_state_credit(
             raise RuntimeError(
                 f"state-credit: depth {d} returned {len(seqs)} continuations, asked for {M}. Phi "
                 f"from a short sample is a different estimator, not a noisier one.")
+        # Sec 10 / Sec 14.4: logical vs PHYSICAL prefix work. The teacher ingests prompt + y[:d] at
+        # every boundary and those prefixes are nested, so most of it should come back from the
+        # prefix cache -- "high logical-prefix volume is not equivalent to high physical prefill
+        # work when cache reuse succeeds". Both numbers were already being measured per request and
+        # then dropped on the floor, which left the one quantity that distinguishes the two
+        # unobservable and the Sec 8 sharing claim unfalsifiable.
+        tele["sc_prefix_tokens_logical"] += int((t or {}).get("teacher_prefix_tokens") or 0)
+        tele["sc_prefix_tokens_cached"] += int((t or {}).get("teacher_cached_tokens") or 0)
         fr = (t or {}).get("finish_reasons") or []
         if len(fr) < len(seqs):
             # No finish reasons for these rows: truncation is UNMEASURED here, not zero.
@@ -200,7 +242,8 @@ async def run_state_credit(
         qs = []
         for j, sq in enumerate(seqs):
             cont = tokenizer.decode(sq, skip_special_tokens=True)
-            q = score_answer(prefix_text + cont, ground_truth)
+            q = score_answer(prefix_text + cont, ground_truth,
+                             fast=bool(getattr(sc_config, "verifier_fast", False)))
             if q != q:                              # NaN -> verifier failed, not a zero
                 tele["sc_verifier_failed"] += 1
                 continue
@@ -268,12 +311,16 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
         # followed it and the run is the sequential arm wearing a streaming label. `wall` minus
         # `gen_s` is the part the overlap actually removes.
         print("[STATE-CREDIT] sid=%s T=%d depths=%s phi=%s trunc=%.3f gen_s=%.1f vfail=%d "
-              "early=%d/%d maxcont=%d wall=%.1f"
+              "early=%d/%d maxcont=%d prefix=%d/%d wall=%.1f"
               % (session_id, te["sc_response_len"], rec["state_credit_depths"],
                  ["%.3f" % p for p in rec["state_credit_phi"]],
                  te.get("sc_trunc_frac", 0.0), te["sc_gen_seconds"],
                  te["sc_verifier_failed"], te.get("sc_reused_early", 0),
                  len(rec["state_credit_depths"]), te.get("sc_cont_max_tokens", 0),
+                 # cached/logical -- Sec 14.4. Nested boundary prefixes SHOULD make these nearly
+                 # equal; a cached count well below logical is the cache-contention hazard of
+                 # Sec 16.7 showing up, not a scheduling problem.
+                 te.get("sc_prefix_tokens_cached", 0), te.get("sc_prefix_tokens_logical", 0),
                  time.time() - t0), flush=True)
 
 

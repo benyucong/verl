@@ -120,7 +120,8 @@ def build_state_credit_weights(
     n = len(uids)
     W = np.zeros((n, max_response_len), dtype=np.float32)
     stats = {"rows": n, "rows_credited": 0, "chunks_total": 0, "chunks_dropped_small_group": 0,
-             "chunks_dropped_nan": 0, "groups": 0, "groups_too_small": 0}
+             "chunks_dropped_nan": 0, "groups": 0, "groups_too_small": 0,
+             "rows_below_first_depth": 0}
 
     # ---- per row: the chunk boundaries and the RAW progress of each chunk ----------------------
     # Chunk j spans (k_{j-1}, k_j]; the last chunk runs from the deepest reached depth to the end,
@@ -154,6 +155,22 @@ def build_state_credit_weights(
         #
         # n_sampled=1: Phi(s_0) contributes no variance to the centered value because it cancels, so
         # this delta carries one sampled term, not two.
+        if not d and T > 0:
+            # T < d_1: the trajectory ended before the first fixed boundary. Sec 3 still gives it a
+            # valid boundary set -- keep the depths below T (none) and append T -- so it has exactly
+            # one chunk, (0, T], with Delta_1 = Phi(s_T) - Phi(s_0) = Q(x, y) - Phi(s_0). The same
+            # cancellation as above makes the constant free, so this needs NO continuations at all.
+            #
+            # Dropping these rows instead (what run_state_credit's empty-`reached` return leads to)
+            # removes exactly the SHORT trajectories from every credit group -- a length-correlated
+            # hole in the supervision, and one that widens as the student learns to answer sooner.
+            # Keyed ("t", 0): terminal, leaving the anchor 0, so it centres only against other rows
+            # that also ended before the first boundary.
+            raw.append([(0, T, _phi_terminal(terminal[b]), 1, ("t", 0))])
+            stats["chunks_total"] += 1
+            stats["rows_below_first_depth"] = stats.get("rows_below_first_depth", 0) + 1
+            continue
+
         bounds, prev_phi, prev_k = [], None, 0
         for k, ph in zip(d, p):
             k = min(k, T)
@@ -290,6 +307,24 @@ def attach_state_credit_weights(batch, config, metrics: dict) -> None:
         min_survivors=int(sc.min_survivors),
         M=int(sc.M),   # known; the noise floor must not have to guess it
     )
+    # Sec 14.4 aggregates. These ride the batch as a per-row telemetry column and had no consumer:
+    # every quantity below was measured per trajectory and then existed only in a log line.
+    tele_rows = list(ntb["state_credit_telemetry"]) if "state_credit_telemetry" in ntb else []
+    if tele_rows:
+        def _sum(k):
+            return float(sum(float((r or {}).get(k) or 0.0) for r in tele_rows))
+        logical, cached = _sum("sc_prefix_tokens_logical"), _sum("sc_prefix_tokens_cached")
+        stats["prefix_tokens_logical"] = logical
+        stats["prefix_tokens_cached"] = cached
+        # NaN, not 1.0, when there is no prefix work: a reuse ratio of "no data" must not read as
+        # perfect reuse on the one metric that would expose the opposite.
+        stats["prefix_reuse_frac"] = (cached / logical) if logical > 0 else float("nan")
+        stats["teacher_gen_seconds"] = _sum("sc_gen_seconds")
+        stats["teacher_gen_tokens"] = _sum("sc_gen_tokens")
+        stats["continuations_scored"] = _sum("sc_scored")
+        stats["verifier_failed"] = _sum("sc_verifier_failed")
+        stats["trunc_unmeasured"] = _sum("sc_trunc_unmeasured")
+
     batch.batch["state_credit_weights"] = _torch.as_tensor(
         W, dtype=_torch.float32, device=resp_mask.device)
     for k, v in stats.items():

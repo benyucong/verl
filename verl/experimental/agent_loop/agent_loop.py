@@ -54,7 +54,8 @@ from verl.trainer.distillation.omniopd_stage import (attach_omniopd_audit, omnio
                                                       resolve_omniopd_config)
 from verl.trainer.distillation.state_credit_stage import (attach_state_credit,
                                                           resolve_state_credit_config,
-                                                          state_credit_enabled, launch_state_credit_early)
+                                                          state_credit_enabled, launch_state_credit_early,
+                                                          state_credit_needs_teacher_scores)
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -492,6 +493,7 @@ class AgentLoopWorker:
         self.config = config
         self._omniopd_enabled = False   # set once distillation resolves; see below
         self._state_credit_enabled = False
+        self._state_credit_needs_scores = False
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
@@ -514,6 +516,7 @@ class AgentLoopWorker:
             self.teacher_key: str = config.distillation.teacher_key
             self._omniopd_enabled = omniopd_enabled(self.config)
             self._state_credit_enabled = state_credit_enabled(self.config)
+            self._state_credit_needs_scores = state_credit_needs_teacher_scores(self.config)
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
                 teacher_client=teacher_client,
@@ -1396,14 +1399,37 @@ class AgentLoopWorker:
             # exact KL against the frozen initial policy, and never a teacher logprob. Running both
             # would pay for a full-sequence teacher forward whose result nothing consumes.
             if self._state_credit_enabled:
-                await self._compute_state_credit(
+                # BOTH halves of the Sec 8 probe. State-credit is not a replacement for teacher
+                # scoring the way OmniOPD is -- Sec 7's advantage is u_t = a_t^OPD + beta*G~, so it
+                # consumes the token-level score AND the continuations. Issuing only the
+                # continuations (what the else-branch structure did before) leaves the batch with no
+                # teacher_logprobs column at all, and the objective silently degrades to arm D, the
+                # credit-only diagnostic. The loss now refuses that rather than training on it, so
+                # the symptom is a KeyError at the first backward -- after a full rollout is paid
+                # for.
+                #
+                # gather, not sequential await: the scoring prefill and the continuation decode are
+                # independent requests to the same pool, and the continuations are the long pole.
+                # Serialising them would put a full-sequence prefill on the critical path behind
+                # them for no reason.
+                _sc_calls = [self._compute_state_credit(
                     output,
                     prompt_ids=output.prompt_ids,
                     response_ids=output.response_ids,
                     validate=validate,
                     sample_kwargs=kwargs,
                     chunk_is_final=chunk_is_final,
-                )
+                )]
+                if self._state_credit_needs_scores:
+                    _sc_calls.append(self._compute_teacher_logprobs(
+                        output,
+                        prompt_ids=output.prompt_ids,
+                        response_ids=output.response_ids,
+                        validate=validate,
+                        sample_kwargs=kwargs,
+                        chunk_is_final=chunk_is_final,
+                    ))
+                await asyncio.gather(*_sc_calls)
             elif self._omniopd_enabled:
                 await self._compute_omniopd_audit(
                     output,

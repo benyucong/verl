@@ -395,6 +395,11 @@ class StateCreditConfig(BaseConfig):
     base_loss_mode: the token-level OPD estimator that supplies a_t^OPD. "k1" is vanilla OPD and
         keeps the dense base signal. "none" drops it, leaving state credit alone -- a diagnostic
         arm, not the method.
+    verifier_fast: grade interior continuations with the FAST verifier. Default False so Phi and the
+        terminal reward come from the same Q, as Sec 4 requires. Setting it True is a measured
+        speedup with a known bias: the fast grader skips the is_latex_equal recall pass, so it can
+        only mark a correct continuation wrong, which inflates every terminal delta by a
+        problem-dependent amount that leave-one-out does not remove.
     pi_c_key: which teacher_models entry serves as the FROZEN continuation model.
     min_survivors: per-(group, depth) floor for leave-one-out. Below this the chunk is DROPPED, not
         centered against zero -- an absent baseline would otherwise become a maximal-magnitude
@@ -408,6 +413,7 @@ class StateCreditConfig(BaseConfig):
     beta: float = 1.0
     credit_norm: str = "broadcast"
     base_loss_mode: str = "k1"
+    verifier_fast: bool = False
     pi_c_key: str = "math"
     min_survivors: int = 3
 

@@ -123,6 +123,12 @@ state_credit:
   # base signal entirely, which is the credit-only diagnostic arm and not the method.
   base_loss_mode: k1
 
+  # Grade interior continuations with the FAST verifier. Keep False: Phi and the terminal reward
+  # must come from the SAME Q (Sec 4), and the fast grader skips the is_latex_equal recall pass, so
+  # it can only turn a correct continuation into a wrong one. Mixing the two biases every terminal
+  # delta upward by a problem-dependent amount that leave-one-out does not remove.
+  verifier_fast: false
+
   # Weight of the state term against the token-level OPD advantage.
   beta: 1.0
 
