@@ -27,6 +27,10 @@ fixed-length chunk's, which is why it is the ablation and not the default.
 
 CENTERING IS PER TRANSITION, not per ordinal chunk index -- see the comment at the grouping loop.
 
+Phi(s_0) is never computed. It is one constant per problem, so it cancels exactly out of the
+leave-one-out centering of the first chunk -- which means chunk 1 is credited for FREE, not skipped.
+See the note at the boundary construction.
+
 WHY THIS LIVES IN THE DRIVER AND NOT THE LOSS. Centering is across the rollouts OF ONE PROBLEM, and
 by the time a micro-batch reaches the loss those siblings are gone: balance_batch reorders rows onto
 DP ranks BY LENGTH -- so two rollouts of one problem with different lengths land on different GPUs
@@ -130,12 +134,33 @@ def build_state_credit_weights(
         T = int(response_lengths[b])
         if len(d) != len(p):
             raise ValueError(f"row {b}: {len(d)} depths but {len(p)} Phi values")
-        # Phi(s_0) is not needed: it is identical across a problem's rollouts and cancels under LOO.
-        # So the FIRST chunk has no defined progress and is not credited.
+        # THE FIRST CHUNK (0 -> d_1). Its progress is Phi(s_{d_1}) - Phi(s_0), and s_0 = (x, empty)
+        # is the SAME state for every rollout of a problem -- so Phi(s_0) is one constant per group.
+        # Leave-one-out subtracts a mean of the same quantity over siblings, and adding a constant to
+        # every member of a group leaves the centered value untouched:
+        #
+        #   G~_i = [Phi_i(d_1) - Phi(s_0)] - mean_{n!=i}[Phi_n(d_1) - Phi(s_0)]
+        #        =  Phi_i(d_1)            - mean_{n!=i} Phi_n(d_1)
+        #
+        # So the centered credit for chunk 1 is available WITHOUT ever running continuations from
+        # s_0. That is why the raw delta stored here is Phi_i(d_1) alone. It is not the true Delta_1
+        # -- it is offset by the unknown constant Phi(s_0) -- which matters only for the uncentered
+        # diagnostic, never for W.
+        #
+        # Dropping this chunk instead (what the earlier version did, on the same cancellation
+        # argument) left the first d_1 tokens of EVERY trajectory with zero state credit: a quarter
+        # of a median response here, and for a trajectory that reaches only one depth, half its
+        # chunks. Cancellation is the reason chunk 1 is FREE, not the reason to skip it.
+        #
+        # n_sampled=1: Phi(s_0) contributes no variance to the centered value because it cancels, so
+        # this delta carries one sampled term, not two.
         bounds, prev_phi, prev_k = [], None, 0
         for k, ph in zip(d, p):
             k = min(k, T)
-            if prev_phi is not None and k > prev_k:
+            if prev_phi is None:
+                if k > 0:
+                    bounds.append((0, k, ph, 1, ("i", 0, k)))
+            elif k > prev_k:
                 # interior: BOTH ends are Phi-hats, so this delta carries two draws of noise.
                 # Keyed by the DEPTH PAIR, which comes from the fixed schedule and so means the same
                 # transition ("2560 -> 5120") in every trajectory that reached it.
