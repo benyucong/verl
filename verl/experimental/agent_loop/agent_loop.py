@@ -763,9 +763,50 @@ class AgentLoopWorker:
                 **kwargs,
             )
 
+    def _early_boundaries_only(self) -> bool:
+        """Stream chunk BOUNDARIES with no publishing, so early continuation works without a queue.
+
+        State-credit's early launch needs one thing from streaming: a point mid-generation where
+        "the stream has passed depth d" is observable. It does not need the chunks themselves --
+        those exist to feed the async trainer's message queue.
+
+        The synchronous trainer never creates a chunk_message_queue_client (it is set in exactly
+        two places, both in fully_async_rollouter), so _should_stream_chunks returned False, no
+        callback was attached, chunk_is_final stayed None, and the hook -- guarded on `is False` --
+        could never fire. An `EARLY=1` arm there was a byte-identical A/A with its control.
+
+        This mode attaches the callback and fires ONLY the launch. Nothing is postprocessed and
+        nothing is published, so the expensive padded-DataProto build that F mode exists to skip
+        never happens either.
+
+        Requires continuous streaming. The default chunking path obtains boundaries by ENDING the
+        vLLM request every chunk_tokens and resubmitting the prefix, which changes what is sampled
+        -- unacceptable when the whole point is an A/B whose arms must generate identically.
+        """
+        if self.chunk_message_queue_client is not None:
+            return False          # the async path publishes for real; not this mode
+        if not (self._state_credit_enabled and self.distillation_enabled):
+            return False
+        if os.environ.get("OPD_STATE_CREDIT_EARLY_SYNC", "0") in ("0", "", "false", "False"):
+            return False
+        # ENFORCED, not merely documented. Without continuous streaming the boundaries come from
+        # ending and resubmitting the vLLM request, so the two arms would not generate the same
+        # tokens and the comparison would measure resubmission, not overlap.
+        if os.environ.get("OPD_CONTINUOUS_STREAM", "0") in ("0", "", "false", "False"):
+            raise ValueError(
+                "OPD_STATE_CREDIT_EARLY_SYNC=1 requires OPD_CONTINUOUS_STREAM=1. Without it chunk "
+                "boundaries are obtained by ENDING the vLLM request every chunk_tokens and "
+                "resubmitting the prefix, which changes what is sampled -- so the early arm would "
+                "differ from its control in generation as well as in launch timing, and the A/B "
+                "would not measure overlap.")
+        return True
+
     def _should_stream_chunks(self, *, agent_name: str, validate: bool) -> bool:
         """Return True when this worker can publish trainer-visible chunks during generation."""
-        if validate or self.chunk_message_queue_client is None or agent_name != "single_turn_agent":
+        if validate or agent_name != "single_turn_agent":
+            return False
+        # Boundaries-only needs no queue client -- it publishes nothing.
+        if self.chunk_message_queue_client is None and not self._early_boundaries_only():
             return False
         if not self.distillation_enabled:
             return False
@@ -789,6 +830,17 @@ class AgentLoopWorker:
             n_tokens: int,
             is_final: bool,
         ) -> bool:
+            if self._early_boundaries_only():
+                # The boundary is the whole point. Fire the launch and return False so
+                # stream_state records no emission and the ordinary whole-response path runs
+                # exactly as it would with no streaming at all.
+                if not is_final:
+                    try:
+                        self._state_credit_early_launch(output, sample_kwargs=sample_kwargs)
+                    except Exception:
+                        logger.warning("[STATE-CREDIT] early launch failed at a boundary; "
+                                       "the commit still issues every depth itself", exc_info=True)
+                return False
             published = await self._publish_streaming_chunk(
                 output,
                 sample_kwargs=sample_kwargs,
