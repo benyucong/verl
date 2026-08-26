@@ -185,3 +185,65 @@ def build_state_credit_weights(
         stats["credit_sd"] = float(arr.std())
         stats["credit_noise_floor"] = float(_noise_floor(phi_obs, group_sizes, n_sampled, M))
     return W, stats
+
+# ---------------------------------------------------------------------------------------------
+# DRIVER-SIDE ENTRY POINT
+#
+# Shared by BOTH trainers. The async path calls it from separation/ray_trainer.py; the
+# synchronous path (trainer/ppo/ray_trainer.py) calls it after token_level_scores lands. It has
+# to live in the DRIVER either way: leave-one-out centres a rollout against its siblings, and
+# once a batch is dispatched to workers each rank holds only its own slice, so the siblings are
+# gone. Row ORDER does not matter here -- grouping is by uid, and W is stored on the batch so
+# any later reordering carries it along.
+# ---------------------------------------------------------------------------------------------
+
+def attach_state_credit_weights(batch, config, metrics: dict) -> None:
+    """Turn per-depth Phi into the dense weight the State-Credit loss consumes.
+
+    No-op unless the loss actually asks for teacher continuations, so every other objective is
+    byte-identical.
+    """
+    try:
+        from verl.trainer.distillation.losses import get_distillation_loss_settings
+        lm = config.distillation.distillation_loss.loss_mode
+        if not get_distillation_loss_settings(str(lm)).use_teacher_continuations:
+            return
+    except Exception:
+        return
+
+    import torch as _torch
+
+    ntb = batch.non_tensor_batch
+    need = ("state_credit_phi", "state_credit_depths")
+    missing = [k for k in need if k not in ntb]
+    if missing:
+        raise KeyError(
+            f"state-credit loss is configured but {missing} is absent from the batch. Phi is "
+            f"produced in the agent loop (state_credit_stage.attach_state_credit); if that did "
+            f"not run, there is no credit signal and training must not proceed without one.")
+
+    resp_mask = batch.batch["response_mask"]
+    lengths = resp_mask.sum(dim=-1).tolist()
+    # Phi(s_T) is the task reward, already on the batch as the per-token score
+    terminal = batch.batch["token_level_scores"].sum(dim=-1).tolist()
+    uids = ntb["uid"] if "uid" in ntb else np.arange(len(lengths))
+    sc = config.distillation.state_credit
+
+    W, stats = build_state_credit_weights(
+        uids=list(uids),
+        phis=list(ntb["state_credit_phi"]),
+        depths=list(ntb["state_credit_depths"]),
+        terminal=terminal,
+        response_lengths=lengths,
+        max_response_len=int(resp_mask.shape[1]),
+        min_survivors=int(sc.min_survivors),
+        M=int(sc.M),   # known; the noise floor must not have to guess it
+    )
+    batch.batch["state_credit_weights"] = _torch.as_tensor(
+        W, dtype=_torch.float32, device=resp_mask.device)
+    for k, v in stats.items():
+        metrics[f"state_credit/{k}"] = v
+    print(f"[STATE-CREDIT] rows={stats['rows']} credited={stats['rows_credited']} "
+          f"chunks={stats['chunks_total']} dropped_small_group="
+          f"{stats['chunks_dropped_small_group']} groups={stats['groups']}", flush=True)
+

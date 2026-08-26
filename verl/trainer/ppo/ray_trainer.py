@@ -40,6 +40,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.distillation.state_credit_credit import attach_state_credit_weights
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -1508,6 +1509,17 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        # STATE-CREDIT: build the per-token credit here, on the DRIVER, while the
+                        # whole batch is in one place. Leave-one-out centres a rollout against its
+                        # siblings, so it cannot be done inside a worker that holds only its own
+                        # slice. Placed after the reward lands because Phi(s_T) IS the reward.
+                        #
+                        # Unlike the async trainer, _balance_batch has already run by this point.
+                        # That is harmless: grouping is by uid rather than by position, and the
+                        # weight is stored on the batch so any later reordering carries it along.
+                        # No-op for every objective that does not use teacher continuations.
+                        attach_state_credit_weights(batch, self.config, metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
