@@ -439,7 +439,18 @@ def distillation_loss(
     # (generate-time) student's sampled-token logprob; model_output["log_probs"] is the current
     # student's logprob of the same token (computed in the forward -> zero extra model pass). This is a
     # surrogate, NOT the paper's full top-k KL (rollout_log_probs is a per-token scalar, not a
-    # distribution); calibrate offline against the full KL before trusting it. Logged in ALL arms.
+    # distribution); calibrate offline against the full KL before trusting it.
+    #
+    # NOT logged by default, despite what this comment used to claim. rollout_log_probs only
+    # exists when actor_rollout_ref.rollout.calculate_log_probs=True, which defaults False and
+    # no launcher here sets it -- so the surrogate returns {} and the three d_roll_hat_* keys
+    # are simply absent. Absent is the right failure (better than a confident 0.0), but a
+    # missing key is easy to read as "no drift" rather than "never measured".
+    #
+    # Turning it on is safe for the objective but is NOT free of side effects: ray_trainer
+    # fires the rollout-correction path on `"rollout_log_probs" in batch.batch`, which no-ops
+    # only because algorithm.rollout_correction.rollout_is and .rollout_rs both default null.
+    # Check those two before enabling it.
     distillation_metrics.update(
         _compute_rollout_drift_surrogate(model_output=model_output, data=data)
     )

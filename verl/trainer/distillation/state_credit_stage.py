@@ -201,7 +201,11 @@ async def run_state_credit(
             "sc_fp_budget_mode": str(getattr(sc_config, "budget_mode", "remaining")),
             "sc_fp_verifier_fast": bool(getattr(sc_config, "verifier_fast", False)),
             "sc_fp_temperature": None,
-            "sc_fp_top_p": None}
+            "sc_fp_top_p": None,
+            "sc_fp_teacher": None,
+            # The verifier's identity, not just its fast/slow flag: Sec 12.3 lists the verifier and
+            # the answer extractor separately, and both live in this module.
+            "sc_fp_verifier": "custom_reward.ttrl_math.compute_score"}
     if not reached:
         # Not an error: a short trajectory has no interior state to evaluate. The driver drops it
         # from every LOO group rather than crediting it against a baseline it never joined.
@@ -254,6 +258,7 @@ async def run_state_credit(
         if tele["sc_fp_temperature"] is None:
             tele["sc_fp_temperature"] = (t or {}).get("teacher_temperature")
             tele["sc_fp_top_p"] = (t or {}).get("teacher_top_p")
+            tele["sc_fp_teacher"] = (t or {}).get("teacher_model")
         tele["sc_prefix_tokens_logical"] += int((t or {}).get("teacher_prefix_tokens") or 0)
         tele["sc_prefix_tokens_cached"] += int((t or {}).get("teacher_cached_tokens") or 0)
         fr = (t or {}).get("finish_reasons") or []

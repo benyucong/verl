@@ -401,6 +401,11 @@ class StateCreditConfig(BaseConfig):
         only mark a correct continuation wrong, which inflates every terminal delta by a
         problem-dependent amount that leave-one-out does not remove.
     pi_c_key: which teacher_models entry serves as the FROZEN continuation model.
+        ONLY meaningful with a single teacher. Continuations route on the SAMPLE's teacher_key, the
+        same way scoring does, so pi_C is whatever teacher that sample routes to. With one teacher
+        that is unambiguous and equals pi_T, which is the configuration Sec 8's dual-use probe
+        assumes. With several, this key would name one model while routing picked another per
+        sample -- so it is refused rather than silently ignored.
     min_survivors: per-(group, depth) floor for leave-one-out. Below this the chunk is DROPPED, not
         centered against zero -- an absent baseline would otherwise become a maximal-magnitude
         target.
@@ -571,6 +576,21 @@ class DistillationConfig(BaseConfig):
                 "state_credit metric still looked correct.")
 
         self.teacher_models = self._resolve_teacher_models()
+        if getattr(ls, "use_teacher_continuations", False) and len(self.teacher_models) > 1:
+            # AFTER _resolve_teacher_models, which pops the unused `teacher_model` template entry --
+            # before it, a perfectly ordinary single-teacher config still counts two.
+            #
+            # pi_c_key cannot select the continuation model: generate_chunk_continuations resolves
+            # the teacher from the SAMPLE's routing key, exactly like scoring. With one teacher that
+            # is the same thing; with several, pi_C would vary per sample while pi_c_key claimed
+            # otherwise -- and Phi is only a well-defined functional if pi_C is one frozen policy.
+            # Sec 8's dual-use assumption also requires pi_C == pi_T.
+            raise ValueError(
+                f"state_credit is configured with {len(self.teacher_models)} teacher models "
+                f"({sorted(self.teacher_models)}). Continuations route per-sample like scoring "
+                f"does, so pi_C would differ between samples and Phi would not be one functional. "
+                f"state_credit.pi_c_key does NOT select the continuation model -- it is not read at "
+                f"runtime. Use a single teacher.")
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(

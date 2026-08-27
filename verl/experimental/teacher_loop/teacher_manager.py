@@ -291,6 +291,10 @@ class AsyncTeacherLLMServerManager:
             "teacher_temperature": _temp,
             "teacher_top_p": _top_p,
             "teacher_max_tokens": int(max_tokens),
+            # Sec 12.3 names the teacher SNAPSHOT specifically. Recoverable run-wide from the Hydra
+            # dump, but not per record -- so two Phi values from different teacher builds could be
+            # pooled with nothing to object.
+            "teacher_model": str(getattr(_tcfg, "model_path", "") or ""),
             "teacher_n": len(out.sequences),
             # Consumed by state-credit's truncation gate. Dropping it did not make the gate fail --
             # it made the gate report 0.000 truncation unconditionally, which reads as an
