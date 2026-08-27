@@ -245,9 +245,17 @@ class AsyncTeacherLLMServerManager:
         # appearing in the resolved config as though it had. Reading them here makes pi_C's sampling
         # policy the one the config actually names. (Both default to 1.0, so this changes no
         # existing run; it removes a knob that lied.)
-        _tcfg = getattr(self.teacher_model_configs.get(teacher_key), "inference", None)
-        _temp = float(getattr(_tcfg, "temperature", 1.0) or 1.0)
-        _top_p = float(getattr(_tcfg, "top_p", 1.0) or 1.0)
+        # Defensive on every hop: this is a FINGERPRINT lookup, and a fingerprint that can raise is
+        # worse than no fingerprint -- it would take down the continuation it was only meant to
+        # describe. (It did: a partially-constructed manager in the test suite has no
+        # teacher_model_configs, and the first version of this line crashed generate_chunk_
+        # continuations outright.) Falling back to generate_n's own defaults keeps the previous
+        # behaviour exactly.
+        _tcfg = getattr(getattr(self, "teacher_model_configs", None) or {}, "get",
+                        lambda _k: None)(teacher_key)
+        _tinf = getattr(_tcfg, "inference", None)
+        _temp = float(getattr(_tinf, "temperature", None) or 1.0)
+        _top_p = float(getattr(_tinf, "top_p", None) or 1.0)
 
         t0 = time.perf_counter()
         out = await client.generate_n(
