@@ -190,7 +190,18 @@ async def run_state_credit(
             "sc_response_len": T, "sc_gen_seconds": 0.0, "sc_gen_tokens": 0,
             "sc_truncated": 0, "sc_scored": 0, "sc_verifier_failed": 0,
             "sc_trunc_unmeasured": 0, "sc_cont_max_tokens": 0,
-            "sc_prefix_tokens_logical": 0, "sc_prefix_tokens_cached": 0}
+            "sc_prefix_tokens_logical": 0, "sc_prefix_tokens_cached": 0,
+            # Sec 12.3 measurement-policy fingerprint. Phi means nothing without the settings it was
+            # measured under, and "read them off the config afterwards" is exactly how this repo lost
+            # a whole campaign to a teacher response_length of 512 that nobody had recorded. These
+            # ride the RECORD, so two Phi values measured under different budgets or graders cannot
+            # be pooled by accident.
+            "sc_fp_M": int(sc_config.M),
+            "sc_fp_B": int(sc_config.B),
+            "sc_fp_budget_mode": str(getattr(sc_config, "budget_mode", "remaining")),
+            "sc_fp_verifier_fast": bool(getattr(sc_config, "verifier_fast", False)),
+            "sc_fp_temperature": None,
+            "sc_fp_top_p": None}
     if not reached:
         # Not an error: a short trajectory has no interior state to evaluate. The driver drops it
         # from every LOO group rather than crediting it against a baseline it never joined.
@@ -238,6 +249,11 @@ async def run_state_credit(
         # work when cache reuse succeeds". Both numbers were already being measured per request and
         # then dropped on the floor, which left the one quantity that distinguishes the two
         # unobservable and the Sec 8 sharing claim unfalsifiable.
+        # First probe to report them wins; they are constant across depths by construction, and a
+        # LATER value silently overwriting an earlier one is how a mid-run change would hide.
+        if tele["sc_fp_temperature"] is None:
+            tele["sc_fp_temperature"] = (t or {}).get("teacher_temperature")
+            tele["sc_fp_top_p"] = (t or {}).get("teacher_top_p")
         tele["sc_prefix_tokens_logical"] += int((t or {}).get("teacher_prefix_tokens") or 0)
         tele["sc_prefix_tokens_cached"] += int((t or {}).get("teacher_cached_tokens") or 0)
         fr = (t or {}).get("finish_reasons") or []

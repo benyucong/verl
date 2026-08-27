@@ -238,12 +238,25 @@ class AsyncTeacherLLMServerManager:
         use_stable_routing = session_id is not None
         routing_request_id = f"teacher::{session_id}" if use_stable_routing else uuid4().hex
 
+        # Sec 4 makes Phi operational: "solvable by THIS continuation policy under THIS budget",
+        # and lists temperature/top_p among the settings that must stay fixed within an experiment.
+        # They were fixed -- at generate_n's own 1.0/1.0 defaults -- but not at the CONFIGURED
+        # values, so setting the teacher's inference.temperature silently did nothing to Phi while
+        # appearing in the resolved config as though it had. Reading them here makes pi_C's sampling
+        # policy the one the config actually names. (Both default to 1.0, so this changes no
+        # existing run; it removes a knob that lied.)
+        _tcfg = getattr(self.teacher_model_configs.get(teacher_key), "inference", None)
+        _temp = float(getattr(_tcfg, "temperature", 1.0) or 1.0)
+        _top_p = float(getattr(_tcfg, "top_p", 1.0) or 1.0)
+
         t0 = time.perf_counter()
         out = await client.generate_n(
             request_id=routing_request_id,
             prompt_ids=prefix_ids,
             n=n,
             max_tokens=max_tokens,
+            temperature=_temp,
+            top_p=_top_p,
             seed=seed,
             is_final=is_final,
             track_parent=bool(use_stable_routing),
@@ -264,6 +277,12 @@ class AsyncTeacherLLMServerManager:
             "teacher_gen_tokens": sum(len(x) for x in out.sequences),
             "teacher_prefix_tokens": len(prefix_ids),
             "teacher_cached_tokens": out.num_cached_tokens,
+            # Sec 12.3: the sampling policy Phi was actually measured under, carried on the record
+            # rather than inferred from the config later. A campaign has already been lost in this
+            # repo to a teacher length nobody recorded.
+            "teacher_temperature": _temp,
+            "teacher_top_p": _top_p,
+            "teacher_max_tokens": int(max_tokens),
             "teacher_n": len(out.sequences),
             # Consumed by state-credit's truncation gate. Dropping it did not make the gate fail --
             # it made the gate report 0.000 truncation unconditionally, which reads as an
