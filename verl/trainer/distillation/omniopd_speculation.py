@@ -149,8 +149,15 @@ def dispatch_thread_enabled() -> bool:
     return os.environ.get("OPD_OMNIOPD_SPEC_THREAD", "0") not in ("0", "", "false", "False")
 
 
-def _spec_semaphore():
+def _spec_semaphore(size: Optional[int] = None):
     """Bound in-flight SPECULATIVE teacher requests, per event loop.
+
+    `size` is the caller's own budget. Without it this falls back to the OmniOPD speculation
+    default, which is correct for speculation and WRONG for anyone else: state-credit's store sets
+    max_inflight from OPD_STATE_CREDIT_MAX_INFLIGHT, and that value used to select this semaphore
+    without sizing it -- so asking for 8 applied 4 while the banner printed 8. A cap that reports
+    one number and enforces another is worse than no cap: it makes a throttled A/B look like an
+    unthrottled one.
 
     Without this a proposal is fired the instant a chunk closes, for every trajectory in flight. At
     staleness=1 the in-flight budget is ppo_mini x (staleness+1) x sync = 32 trajectories, each
@@ -163,11 +170,12 @@ def _spec_semaphore():
     never gated. Default deliberately well under the engine's concurrent-request ceiling.
     """
     loop = asyncio.get_event_loop()
-    sem = _SPEC_SEM.get(loop)   # per-loop: the dispatch loop gets its own budget
+    key = (loop, int(size) if size else 0)   # a distinct budget gets a distinct semaphore
+    sem = _SPEC_SEM.get(key)   # per-loop: the dispatch loop gets its own budget
     if sem is None:
-        n = int(os.environ.get("OPD_OMNIOPD_SPEC_MAX_INFLIGHT", "4") or 4)
+        n = int(size) if size else int(os.environ.get("OPD_OMNIOPD_SPEC_MAX_INFLIGHT", "4") or 4)
         sem = asyncio.Semaphore(max(1, n))
-        _SPEC_SEM[loop] = sem
+        _SPEC_SEM[key] = sem
     return sem
 
 
@@ -237,7 +245,7 @@ class SpeculativeStore:
         else:
             async def _gated():
                 await asyncio.sleep(0)      # yield first: let the generation stream advance
-                async with _spec_semaphore():
+                async with _spec_semaphore(self.max_inflight):
                     return await coro_factory()
 
         if dispatch_thread_enabled():
