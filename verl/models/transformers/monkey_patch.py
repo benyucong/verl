@@ -345,13 +345,24 @@ def apply_monkey_patch(
     )
 
     if is_trl_available():
-        from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        # is_trl_available() only says the PACKAGE is importable, not that it still exports this
+        # class -- trl 1.x removed AutoModelForCausalLMWithValueHead, so on any environment shipping
+        # a modern trl this guard passes and the import below raises, killing worker init before a
+        # single step. It went unnoticed because the environments this ran on had no trl at all, so
+        # the guard was False and the whole block skipped.
+        #
+        # The patch is genuinely optional: it only fixes state_dict on a value-head wrapper we do
+        # not use for OPD, and runs that have never had trl are unaffected by its absence.
+        try:
+            from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        except ImportError:
+            pass
+        else:
+            def state_dict(self, *args, **kwargs):
+                return torch.nn.Module.state_dict(self, *args, **kwargs)
 
-        def state_dict(self, *args, **kwargs):
-            return torch.nn.Module.state_dict(self, *args, **kwargs)
-
-        AutoModelForCausalLMWithValueHead.state_dict = state_dict
-        print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
+            AutoModelForCausalLMWithValueHead.state_dict = state_dict
+            print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
 
     # TODO: VLM models only, unify monkey patch to LLM models.
     if model.config.model_type in ["qwen2_5_vl", "qwen2_vl"]:
