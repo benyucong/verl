@@ -35,6 +35,7 @@ not exist" when it actually meant "the budget was 20x too small". So the truncat
 recorded per depth and surfaced; the caller decides whether Phi is interpretable.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -214,7 +215,23 @@ async def run_state_credit(
 
     phis: list[float] = []
     n_reused = 0
-    for i, d in enumerate(reached):
+
+    # ---- issue every depth CONCURRENTLY, then score in depth order ----------------------------
+    # Sec 14.2 defines the baseline as "sample i reaches EOS -> submit ALL teacher work for sample
+    # i". ALL of it, at once. An earlier version awaited each depth inside the loop, so the
+    # sequential arm issued depth 2 only after depth 1 came back -- serialising m round trips that
+    # the spec says are concurrent.
+    #
+    # That is not a small handicap, and worse, its size depends on the teacher. Against a SATURATED
+    # teacher it is nearly free: the queue is the bottleneck, so it makes little difference whether
+    # requests arrive together or one at a time (acc, 32B, measured +8%). Against an IDLE teacher it
+    # is the whole story: serial issuance leaves 12 replicas doing nothing between depths while the
+    # early arm keeps them fed (roihu, 1.5B, apparent 877s vs 295s -- a 3x that is mostly this bug).
+    #
+    # So the flaw manufactures a gain that GROWS exactly as the teacher gets faster, which is the
+    # direction the experiment was moved to explore. Fixing it costs the treatment nothing: the
+    # early arm's work is already in flight and its store.take just collects.
+    async def _fetch(d):
         prefix = list(prompt_ids) + list(response_ids[:d])
         # keyed on DEPTH, stride M, so the M children of one depth never share a stream with
         # another depth's (vLLM seeds children parent+0..parent+M-1)
@@ -228,21 +245,28 @@ async def run_state_credit(
             # rather than substituting a prefix nobody asked for.
             got = await store.take(d, expect_key=store.request_key(prefix, M, B, d_seed))
         if got is not None:
-            seqs, t = got
+            return got[0], got[1], True
+        seqs, t = await teacher_manager.generate_chunk_continuations(
+            prefix_ids=prefix,
+            n=M,
+            max_tokens=B,
+            routing_key=routing_key,
+            session_id=session_id,
+            seed=d_seed,
+            # An EARLY launch cannot know which depth is last: the set is only settled once the
+            # true response length is known. So no call carries is_final and the parent's FIFO
+            # state is released explicitly once every depth is in hand.
+            is_final=False,
+        )
+        return seqs, t, False
+
+    fetched = await asyncio.gather(*[_fetch(d) for d in reached])
+
+    # Scoring stays SEQUENTIAL and in depth order: the verifier is synchronous CPU work, and phis
+    # must line up with `reached` positionally -- the driver zips them.
+    for i, (d, (seqs, t, was_reused)) in enumerate(zip(reached, fetched)):
+        if was_reused:
             n_reused += 1
-        else:
-            seqs, t = await teacher_manager.generate_chunk_continuations(
-                prefix_ids=prefix,
-                n=M,
-                max_tokens=B,
-                routing_key=routing_key,
-                session_id=session_id,
-                seed=d_seed,
-                # An EARLY launch cannot know which depth is last: the set is only settled once the
-                # true response length is known. So no call carries is_final and the parent's FIFO
-                # state is released explicitly once every depth is in hand.
-                is_final=False,
-            )
         if len(seqs) != M:
             raise RuntimeError(
                 f"state-credit: depth {d} returned {len(seqs)} continuations, asked for {M}. Phi "
