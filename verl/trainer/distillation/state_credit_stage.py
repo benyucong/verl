@@ -338,12 +338,17 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
         # followed it and the run is the sequential arm wearing a streaming label. `wall` minus
         # `gen_s` is the part the overlap actually removes.
         print("[STATE-CREDIT] sid=%s T=%d depths=%s phi=%s trunc=%.3f gen_s=%.1f vfail=%d "
-              "early=%d/%d maxcont=%d prefix=%d/%d wall=%.1f"
+              "early=%d/%d maxcont=%d gentok=%d prefix=%d/%d wall=%.1f"
               % (session_id, te["sc_response_len"], rec["state_credit_depths"],
                  ["%.3f" % p for p in rec["state_credit_phi"]],
                  te.get("sc_trunc_frac", 0.0), te["sc_gen_seconds"],
                  te["sc_verifier_failed"], te.get("sc_reused_early", 0),
                  len(rec["state_credit_depths"]), te.get("sc_cont_max_tokens", 0),
+                 # Teacher decode tokens for this trajectory, SUMMED over every continuation at
+                 # every depth. The one number that makes the teacher/student work ratio a
+                 # measurement instead of an inference from maxcont -- and that ratio is what
+                 # decides whether this mechanism has anything to hide (Sec 13, Sec 16.9).
+                 te.get("sc_gen_tokens", 0),
                  # cached/logical -- Sec 14.4. Nested boundary prefixes SHOULD make these nearly
                  # equal; a cached count well below logical is the cache-contention hazard of
                  # Sec 16.7 showing up, not a scheduling problem.
