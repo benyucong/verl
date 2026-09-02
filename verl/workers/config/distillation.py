@@ -80,6 +80,21 @@ class DistillationLossConfig(BaseConfig):
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
+    # ---- Teacher-Guided Block Preconditioning (TGBP) --------------------------------------
+    # OFF BY DEFAULT. Every existing arm must be byte-identical with these at their defaults;
+    # the engine only takes the TGBP path when tgbp_enable is True.
+    #   g_train^(m) = (1 + lambda * clip(a_m, 0, a_max)) * g_R^(m),
+    #   a_m = <g_D^(m), g_R^(m)> / (||g_R^(m)||^2 + eps)
+    # a_m is an EMA over PREVIOUS batches, never the batch it is applied to: g_R and g_D come
+    # from the same rollouts and share sampling noise, which biases <g_D,g_R> positive
+    # (measured: 0.33 same-batch vs 0.17 cross-fitted, results/admission/).
+    tgbp_enable: bool = False
+    tgbp_lambda: float = 1.0
+    tgbp_a_max: float = 1.0
+    tgbp_tau: float = 0.02          # drop blocks with ||g_R|| below tau * max ||g_R||
+    tgbp_ema_beta: float = 0.9
+    tgbp_precondition_embed: bool = False
+
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
     # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
     # Default ``False`` to preserve short-context performance (chunked path
@@ -110,6 +125,12 @@ class DistillationLossConfig(BaseConfig):
 
     def __post_init__(self):
         self._mutable_fields.add("loss_settings")
+        # TGBP runs the SAME micro-batches twice, flipping these two fields between passes to
+        # isolate g_R (use_task_rewards=True, coef=0) from g_D (use_task_rewards=False, coef
+        # forced to 1.0 by losses.py:237). Making them mutable is what allows that toggle; the
+        # values are restored immediately after each pass.
+        self._mutable_fields.add("use_task_rewards")
+        self._mutable_fields.add("distillation_loss_coef")
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)

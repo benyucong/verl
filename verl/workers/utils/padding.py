@@ -93,6 +93,27 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         data["teacher_logprobs"] = teacher_logprobs_nested
         data["teacher_ids"] = teacher_ids_nested
 
+    # SOFT PREFIX SUPERVISION: same (bsz, seqlen, K) layout as the teacher tensors above, and
+    # deliberately the same conversion. These carry the OFFLINE-scored teacher top-k over the
+    # prefix, zero everywhere else. Present only for the mixed soft arm; every other arm leaves
+    # them absent and this block is a no-op.
+    #
+    # NOTE the shapes differ from the teacher pair in one way that matters: those arrive (bsz,
+    # seqlen) and are unsqueezed to a trailing 1, whereas these already carry a real K, so they
+    # are flattened WITHOUT the extra unsqueeze and keep K through index_first_axis.
+    prefix_topk_logprobs = data.get("prefix_topk_logprobs", None)
+    prefix_topk_ids = data.get("prefix_topk_ids", None)
+    if prefix_topk_logprobs is not None and prefix_topk_ids is not None:
+        _k = prefix_topk_ids.shape[-1]
+        _lp_rmpad = index_first_axis(prefix_topk_logprobs.flatten(0, 1), indices)  # (total_nnz, K)
+        _id_rmpad = index_first_axis(prefix_topk_ids.flatten(0, 1), indices)
+        data["prefix_topk_logprobs"] = torch.nested.nested_tensor_from_jagged(
+            _lp_rmpad.view(-1, _k), offsets=cu_seqlens
+        )
+        data["prefix_topk_ids"] = torch.nested.nested_tensor_from_jagged(
+            _id_rmpad.view(-1, _k), offsets=cu_seqlens
+        )
+
     return data
 
 

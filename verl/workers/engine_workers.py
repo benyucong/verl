@@ -166,6 +166,114 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.engine.to(device=device, model=model, optimizer=optimizer, grad=grad)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def _tgbp_distillation_config(self):
+        """Reach the DistillationConfig bound into self.loss_fn, or None.
+
+        engine_workers.py builds the loss as
+            partial(distillation_ppo_loss, config=..., distillation_config=...)
+        so the config is in .keywords. Everything is guarded: a non-distillation arm, or any
+        future change to how the loss is constructed, falls through to the normal path rather
+        than raising.
+        """
+        kw = getattr(self.loss_fn, "keywords", None) or {}
+        return kw.get("distillation_config")
+
+    def _tgbp_train_batch(self, data):
+        """One optimizer step of block-wise projected OPD.
+
+            a_m         = <g_D^(m), g_R^(m)> / (||g_R^(m)||^2 + eps)
+            g_train^(m) = (1 + lambda * clip(a_m, 0, a_max)) * g_R^(m)
+
+        TWO PASSES OVER THE SAME MICRO-BATCHES. The two losses must land in separate gradient
+        buffers, and under FSDP the only way to get correctly reduce-scattered gradients is to
+        let each loss go through its own backward. The teacher is NOT re-run: teacher_logprobs
+        are already materialised on the batch, so the second pass costs one extra student
+        forward/backward, not another 32B forward.
+
+        THE WEIGHTS APPLIED COME FROM PREVIOUS BATCHES ONLY. weights() is read BEFORE update()
+        folds this batch in. g_R and g_D share rollouts and therefore share sampling noise, which
+        biases <g_D,g_R> positive (0.33 same-batch vs 0.17 cross-fitted on this project's data);
+        applying a same-batch coefficient would amplify a block partly because its noise lined up
+        this step.
+        """
+        from verl.trainer.distillation.tgbp import TGBPState, apply_weights, block_stats
+
+        dcfg = self._tgbp_distillation_config()
+        lc = dcfg.distillation_loss
+        eng, mod = self.engine, self.engine.module
+
+        if getattr(self, "_tgbp_state", None) is None:
+            self._tgbp_state = TGBPState(
+                ema_beta=lc.tgbp_ema_beta, lam=lc.tgbp_lambda, a_max=lc.tgbp_a_max,
+                tau_rel=lc.tgbp_tau, precondition_embed=lc.tgbp_precondition_embed)
+            # Resume the EMA across restarts. Without this a resumed run silently reverts to
+            # plain RLVR (all weights 1.0) until the EMA refills -- see TGBPState.save.
+            self._tgbp_state_path = os.environ.get("TGBP_STATE_PATH") or None
+            self._tgbp_state.load(self._tgbp_state_path)
+
+        # THE REDUCTION GROUP IS THE FSDP GROUP, NOT get_data_parallel_group().
+        # fsdp_size defaults to -1, so parameters shard over a single "fsdp" mesh dim spanning
+        # the whole world. But ULYSSES defaults to 2, which makes get_data_parallel_group()
+        # return the "dp" dim of a (dp=world/2, sp=2) mesh -- half the ranks. Reducing block
+        # statistics over that group would sum only half the gradient shards and yield a wrong
+        # a_m with nothing failing.
+        try:
+            reduce_group = eng.device_mesh["fsdp"].get_group()
+        except Exception:
+            reduce_group = None
+
+        saved = (lc.use_task_rewards, lc.distillation_loss_coef)
+        try:
+            # ---- pass 1: g_R (verifier only; coef=0 zeroes the teacher term) ----
+            eng.optimizer_zero_grad()
+            lc.use_task_rewards = True
+            lc.distillation_loss_coef = 0.0
+            outputs = eng.forward_backward_batch(data, self.loss_fn, forward_only=False)
+            gR = {n: (p.grad.detach().clone() if p.grad is not None else None)
+                  for n, p in mod.named_parameters()}
+
+            # ---- pass 2: g_D (teacher only; losses.py forces coef to 1.0 here) ----
+            eng.optimizer_zero_grad()
+            lc.use_task_rewards = False
+            eng.forward_backward_batch(data, self.loss_fn, forward_only=False)
+            gD = {n: p.grad.detach() for n, p in mod.named_parameters() if p.grad is not None}
+        finally:
+            lc.use_task_rewards, lc.distillation_loss_coef = saved
+
+        dots, nR2 = block_stats(((n, g) for n, g in gR.items() if g is not None),
+                                gD, reduce_group=reduce_group)
+        weights = self._tgbp_state.weights()      # PREVIOUS batches only
+        raw = self._tgbp_state.update(dots, nR2)  # this batch informs the NEXT step
+        self._tgbp_state.save(getattr(self, "_tgbp_state_path", None))
+        del gD
+
+        # restore g_R, then precondition it block-wise
+        for n, p in mod.named_parameters():
+            p.grad = gR.get(n)
+        del gR
+        apply_weights(mod.named_parameters(), weights)
+
+        grad_norm = eng.optimizer_step()
+
+        # NOTE: is_mp_src_rank_with_outputs lives on the ENGINE, not the worker. base.py's
+        # train_batch calls it as self.<...> because there `self` IS the engine; here `self` is
+        # the TrainingWorker, so it must be reached through eng.
+        if eng.is_mp_src_rank_with_outputs():
+            outputs["metrics"]["grad_norm"] = grad_norm
+            n_amp = sum(1 for w in weights.values() if w > 1.0 + 1e-9)
+            outputs["metrics"]["tgbp/blocks_amplified"] = float(n_amp)
+            outputs["metrics"]["tgbp/blocks_measured"] = float(len(raw))
+            outputs["metrics"]["tgbp/weight_max"] = float(max(weights.values(), default=1.0))
+            outputs["metrics"]["tgbp/weight_mean"] = float(
+                sum(weights.values()) / len(weights)) if weights else 1.0
+            outputs["metrics"]["tgbp/ema_updates"] = float(self._tgbp_state.n_updates)
+            # every block coefficient, as requested -- raw measurement and applied weight
+            for b, a in raw.items():
+                outputs["metrics"][f"tgbp/a_raw/{b}"] = float(a)
+            for b, w in weights.items():
+                outputs["metrics"][f"tgbp/weight/{b}"] = float(w)
+        return outputs
+
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
 
@@ -320,11 +428,27 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            if val and isinstance(val[0], Metric):
+                                output[key] = Metric.aggregate_dp(val)
+                            else:
+                                # TOLERATE SCALAR ENTRIES.
+                                # allgather_dict_into_dict (utils/torch_functional.py) builds one
+                                # entry PER RANK: a metric that was a list becomes a list of
+                                # lists, but a metric that was a bare SCALAR becomes a list of
+                                # scalars, and chain.from_iterable then raises
+                                #   TypeError: 'float' object is not iterable
+                                # Producers that emit scalars are legitimate (the distillation
+                                # policy-gradient path emits distillation/pg_clipfrac, ppo_kl and
+                                # pg_clipfrac_lower this way when use_task_rewards is on), so the
+                                # contract is repaired HERE, at the single point of consumption,
+                                # rather than in each producer. Shape-only: a scalar is treated as
+                                # a 1-element list, so the flattened result is unchanged for every
+                                # input that already worked.
+                                output[key] = list(
+                                    chain.from_iterable(
+                                        v if hasattr(v, "__iter__") else [v] for v in val
+                                    )
+                                )
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
@@ -359,7 +483,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            _dcfg = self._tgbp_distillation_config()
+            _tgbp = bool(getattr(getattr(_dcfg, "distillation_loss", None), "tgbp_enable", False))
+            if _tgbp:
+                output = self._tgbp_train_batch(data)
+            else:
+                output = self.engine.train_batch(data, loss_function=self.loss_fn)
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last

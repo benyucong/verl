@@ -826,6 +826,17 @@ distillation:
     topk: 32
     use_task_rewards: true
     distillation_loss_coef: 1.0
+    # ---- Teacher-Guided Block Preconditioning (TGBP) ----
+    # OFF BY DEFAULT: with tgbp_enable false the engine takes the normal path and every existing
+    # arm is byte-identical. See verl/trainer/distillation/tgbp.py.
+    #   g_train^(m) = (1 + tgbp_lambda * clip(a_m, 0, tgbp_a_max)) * g_R^(m)
+    #   a_m = <g_D^(m), g_R^(m)> / (||g_R^(m)||^2 + eps), EMA'd over PREVIOUS batches only.
+    tgbp_enable: false
+    tgbp_lambda: 1.0
+    tgbp_a_max: 1.0
+    tgbp_tau: 0.02
+    tgbp_ema_beta: 0.9
+    tgbp_precondition_embed: false
     loss_max_clamp: null
     log_prob_min_clamp: null
     use_policy_gradient: false

@@ -115,6 +115,21 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    # A MICRO-BATCH WITH NO SAMPLED TOKENS IS A CONFIG ERROR, NOT A NUMERICAL EDGE CASE.
+    # response_mask is "1 iff the policy sampled it", so an empty selection means every sequence
+    # here was supplied rather than generated -- in practice a mixed-SFT stage whose MAX_RESP is
+    # smaller than its prefixes, so the prefix consumed the whole response. Bare .min() then
+    # raises "Expected reduction dim to be specified for input.numel() == 0" from inside a metrics
+    # helper, which points nowhere near the actual cause (job 21561761 burned 1h28m before that
+    # traceback identified itself). Say what is wrong instead.
+    if distillation_losses_response.numel() == 0:
+        raise ValueError(
+            "distillation metrics got zero sampled tokens: response_mask is all-zero for this "
+            "micro-batch. For a mixed SFT+OPD arm this means MAX_RESP is smaller than the "
+            "prefixes it must hold, so no suffix was generated -- raise MAX_RESP above the "
+            "stage's K_max. response_mask.shape="
+            f"{tuple(response_mask.shape)}, losses.shape={tuple(distillation_losses.shape)}"
+        )
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),

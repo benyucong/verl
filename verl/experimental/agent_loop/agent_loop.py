@@ -170,6 +170,15 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    prefix_topk_ids: Optional[torch.Tensor] = None
+    """(response_width, K) teacher top-k token ids over the OFFLINE-scored prefix, zero beyond it.
+
+    Only the mixed soft-SFT arm sets this; every other arm leaves it None and is unaffected. It is
+    response-width rather than full-sequence because the prefix occupies leading RESPONSE
+    positions in that arm (mask 0), so the loss can index it with the same offsets it uses for
+    response_mask."""
+    prefix_topk_logprobs: Optional[torch.Tensor] = None
+    """(response_width, K) teacher log-probs matching prefix_topk_ids."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -847,9 +856,34 @@ class AgentLoopWorker:
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
+        # SOFT PREFIX SUPERVISION (mixed arm only). The offline-scored teacher top-k covers the
+        # first n_prefix RESPONSE positions; widen it to response_width with zeros so it indexes
+        # exactly like response_mask. Absent for every other arm, which leaves these None.
+        _ptk_ids = output.extra_fields.pop("prefix_topk_ids", None)
+        _ptk_lps = output.extra_fields.pop("prefix_topk_logprobs", None)
+        prefix_topk_ids = prefix_topk_logprobs = None
+        if _ptk_ids and _ptk_lps:
+            # FULL SEQUENCE WIDTH (prompt + response), not response width, so these ride the SAME
+            # padded->nested conversion as teacher_logprobs/teacher_ids in
+            # workers/utils/padding.py:left_right_2_no_padding. That conversion uses index_first_axis
+            # with indices over the whole sequence; a response-width tensor would be indexed with
+            # full-sequence offsets and silently misalign. Reusing the known-correct path beats
+            # hand-rolling packed/padded/Ulysses alignment in the forward.
+            _pw = prompt_output["input_ids"].shape[1]
+            _rw = response_output["input_ids"].shape[1]
+            _k = len(_ptk_ids[0])
+            _n = min(len(_ptk_ids), _rw)
+            prefix_topk_ids = torch.zeros((1, _pw + _rw, _k), dtype=torch.int64)
+            prefix_topk_logprobs = torch.zeros((1, _pw + _rw, _k), dtype=torch.float32)
+            # The prefix occupies the first _n RESPONSE positions, which start at offset _pw.
+            prefix_topk_ids[0, _pw : _pw + _n] = torch.tensor(_ptk_ids[:_n], dtype=torch.int64)
+            prefix_topk_logprobs[0, _pw : _pw + _n] = torch.tensor(_ptk_lps[:_n], dtype=torch.float32)
+
         return _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
             response_ids=response_output["input_ids"],
+            prefix_topk_ids=prefix_topk_ids,
+            prefix_topk_logprobs=prefix_topk_logprobs,
             input_ids=input_ids,
             position_ids=position_ids,
             response_mask=response_mask,
@@ -1054,6 +1088,25 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        # SOFT PREFIX SUPERVISION. Keyed on ANY input carrying the arrays, not inputs[0]: a batch
+        # can mix rows that have a prefix with rows that do not (a row whose stored ids failed the
+        # alignment check is dropped upstream), and gating on the first element alone would
+        # silently discard the whole batch's soft data whenever element 0 happened to be the
+        # dropped one. Rows without arrays get zeros, which the loss ignores because their
+        # prefix span is empty.
+        _ptk = [inp for inp in inputs if inp.prefix_topk_ids is not None]
+        if _ptk:
+            _shape = _ptk[0].prefix_topk_ids.shape
+            _ids, _lps = [], []
+            for inp in inputs:
+                if inp.prefix_topk_ids is not None:
+                    _ids.append(inp.prefix_topk_ids)
+                    _lps.append(inp.prefix_topk_logprobs)
+                else:
+                    _ids.append(torch.zeros(_shape, dtype=torch.int64))
+                    _lps.append(torch.zeros(_shape, dtype=torch.float32))
+            optional_outputs["prefix_topk_ids"] = torch.cat(_ids, dim=0)
+            optional_outputs["prefix_topk_logprobs"] = torch.cat(_lps, dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
