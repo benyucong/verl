@@ -679,10 +679,24 @@ class vLLMHttpServer:
         extra_fields["num_cached_tokens"] = _nct
         _rm = getattr(final_res, "metrics", None)
         if _rm is not None:
-            _arr = getattr(_rm, "arrival_time", None)
-            _sched = getattr(_rm, "first_scheduled_time", None)
-            if _arr is not None and _sched is not None:
-                extra_fields["queue_wait_s"] = max(0.0, float(_sched) - float(_arr))
+            # SAME CLOCK, OR NOTHING. vLLM V1 stamps arrival_time with time.time() (epoch) but
+            # queued_ts/scheduled_ts come from scheduler events stamped with time.monotonic()
+            # (scheduler.py, stats.py "ignore preemptions" -> first schedule). scheduled_ts -
+            # arrival_time is therefore ~-1.7e9, and a max(0.0, ...) clamp turned that into an
+            # exact 0.00 on EVERY probe of two full runs -- a "no queueing" reading that was
+            # arithmetic, not measurement. The wait is scheduled_ts - queued_ts: same clock, and
+            # the pure scheduler-queue interval. V0 (first_scheduled_time, also epoch) keeps the
+            # arrival-based form, which was internally consistent there. Note metrics is None
+            # unless the engine runs disable_log_stats=False (verl defaults it True).
+            _q = getattr(_rm, "queued_ts", None)
+            _s = getattr(_rm, "scheduled_ts", None)
+            if _q is not None and _s is not None and float(_q) > 0.0 and float(_s) > 0.0:
+                extra_fields["queue_wait_s"] = max(0.0, float(_s) - float(_q))
+            else:
+                _arr = getattr(_rm, "arrival_time", None)
+                _fst = getattr(_rm, "first_scheduled_time", None)
+                if _arr is not None and _fst is not None and float(_fst) > 0.0:
+                    extra_fields["queue_wait_s"] = max(0.0, float(_fst) - float(_arr))
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
@@ -742,10 +756,24 @@ class vLLMHttpServer:
         # show up as scheduling delay rather than decode cost.
         _rm = getattr(res, "metrics", None)
         if _rm is not None:
-            _arr = getattr(_rm, "arrival_time", None)
-            _sched = getattr(_rm, "first_scheduled_time", None)
-            if _arr is not None and _sched is not None:
-                extra_fields["queue_wait_s"] = max(0.0, float(_sched) - float(_arr))
+            # SAME CLOCK, OR NOTHING. vLLM V1 stamps arrival_time with time.time() (epoch) but
+            # queued_ts/scheduled_ts come from scheduler events stamped with time.monotonic()
+            # (scheduler.py, stats.py "ignore preemptions" -> first schedule). scheduled_ts -
+            # arrival_time is therefore ~-1.7e9, and a max(0.0, ...) clamp turned that into an
+            # exact 0.00 on EVERY probe of two full runs -- a "no queueing" reading that was
+            # arithmetic, not measurement. The wait is scheduled_ts - queued_ts: same clock, and
+            # the pure scheduler-queue interval. V0 (first_scheduled_time, also epoch) keeps the
+            # arrival-based form, which was internally consistent there. Note metrics is None
+            # unless the engine runs disable_log_stats=False (verl defaults it True).
+            _q = getattr(_rm, "queued_ts", None)
+            _s = getattr(_rm, "scheduled_ts", None)
+            if _q is not None and _s is not None and float(_q) > 0.0 and float(_s) > 0.0:
+                extra_fields["queue_wait_s"] = max(0.0, float(_s) - float(_q))
+            else:
+                _arr = getattr(_rm, "arrival_time", None)
+                _fst = getattr(_rm, "first_scheduled_time", None)
+                if _arr is not None and _fst is not None and float(_fst) > 0.0:
+                    extra_fields["queue_wait_s"] = max(0.0, float(_fst) - float(_arr))
         return TokenOutput(
             token_ids=list(out.token_ids[start:end]),
             log_probs=log_probs,
@@ -852,11 +880,37 @@ class vLLMHttpServer:
                 f"submitted {len(prompt_ids)}."
             )
 
+        extra_fields = {"replica_rank": self.replica_rank, "n_requested": n}
+        # Engine queue wait, exactly as the scoring path records it (arrival -> first schedule).
+        # The continuation path never had it, which left one question unanswerable from a run:
+        # when early release fails to pay, is the gating probe SLOW or is it WAITING? Measured
+        # 2026-09-01 by consequence only (corr 0.96 between step outcome and the slowest
+        # trajectory's commit); this makes the queue itself visible per probe.
+        _rm = getattr(final_res, "metrics", None)
+        if _rm is not None:
+            # SAME CLOCK, OR NOTHING. vLLM V1 stamps arrival_time with time.time() (epoch) but
+            # queued_ts/scheduled_ts come from scheduler events stamped with time.monotonic()
+            # (scheduler.py, stats.py "ignore preemptions" -> first schedule). scheduled_ts -
+            # arrival_time is therefore ~-1.7e9, and a max(0.0, ...) clamp turned that into an
+            # exact 0.00 on EVERY probe of two full runs -- a "no queueing" reading that was
+            # arithmetic, not measurement. The wait is scheduled_ts - queued_ts: same clock, and
+            # the pure scheduler-queue interval. V0 (first_scheduled_time, also epoch) keeps the
+            # arrival-based form, which was internally consistent there. Note metrics is None
+            # unless the engine runs disable_log_stats=False (verl defaults it True).
+            _q = getattr(_rm, "queued_ts", None)
+            _s = getattr(_rm, "scheduled_ts", None)
+            if _q is not None and _s is not None and float(_q) > 0.0 and float(_s) > 0.0:
+                extra_fields["queue_wait_s"] = max(0.0, float(_s) - float(_q))
+            else:
+                _arr = getattr(_rm, "arrival_time", None)
+                _fst = getattr(_rm, "first_scheduled_time", None)
+                if _arr is not None and _fst is not None and float(_fst) > 0.0:
+                    extra_fields["queue_wait_s"] = max(0.0, float(_fst) - float(_arr))
         return MultiTokenOutput(
             sequences=[list(c.token_ids) for c in final_res.outputs],
             finish_reasons=[c.finish_reason for c in final_res.outputs],
             num_cached_tokens=getattr(final_res, "num_cached_tokens", None),
-            extra_fields={"replica_rank": self.replica_rank, "n_requested": n},
+            extra_fields=extra_fields,
         )
 
     async def generate_stream(

@@ -785,6 +785,10 @@ class AgentLoopWorker:
                 **kwargs,
             )
 
+    def _stream_only_control(self) -> bool:
+        """Pay the streaming cost, skip the early launch. See the call site."""
+        return os.environ.get("OPD_STATE_CREDIT_STREAM_ONLY", "0") not in ("0", "", "false", "False")
+
     def _early_boundaries_only(self) -> bool:
         """Stream chunk BOUNDARIES with no publishing, so early continuation works without a queue.
 
@@ -853,6 +857,21 @@ class AgentLoopWorker:
             is_final: bool,
         ) -> bool:
             if self._early_boundaries_only():
+                # STREAM-ONLY CONTROL. The two arms have been differing in TWO things, not one:
+                # when the teacher is asked, AND whether generation is chunked at all. EARLY=1 sets
+                # OPD_CONTINUOUS_STREAM=1 so vLLM yields a delta every chunk_tokens; EARLY=0 runs
+                # one continuous call. That machinery costs something on its own, and the cost
+                # scales with CHUNK COUNT -- ~6 yields per trajectory at spacing 2560 but ~16 at
+                # 1024. Which is exactly the per-boundary penalty that survived every teacher-side
+                # fix (in-flight bound, jitter, dispatch thread off), because none of them touched
+                # the rollout path.
+                #
+                # With this set the chunks are still cut and the callback still fires -- the
+                # streaming cost is paid in full -- but nothing launches early, so the teacher is
+                # asked at commit exactly as in the sequential arm. That is the S0 the comparison
+                # needed: identical machinery, differing only in release time.
+                if self._stream_only_control():
+                    return False
                 # The boundary is the whole point. Fire the launch and return False so
                 # stream_state records no emission and the ordinary whole-response path runs
                 # exactly as it would with no streaming at all.
@@ -1384,8 +1403,16 @@ class AgentLoopWorker:
         # so a hook placed inside it never runs while streaming -- which is exactly how the OmniOPD
         # speculation pass silently measured an A/A. The early launch's whole purpose is the
         # non-final chunks, so it cannot live under that flag.
+        # STREAM_ONLY MUST BE CHECKED HERE TOO. It was consulted only in the boundaries-only
+        # branch (_chunk_callback), so this site -- reachable on the fully-async path, where
+        # _early_boundaries_only() is False because a chunk_message_queue_client exists -- would
+        # launch early regardless. A job configured and LABELLED as the S0 control would then be a
+        # treatment, the A/B would be treatment-vs-treatment reporting ~0%, and every log line
+        # would say "control". The control's correctness must rest on the flag, not on which
+        # streaming mode happens to be active.
         if (self._state_credit_enabled and chunk_is_final is False
-                and self.distillation_enabled and not validate):
+                and self.distillation_enabled and not validate
+                and not self._stream_only_control()):
             try:
                 self._state_credit_early_launch(output, sample_kwargs=kwargs)
             except Exception:

@@ -317,6 +317,7 @@ class LLMServerClient:
         seed: Optional[int] = None,
         is_final: bool = False,
         track_parent: bool = False,
+        priority: int = 0,
     ) -> "MultiTokenOutput":
         """Generate N continuations of one prompt (generative teaching).
 
@@ -336,6 +337,10 @@ class LLMServerClient:
                 temperature=temperature,
                 top_p=top_p,
                 seed=seed,
+                # vLLM priority scheduling: LOWER number = served first. Ignored under the default
+                # fcfs policy, so this is inert unless the engine is started with
+                # scheduling_policy=priority.
+                priority=priority,
             )
         finally:
             self._release_server(server_id)

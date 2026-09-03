@@ -386,6 +386,20 @@ class StateCreditConfig(BaseConfig):
         that matches the training objective, so it is the default.
     beta: weight of the state term against the token-level OPD loss, in
         u_t = a_t^OPD + beta * G_tilde_{j(t)}.
+    cont_cap: hard ceiling on a single continuation, in tokens. 0 disables it and the budget is
+        whatever budget_mode says. Non-zero takes min(budget, cont_cap).
+
+        THIS CHANGES WHAT PHI MEANS and is not a free speedup. Measured at B=16384 with
+        budget_mode=remaining: 27-31% of continuations ran to their cap, and working back from the
+        mean length (5127 tokens) those truncated ones account for ~64% of ALL teacher decode
+        tokens. A truncated continuation scores 0 whether or not the state was solvable, so that
+        majority of the teacher's work buys a degenerate measurement.
+
+        Capping at 4096 cuts mean continuation length to ~3050 -- about 40% less teacher work --
+        but Phi then answers "solvable within cont_cap tokens from here" instead of "within the
+        task's remaining budget". Both are legitimate operational definitions; they are not the
+        same one, and Phi values measured under different caps must not be pooled. The cap rides
+        the record (sc_fp_cont_cap) for exactly that reason.
     credit_norm: how a chunk's centered credit reaches its tokens.
         "broadcast" (default) gives every token in the chunk the same G_tilde, leaving the 1/T
             normalisation to the loss aggregator.
@@ -415,6 +429,7 @@ class StateCreditConfig(BaseConfig):
     M: int = 4
     B: int = 20480
     budget_mode: str = "remaining"
+    cont_cap: int = 0
     beta: float = 1.0
     credit_norm: str = "broadcast"
     base_loss_mode: str = "k1"
@@ -432,10 +447,36 @@ class StateCreditConfig(BaseConfig):
             raise ValueError(f"state_credit.depths must be positive, got {self.depths}")
         if self.depths != sorted(self.depths) or len(set(self.depths)) != len(self.depths):
             raise ValueError(f"state_credit.depths must be strictly ascending, got {self.depths}")
-        if self.M < 2:
-            raise ValueError(f"state_credit.M must be >= 2 to estimate Phi, got {self.M}")
+        if self.M < 1:
+            raise ValueError(f"state_credit.M must be >= 1, got {self.M}")
+        if self.M == 1:
+            # M=1 makes Phi a single Bernoulli draw per state, so Delta lands in {-1, 0, +1}. It is
+            # still UNBIASED -- the guard used to refuse it at M<2 with no stated reason, and there
+            # is no mathematical bar. What it costs is measurable, and was measured (2026-08-29,
+            # n=3517 Phi estimates from the M=4 run):
+            #
+            #   the latent per-state solvability p is nearly BIMODAL -- 61.1% of states scored 0/4
+            #   and 23.3% scored 4/4 -- so E[p(1-p)] is only 0.0434 and the binomial term shrinks
+            #   fast. SE(Delta) = sqrt(2*0.0434/M): 0.295 at M=1, 0.208 at M=2, 0.147 at M=4.
+            #   Against the documented 0.104 separation that is a per-transition signal/noise of
+            #   0.35 / 0.50 / 0.71. Leave-one-out centering over a problem's rollouts recovers
+            #   roughly sqrt(group size) of it.
+            #
+            # Allowed so the M sweep can be run, NOT recommended: at M=1 a single verifier failure
+            # or truncated draw decides the state outright, with no other sample to average against.
+            logger.warning(
+                "[STATE-CREDIT] M=1: Phi is a single Bernoulli draw per state (SE(Delta)~0.295 "
+                "against a ~0.104 separation). Unbiased but the noisiest setting that runs; "
+                "credit quality depends entirely on leave-one-out group averaging.")
         if self.B < 1:
             raise ValueError(f"state_credit.B must be >= 1, got {self.B}")
+        if self.cont_cap < 0:
+            raise ValueError(f"state_credit.cont_cap must be >= 0 (0 disables), got {self.cont_cap}")
+        if 0 < self.cont_cap < _MIN_REMAINING_BUDGET:
+            raise ValueError(
+                f"state_credit.cont_cap={self.cont_cap} is under the {_MIN_REMAINING_BUDGET}-token "
+                f"floor. Below it Phi measures whether the continuation fits, not whether the state "
+                f"is solvable -- the same failure the budget_mode floor exists to prevent.")
         if self.credit_norm not in ("broadcast", "per_chunk"):
             raise ValueError(
                 f"state_credit.credit_norm must be 'broadcast' or 'per_chunk', got "

@@ -113,6 +113,12 @@ state_credit:
   #     deep state is scored with more room than the task ever allows.
   budget_mode: remaining
 
+  # Hard ceiling on one continuation, in tokens. 0 = no ceiling (budget_mode decides).
+  # NOT a free speedup: it changes Phi from "solvable in the task's remaining budget" to "solvable
+  # within cont_cap tokens". Measured motivation -- at B=16384, 27-31% of continuations ran to
+  # their cap and account for ~64% of all teacher decode tokens, buying a Phi of 0 either way.
+  cont_cap: 0
+
   # How a chunk's centered credit reaches its tokens.
   #   broadcast: every token in the chunk gets the same G~ (Sec 7); the loss aggregator owns 1/T.
   #   per_chunk: divide by (chunks in row * chunk length), giving each chunk equal TOTAL weight

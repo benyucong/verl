@@ -215,6 +215,7 @@ class AsyncTeacherLLMServerManager:
         session_id: Optional[str] = None,
         seed: Optional[int] = None,
         is_final: bool = False,
+        priority: int = 0,
     ) -> tuple[list[list[int]], dict]:
         """N teacher continuations of ONE audited chunk's prefix (generative teaching).
 
@@ -268,6 +269,7 @@ class AsyncTeacherLLMServerManager:
             seed=seed,
             is_final=is_final,
             track_parent=bool(use_stable_routing),
+            priority=priority,
         )
         dt = time.perf_counter() - t0
 
@@ -282,6 +284,9 @@ class AsyncTeacherLLMServerManager:
             )
         telemetry = {
             "teacher_gen_seconds": dt,
+            # Engine queue wait for THIS probe (arrival -> first schedule). None when the engine
+            # did not report metrics; never defaulted to 0.0, which would read as "no queue".
+            "teacher_queue_wait_s": (getattr(out, "extra_fields", None) or {}).get("queue_wait_s"),
             "teacher_gen_tokens": sum(len(x) for x in out.sequences),
             "teacher_prefix_tokens": len(prefix_ids),
             "teacher_cached_tokens": out.num_cached_tokens,

@@ -159,9 +159,12 @@ def sc_budget_for_depth(sc_config, d: int) -> int:
     silently: it would simply miss every early launch and quietly re-issue the work.
     """
     B = int(sc_config.B)
-    if getattr(sc_config, "budget_mode", "remaining") != "remaining":
-        return B
-    return max(1, B - int(d))
+    if getattr(sc_config, "budget_mode", "remaining") == "remaining":
+        B = max(1, B - int(d))
+    # A hard ceiling on top of whichever budget rule applies. See StateCreditConfig.cont_cap: it is
+    # a change to what Phi MEASURES, not a tuning knob, and it is fingerprinted for that reason.
+    cap = int(getattr(sc_config, "cont_cap", 0) or 0)
+    return min(B, cap) if cap > 0 else B
 
 
 async def run_state_credit(
@@ -182,6 +185,10 @@ async def run_state_credit(
     `store` holds continuations launched EARLY, as the stream crossed each depth. Reusing them is
     what makes the teacher's work overlap generation instead of following it.
     """
+    # EOS. run_state_credit is called once the response is complete, so entering it IS the moment
+    # generation ended -- the reference point that turns "we launched 806 of 806 depths early" into
+    # "we launched them N seconds before we needed them".
+    t_eos = time.time()
     depths = [int(d) for d in (sc_config.depths or [])]
     M = int(sc_config.M)
     T = len(response_ids)
@@ -192,6 +199,10 @@ async def run_state_credit(
             "sc_truncated": 0, "sc_scored": 0, "sc_verifier_failed": 0,
             "sc_trunc_unmeasured": 0, "sc_cont_max_tokens": 0,
             "sc_prefix_tokens_logical": 0, "sc_prefix_tokens_cached": 0,
+            # Engine queue wait: SUM over this trajectory's probes, and the DEEPEST probe's alone
+            # (the one that gates the commit). -1.0, not 0.0, when unmeasured: a queue that reads
+            # as empty is exactly the wrong default for the question this exists to answer.
+            "sc_queue_wait_s": 0.0, "sc_queue_wait_deepest_s": -1.0,
             # Sec 12.3 measurement-policy fingerprint. Phi means nothing without the settings it was
             # measured under, and "read them off the config afterwards" is exactly how this repo lost
             # a whole campaign to a teacher response_length of 512 that nobody had recorded. These
@@ -206,6 +217,7 @@ async def run_state_credit(
             "sc_fp_teacher": None,
             # The verifier's identity, not just its fast/slow flag: Sec 12.3 lists the verifier and
             # the answer extractor separately, and both live in this module.
+            "sc_fp_cont_cap": int(getattr(sc_config, "cont_cap", 0) or 0),
             "sc_fp_verifier": "custom_reward.ttrl_math.compute_score"}
     if not reached:
         # Not an error: a short trajectory has no interior state to evaluate. The driver drops it
@@ -246,19 +258,38 @@ async def run_state_credit(
             got = await store.take(d, expect_key=store.request_key(prefix, M, B, d_seed))
         if got is not None:
             return got[0], got[1], True
-        seqs, t = await teacher_manager.generate_chunk_continuations(
-            prefix_ids=prefix,
-            n=M,
-            max_tokens=B,
-            routing_key=routing_key,
-            session_id=session_id,
-            seed=d_seed,
-            # An EARLY launch cannot know which depth is last: the set is only settled once the
-            # true response length is known. So no call carries is_final and the parent's FIFO
-            # state is released explicitly once every depth is in hand.
-            is_final=False,
-        )
-        return seqs, t, False
+        # ONE RETRY, IN BOTH ARMS. store.take() swallows a failed proposal and returns None, so the
+        # treatment already got a free second attempt at every early-launched depth; the baseline
+        # has no store, so the same transient fault propagated out of the gather below and killed
+        # the whole trajectory's commit. That is an arm-asymmetric survival filter sitting directly
+        # on the quantity being compared -- teacher_manager raises RuntimeError("teacher returned no
+        # continuations") whenever vLLM aborts a request mid-flight, which is exactly the kind of
+        # fault a burst of early launches makes more likely in the arm that tolerates it.
+        #
+        # Retrying here rather than removing the treatment's tolerance: dropping a trajectory loses
+        # a whole LOO group, and the retry is free when nothing fails.
+        last_exc = None
+        for _attempt in range(2):
+            try:
+                seqs, t = await teacher_manager.generate_chunk_continuations(
+                    prefix_ids=prefix,
+                    n=M,
+                    max_tokens=B,
+                    routing_key=routing_key,
+                    session_id=session_id,
+                    seed=d_seed,
+                    priority=sc_priority_for_depth(sc_config, d),
+                    # An EARLY launch cannot know which depth is last: the set is only settled once
+                    # the true response length is known. So no call carries is_final and the
+                    # parent's FIFO state is released explicitly once every depth is in hand.
+                    is_final=False,
+                )
+                return seqs, t, False
+            except Exception as e:                  # noqa: BLE001 -- re-raised below if both fail
+                last_exc = e
+                logger.warning("[STATE-CREDIT] depth %d continuation failed (attempt %d/2): %s",
+                               d, _attempt + 1, e)
+        raise last_exc
 
     fetched = await asyncio.gather(*[_fetch(d) for d in reached])
 
@@ -303,6 +334,11 @@ async def run_state_credit(
                 tele["sc_truncated"] += 1
         tele["sc_scored"] += len(qs)
         tele["sc_gen_seconds"] += (t or {}).get("teacher_gen_seconds") or 0.0
+        _qw = (t or {}).get("teacher_queue_wait_s")
+        if _qw is not None:
+            tele["sc_queue_wait_s"] += float(_qw)
+            if d == reached[-1]:
+                tele["sc_queue_wait_deepest_s"] = float(_qw)
         tele["sc_gen_tokens"] += (t or {}).get("teacher_gen_tokens") or 0
         # LONGEST single continuation, which is what actually bounds B -- and through B the teacher's
         # max_model_len, its KV per sequence, and therefore how many sequences the pool can hold.
@@ -326,10 +362,38 @@ async def run_state_credit(
     tele["sc_reused_early"] = n_reused
     tele["sc_early_frac"] = n_reused / max(1, len(reached))
     if store is not None:
-        # Every depth is accounted for; no call carried is_final, so release the parent's ordering
-        # state here rather than leaving it for the stale reaper.
+        # LEAD TIME, not launch count. sc_reused_early is n/n by CONSTRUCTION whenever depth spacing
+        # equals the chunk size -- every crossed depth launches and every callback is gathered before
+        # the commit -- so it says the launches HAPPENED and nothing about whether they happened
+        # early enough to matter. A depth crossed 640 tokens before EOS scores identically to one
+        # crossed at 12% of generation. spec_lead_s is the quantity the mechanism actually trades on,
+        # and it has been computed inside SpeculativeStore.telemetry() and thrown away for the whole
+        # campaign because nothing here called it (see the sibling bug in omniopd_stage.py, which
+        # does).
+        # DRAIN FIRST, then read telemetry. drain_unused counts the orphans it releases, so
+        # reading before it ran made spec_wasted a permanent 0. It no longer blocks, so ordering it
+        # first costs nothing.
         await store.drain_unused()
+        # WHITELISTED, not merged wholesale. Three of telemetry()'s fields are still constants at
+        # this point and would read as healthy:
+        #   spec_relaunched     initialised at __init__ and incremented NOWHERE -- always 0
+        #   spec_hit_rate       reused / (reused + relaunched), so always exactly 1.0
+        #   spec_waste_multiplier  same dead denominator
+        # Emitting them to fix a missing-metric bug would add three metrics that lie in the same
+        # direction the mechanism is being argued in.
         try:
+            _st = store.telemetry(t_eos) or {}
+            for _k in ("spec_lead_s", "spec_lead_first_s", "spec_launched", "spec_reused",
+                       "spec_key_mismatch", "spec_wasted"):
+                if _k in _st:
+                    tele["sc_%s" % _k] = _st[_k]
+        except Exception:                            # telemetry must never take down a trajectory
+            logger.warning("[STATE-CREDIT] store telemetry failed", exc_info=True)
+        try:
+            # NOTE: with a non-blocking drain this can run while an orphan RPC carrying the same
+            # session_id is still in flight. Inert while the per-parent FIFO is off (it needs
+            # OPD_TEACHER_INCREMENTAL_SCORE + OPD_TEACHER_PER_PARENT_FIFO, neither of which this
+            # launcher exports); revisit before turning either on.
             teacher_manager.release_parent(session_id)
         except AttributeError:
             pass       # older manager without the explicit release; the reaper still collects it
@@ -362,12 +426,31 @@ async def attach_state_credit(output, *, prompt_ids, response_ids, ground_truth,
         # followed it and the run is the sequential arm wearing a streaming label. `wall` minus
         # `gen_s` is the part the overlap actually removes.
         print("[STATE-CREDIT] sid=%s T=%d depths=%s phi=%s trunc=%.3f gen_s=%.1f vfail=%d "
-              "early=%d/%d maxcont=%d gentok=%d prefix=%d/%d wall=%.1f"
+              "early=%d/%d lead=%.1f/%.1f qw=%.1f/%.1f kmm=%d maxcont=%d gentok=%d prefix=%d/%d wall=%.1f"
               % (session_id, te["sc_response_len"], rec["state_credit_depths"],
                  ["%.3f" % p for p in rec["state_credit_phi"]],
                  te.get("sc_trunc_frac", 0.0), te["sc_gen_seconds"],
                  te["sc_verifier_failed"], te.get("sc_reused_early", 0),
-                 len(rec["state_credit_depths"]), te.get("sc_cont_max_tokens", 0),
+                 len(rec["state_credit_depths"]),
+                 # Seconds between the FIRST early launch and EOS. 0.0 in the control by
+                 # construction (no store, no launches). This is the mechanism's actual currency:
+                 # a lead shorter than the teacher's own service time cannot hide anything, and
+                 # until now the run had no way to say which it was.
+                 # BINDING lead / first-launch lead. The commit gathers every depth, so the
+                 # deepest (last-launched, smallest lead) is what gates the trajectory; the second
+                 # number is the shallowest and is the flattering one. Both are upper bounds --
+                 # launched_at is stamped before the RPC is actually submitted.
+                 te.get("sc_spec_lead_s", 0.0), te.get("sc_spec_lead_first_s", 0.0),
+                 # Engine queue wait, sum over probes / deepest probe alone. The deepest is the
+                 # gating one; if the early arm's number here is LARGER than the control's, the
+                 # gating probe is waiting behind the burst of shallow launches -- head-of-line
+                 # blocking seen directly, not inferred from the tail.
+                 te.get("sc_queue_wait_s", 0.0), te.get("sc_queue_wait_deepest_s", -1.0),
+                 # Fix E's safety net, and the ONLY thing that would have surfaced the late-binding
+                 # closure bug at runtime: a nonzero count means launched prefixes disagree with
+                 # what the commit recomputes, i.e. every mismatched depth is being paid for twice.
+                 te.get("sc_spec_key_mismatch", 0),
+                 te.get("sc_cont_max_tokens", 0),
                  # Teacher decode tokens for this trajectory, SUMMED over every continuation at
                  # every depth. The one number that makes the teacher/student work ratio a
                  # measurement instead of an inference from maxcont -- and that ratio is what
@@ -401,22 +484,52 @@ def sc_seed_for_depth(base_seed, M: int, depth: int):
     return None if base_seed is None else (base_seed + int(M) * int(depth)) % (2**31)
 
 
+def _deep_priority_enabled() -> bool:
+    return os.environ.get("OPD_STATE_CREDIT_DEEP_PRIORITY", "0") not in ("0", "", "false", "False")
+
+
+def sc_priority_for_depth(sc_config, d: int) -> int:
+    """Engine scheduling priority for a probe at depth d. vLLM: LOWER number is served FIRST.
+
+    OFF by default (returns 0 everywhere) so the A/B stays one variable. When on, deeper probes get
+    strictly higher priority: the commit gathers every depth and is gated by the DEEPEST, which is
+    launched last and lands behind the burst of shallow probes the early arm has already queued.
+    Measured 2026-09-01 (acc fixed6): early release cut the MEAN commit wall in every length bucket
+    yet the phase did not shrink, because the slowest trajectory's commit -- the one that gates the
+    phase -- got worse on 11/19 steps (corr 0.96 with the step outcome). Serving the gating probe
+    first is the direct test of that head-of-line explanation.
+
+    Both call sites (early launch and commit) MUST use this helper: priority does not enter the
+    request key, so a disagreement would not be caught -- it would just schedule differently.
+    Inert unless the engine runs scheduling_policy=priority; the launcher sets both together.
+    """
+    return -int(d) if _deep_priority_enabled() else 0
+
+
 def launch_state_credit_early(store, *, prompt_ids, response_ids, sc_config, teacher_manager,
                               session_id=None, routing_key=None, seed=None) -> int:
     """Issue continuations for every depth the stream has just passed. Returns how many started.
 
-    THE GENERATION LOOP PAYS ONE COPY PER DEPTH, ONCE. `response_ids` is referenced rather than
-    snapshotted, and the factory's slice runs inside the coroutine -- which SpeculativeStore.launch
-    starts after an `await asyncio.sleep(0)` and, with OPD_OMNIOPD_SPEC_THREAD=1, on a separate
-    dispatch loop entirely. What remains here is the request key, which needs the prefix bytes and
-    so must materialise prompt + response[:d] synchronously. That is d+|prompt| elements once per
-    depth per trajectory -- not the whole response at every chunk boundary, which is the cost that
-    capped the OmniOPD version at +5.2%.
+    THE GENERATION LOOP PAYS NOTHING PER DEPTH. `response_ids` is referenced rather than
+    snapshotted, and BOTH the factory's slice and the request key run inside the coroutine -- which
+    SpeculativeStore.launch starts after an `await asyncio.sleep(0)` and, with
+    OPD_OMNIOPD_SPEC_THREAD=1, on a separate dispatch loop entirely. The key used to be built here,
+    synchronously, which cost a list concat of d ids plus an array copy plus a sha256 per depth per
+    trajectory on the loop draining tokens for the whole batch -- quadratic in depth count, and
+    present in the early arm only, so no STREAM_ONLY control could see it.
 
-    Referencing the live list is safe because response[:d] is immutable once len(response) > d:
-    generation appends. A partial-rollout rewind is the one case that could violate it, and that is
-    exactly what the request key catches at commit -- take() relaunches rather than substituting a
-    prefix the commit never asked for.
+    WHY THE DEFERRED SLICE IS SAFE -- and it is NOT the append-only argument this used to give.
+    Both streaming paths hand the callback a FRESH per-chunk copy of the response ids, so the list
+    sliced on the dispatch loop is one nobody else holds and no cross-thread mutation is possible.
+    The append-only property is real but never exercised here, and stating it as the invariant
+    invites a future "optimisation" that passes the live list instead -- at which point `_prefix()`
+    would slice after a jitter sleep of up to OPD_STATE_CREDIT_JITTER_S seconds, the `resp_len < d`
+    guard would have been evaluated against a stale length, and switching response_ids to an
+    array/ndarray would silently lose the GIL protection that currently makes the slice atomic.
+
+    A partial-rollout rewind is the one case that could still desynchronise launch and commit, and
+    that is what the request key catches -- take() relaunches rather than substituting a prefix the
+    commit never asked for.
     """
     depths = sorted({int(d) for d in (sc_config.depths or [])})
     if not depths:
@@ -439,23 +552,54 @@ def launch_state_credit_early(store, *, prompt_ids, response_ids, sc_config, tea
 
         B = sc_budget_for_depth(sc_config, d)
 
-        def _factory(_d=int(d), _B=int(B)):
-            # Runs on the dispatch loop, after the first yield -- see the note above.
-            _p = list(prompt_ids) + list(response_ids[:_d])
-            return teacher_manager.generate_chunk_continuations(
-                prefix_ids=_p, n=M, max_tokens=_B,
-                routing_key=routing_key, session_id=session_id,
-                seed=sc_seed_for_depth(seed, M, _d),
-                # No early call can know it is the last: the depth set is only settled once the
-                # true response length is known. The commit releases the parent explicitly instead.
-                is_final=False,
-            )
+        # ONE materialisation, on the DISPATCH loop, shared by the hash and the RPC.
+        #
+        # Both the key and the request need the same prefix bytes, and both used to build them
+        # separately -- the key eagerly, at this call site on the generation loop. That put a list
+        # concat of d ids, an array copy and a sha256 on the loop draining tokens for every
+        # concurrent trajectory in the batch, once per depth, with total work quadratic in depth
+        # count. It is also the arm-asymmetric cost the STREAM_ONLY control cannot see, since the
+        # control never launches.
+        #
+        # BUILT IN ITS OWN FRAME, per depth. The first version of this closed over a `_prefix`
+        # defined in the LOOP body: a free variable, rebound every iteration, and resolved only
+        # when the dispatch loop finally called the factory -- by which time the loop had finished
+        # and every depth resolved it to the DEEPEST one's. Each shallow depth then asked the
+        # teacher to continue from a state up to (max_depth - d) tokens too deep, with the shallow
+        # depth's budget and seed. The commit's key check catches it (it recomputes the key from
+        # the true response_ids[:d], sees a mismatch and re-issues), so Phi survives -- but the
+        # early arm silently pays for every depth TWICE, which lands as a one-sided penalty on the
+        # very throughput number this is measured with. Binding by default argument would also work
+        # and is how the bug got in; a fresh frame cannot be got wrong by a later edit.
+        def _mk(_d: int, _B: int):
+            cell: dict = {}
 
-        # Same identity the commit recomputes, built from the same inputs, so the two agree by
-        # construction. The prefix IS materialised here -- unavoidable, the hash needs the bytes --
-        # but only for the first _d tokens, not the whole response.
-        key = store.request_key(list(prompt_ids) + list(response_ids[:d]), M, B,
-                                sc_seed_for_depth(seed, M, d))
-        store.launch(d, _factory, key=key)
+            def prefix():
+                if "p" not in cell:
+                    # response_ids only ever grows, so [:_d] is the same bytes whenever this is
+                    # evaluated -- the property the whole early-launch design already rests on.
+                    cell["p"] = list(prompt_ids) + list(response_ids[:_d])
+                return cell["p"]
+
+            def factory():
+                return teacher_manager.generate_chunk_continuations(
+                    prefix_ids=prefix(), n=M, max_tokens=_B,
+                    routing_key=routing_key, session_id=session_id,
+                    seed=sc_seed_for_depth(seed, M, _d),
+                    priority=sc_priority_for_depth(sc_config, _d),
+                    # No early call can know it is the last: the depth set is only settled once the
+                    # true response length is known. The commit releases the parent explicitly.
+                    is_final=False,
+                )
+
+            # Same identity the commit recomputes, from the same inputs, so the two agree by
+            # construction -- but evaluated on the dispatch loop, not here.
+            def key():
+                return store.request_key(prefix(), M, _B, sc_seed_for_depth(seed, M, _d))
+
+            return factory, key
+
+        _factory, _key = _mk(int(d), int(B))
+        store.launch(d, _factory, key_factory=_key)
         n_launched += 1
     return n_launched

@@ -325,6 +325,53 @@ def attach_state_credit_weights(batch, config, metrics: dict) -> None:
         stats["verifier_failed"] = _sum("sc_verifier_failed")
         stats["trunc_unmeasured"] = _sum("sc_trunc_unmeasured")
 
+    # ---------------------------------------------------------------------------------------
+    # EARLY-TERMINATION SAFETY GATE (measurement only -- nothing is killed here).
+    #
+    # Streaming makes Phi available WHILE the student is still generating, so the early arm could
+    # abandon a trajectory whose interior state the teacher already fails from. The control cannot:
+    # it learns Phi at EOS, when the tokens are already paid for. Measured on job 939937, 27.3% of
+    # ALL student generation happens after a checkpoint that scored Phi=0, so the prize is large.
+    #
+    # The number that decides whether it is SAFE is not the prize, it is the FALSE KILL RATE:
+    # P(the student still got it right | Phi = 0 at its deepest checkpoint). The teacher here is the
+    # same size as the student (both 1.5B), so "the teacher could not finish from this state" is NOT
+    # evidence the student cannot. Gating generation on a signal whose miss rate was never measured
+    # is what closed the judge-gated OPD line -- that judge missed 18-41% of provably wrong steps
+    # against a 5% bar.
+    #
+    # This block only CROSS-TABULATES what already exists on the batch. It must land before any
+    # kill switch is written.
+    try:
+        _n0 = _n0_correct = _n_pos = _n_pos_correct = 0
+        _tok_after_0 = _tok_total = 0
+        for _ph, _dp, _tm, _L in zip(list(ntb["state_credit_phi"]), list(ntb["state_credit_depths"]),
+                                     terminal, lengths):
+            _tok_total += int(_L)
+            if not _dp or not _ph or len(_ph) != len(_dp):
+                continue
+            _deep_phi, _deep_d = float(_ph[-1]), int(_dp[-1])
+            _right = float(_tm) > 0.0
+            if _deep_phi == 0.0:
+                _n0 += 1
+                _n0_correct += int(_right)
+                _tok_after_0 += max(0, int(_L) - _deep_d)
+            else:
+                _n_pos += 1
+                _n_pos_correct += int(_right)
+        stats["kill_gate_n_phi0"] = float(_n0)
+        stats["kill_gate_n_phi_pos"] = float(_n_pos)
+        # THE gate. A kill switch is only safe if this is small; it is the fraction of correct
+        # trajectories that gating on Phi=0 would have thrown away.
+        stats["kill_gate_false_kill_rate"] = (_n0_correct / _n0) if _n0 else float("nan")
+        stats["kill_gate_true_rate_when_pos"] = (_n_pos_correct / _n_pos) if _n_pos else float("nan")
+        # Of every correct trajectory in the batch, what share would a Phi=0 kill have destroyed.
+        _corr = _n0_correct + _n_pos_correct
+        stats["kill_gate_correct_lost_frac"] = (_n0_correct / _corr) if _corr else float("nan")
+        stats["kill_gate_savable_token_frac"] = (_tok_after_0 / _tok_total) if _tok_total else float("nan")
+    except Exception:                    # a diagnostic must never take down the update
+        logger.warning("[STATE-CREDIT] kill-gate diagnostic failed", exc_info=True)
+
     batch.batch["state_credit_weights"] = _torch.as_tensor(
         W, dtype=_torch.float32, device=resp_mask.device)
     for k, v in stats.items():

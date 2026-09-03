@@ -149,6 +149,25 @@ def dispatch_thread_enabled() -> bool:
     return os.environ.get("OPD_OMNIOPD_SPEC_THREAD", "0") not in ("0", "", "false", "False")
 
 
+def _launch_jitter_s() -> float:
+    """Max seconds to spread one trajectory's early launches over. 0 = off (fire at the crossing).
+
+    Sized against the BOUNDARY INTERVAL, not the step: at spacing 1024 with ~8000-token responses a
+    boundary passes every ~1/8th of generation, so a jitter of a few seconds de-synchronises the
+    batch while costing almost none of the head start the mechanism exists to buy.
+    """
+    try:
+        return max(0.0, float(os.environ.get("OPD_STATE_CREDIT_JITTER_S", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+def _stable_hash(s) -> int:
+    """Deterministic across processes -- Python's hash() is salted per interpreter, so using it here
+    would give the two arms different launch schedules and make them incomparable."""
+    return int(hashlib.sha256(str(s).encode()).hexdigest()[:8], 16)
+
+
 def _spec_semaphore(size: Optional[int] = None):
     """Bound in-flight SPECULATIVE teacher requests, per event loop.
 
@@ -226,7 +245,8 @@ class SpeculativeStore:
         h.update(b"|%d|%d|%s" % (int(n), int(max_tokens), str(seed).encode()))
         return h.hexdigest()[:16]
 
-    def launch(self, anchor: int, coro_factory, key: Optional[str] = None) -> None:
+    def launch(self, anchor: int, coro_factory, key: Optional[str] = None,
+               key_factory=None) -> None:
         """Start one proposal. Never awaited here -- that is the entire point.
 
         ensure_future makes the teacher CALL concurrent, but it does not move any of this off the
@@ -234,17 +254,64 @@ class SpeculativeStore:
         its first await -- notably materialising the prefix -- runs synchronously on that loop, so
         the factory is written to do its work INSIDE the coroutine, after the first yield point,
         rather than in the caller.
+
+        `key_factory` extends that same rule to the request KEY, which used to break it. Passing
+        `key=` means the caller has already built the prefix and hashed it ON the generation loop:
+        a list concat of `anchor` ids, an 8-byte-per-token array copy and a sha256 over it, per
+        depth per trajectory -- work that is QUADRATIC in depth count, since depth k hashes k
+        chunks. One event loop serves every concurrent trajectory in the batch, so that cost is
+        subtracted from token draining for all of them, and it exists ONLY in the arm that launches
+        early. It is therefore invisible to the STREAM_ONLY control, which was built to make the
+        two arms differ in release time alone.
+
+        Pass `key_factory` instead: a zero-argument callable evaluated inside the coroutine, on the
+        dispatch loop, after the first yield. `take()` reads the key only after awaiting the task,
+        so it is always set by the time it is compared.
         """
         if anchor in self.tasks:
             return
 
+        # JITTER. Every trajectory in a batch decodes at roughly the same rate, so they all cross
+        # boundary d at roughly the same MOMENT -- and "release at the earliest causally valid
+        # moment" turns out to mean "release at the same instant as everyone else". The teacher then
+        # receives batch_size x M requests in one burst per boundary instead of a stream, and
+        # everything behind the burst waits.
+        #
+        # Measured (roihu, spacing 1024, 64 trajectories => 256-wide bursts): the early arm's teacher
+        # RPC time was slightly LOWER than the sequential arm's (1064s vs 1138s) while its commit
+        # waited LONGER (145s vs 116s). Same work, started sooner, finished later -- which only
+        # happens in a queue. EOS-triggered release is naturally staggered because response lengths
+        # vary hugely (sd ~5000 tokens), so the baseline got its smoothing for free.
+        #
+        # A per-in-flight CAP throttles the queue; it does not stop it forming (measured: halved the
+        # penalty, did not remove it). Spreading each trajectory's launches does. The offset is
+        # DETERMINISTIC in the session id -- a random one would make the schedule unreproducible
+        # across arms, and reproducibility is what lets the two arms be compared at all.
+        _j = _launch_jitter_s()
+        # base_seed is derived from the session id, so it is unique per TRAJECTORY and stable
+        # across processes -- which is what de-synchronises trajectories from each other while
+        # keeping each one's schedule identical between the two arms.
+        _off = ((_stable_hash(self.base_seed) % 1000) / 1000.0 * _j) if _j > 0 else 0.0
+
+        def _set_key():
+            # On the dispatch loop, not the caller's. Ordered BEFORE the jitter sleep so the key is
+            # in place as early as possible; take() does not read it until the task completes.
+            if key_factory is not None:
+                self.keys[anchor] = key_factory()
+
         if self.max_inflight == 0:
             async def _gated():
                 await asyncio.sleep(0)      # yield first: let the generation stream advance
+                _set_key()
+                if _off:
+                    await asyncio.sleep(_off)
                 return await coro_factory()
         else:
             async def _gated():
                 await asyncio.sleep(0)      # yield first: let the generation stream advance
+                _set_key()
+                if _off:
+                    await asyncio.sleep(_off)
                 async with _spec_semaphore(self.max_inflight):
                     return await coro_factory()
 
@@ -274,6 +341,34 @@ class SpeculativeStore:
         task = self.tasks.pop(anchor, None)
         if task is None:
             return None
+        # AWAIT FIRST, then compare. With key_factory the key is computed on the dispatch loop
+        # inside the task, so it does not exist until the task has run. Reading self.keys before
+        # awaiting would see None and silently accept ANY result as matching -- the exact
+        # substitution the key was added to prevent. The old order was observationally identical
+        # (the mismatch branch awaited the task anyway before returning None), so nothing else
+        # changes here.
+        try:
+            seqs, tele = await task
+        except asyncio.CancelledError:
+            # CancelledError derives from BaseException, so `except Exception` below does NOT catch
+            # it. Left unhandled it escapes take() -> _fetch -> the commit's gather and kills the
+            # trajectory -- and only in the arm that has a store, which is the asymmetry this whole
+            # pass exists to remove.
+            #
+            # Distinguish WHOSE cancellation it is. If the proposal itself was cancelled, it is just
+            # an unusable proposal: drop it and let the caller issue the depth fresh. If WE are
+            # being cancelled, swallowing it would break cooperative cancellation and leave the
+            # commit issuing fresh teacher work during shutdown, so re-raise.
+            if task.cancelled():
+                logger.warning("[%s] proposal for anchor %d was cancelled, relaunching",
+                               self.label, anchor)
+                self.keys.pop(anchor, None)
+                return None
+            raise
+        except Exception as e:                       # a failed proposal is not a failed trajectory
+            logger.warning("[%s] proposal for anchor %d failed, relaunching: %s", self.label, anchor, e)
+            self.keys.pop(anchor, None)
+            return None
         launched_key = self.keys.pop(anchor, None)
         if expect_key is not None and launched_key is not None and launched_key != expect_key:
             # NOT reusable. The stored result answers a different request than the commit is
@@ -282,30 +377,47 @@ class SpeculativeStore:
             self.key_mismatch += 1
             logger.warning("[%s] anchor %d key mismatch (launched %s, commit %s); relaunching "
                            "rather than reusing", self.label, anchor, launched_key, expect_key)
-            try:
-                await task
-            except Exception:
-                pass
-            return None
-        try:
-            seqs, tele = await task
-        except Exception as e:                       # a failed proposal is not a failed trajectory
-            logger.warning("[%s] proposal for anchor %d failed, relaunching: %s", self.label, anchor, e)
             return None
         self.reused += 1
         return seqs, tele
 
     async def drain_unused(self) -> None:
-        """Let unmatched proposals finish and drop their results. v1 does not abort.
+        """Release unmatched proposals WITHOUT blocking the caller. v1 does not abort.
 
         They are NOT cancelled: the decode has already been issued to the engine, so cancelling the
-        awaitable frees no GPU work, and dropping the reference without awaiting produces
+        awaitable frees no GPU work, and dropping the reference without any handler produces
         'task exception was never retrieved' noise that hides real failures.
+
+        But they are no longer AWAITED either, and that distinction is the whole point. This runs on
+        the commit path, so awaiting an orphan put the teacher's slowest discarded request directly
+        in series with the trajectory's critical path -- in the ARM THAT LAUNCHES EARLY ONLY, since
+        the control has no store and never calls this. An orphan is produced whenever a response
+        ends exactly on a depth (launch fires at resp_len >= d, the commit keeps d < T), so the
+        penalty lands on a subset of trajectories in one arm and on none in the other.
+
+        A done-callback retrieves the result instead, which suppresses the warning without putting
+        the wait on the critical path. Coroutine only for signature compatibility with callers that
+        await it.
         """
-        for anchor, task in list(self.tasks.items()):
+        def _reap(fut, _self=self):
             try:
-                await task
-                self.wasted += 1
+                if fut.cancelled():
+                    return
+                fut.exception()          # retrieve, so it is not reported as never-retrieved
+            except Exception:
+                pass                # a future that cannot even report its own state is not our problem
+
+        for anchor, task in list(self.tasks.items()):
+            # Counted HERE, synchronously: an orphan is wasted the moment the commit releases it
+            # without taking it, which is knowable now. Counting it in the done-callback instead
+            # made spec_wasted a permanent 0 for every reader -- including omniopd_stage.py, which
+            # calls telemetry() and had been getting a real number before.
+            self.wasted += 1
+            try:
+                if not task.done():
+                    task.add_done_callback(_reap)
+                else:
+                    _reap(task)
             except Exception:
                 pass
             self.tasks.pop(anchor, None)
@@ -321,6 +433,20 @@ class SpeculativeStore:
         committed = self.reused + self.relaunched
         out["spec_hit_rate"] = (self.reused / committed) if committed else 0.0
         out["spec_waste_multiplier"] = (self.launch_calls / committed) if committed else 0.0
-        if t_eos is not None and self.t_first_launch is not None:
-            out["spec_lead_s"] = max(0.0, t_eos - self.t_first_launch)
+        if t_eos is not None and self.launched_at:
+            leads = [t_eos - t for t in self.launched_at.values()]
+            # THE BINDING LEAD IS THE SMALLEST ONE. The commit gathers EVERY depth, so the
+            # trajectory is gated by whichever proposal finishes last -- normally the one launched
+            # last (the deepest), which had the least head start. Reporting t_first_launch instead
+            # gives the SHALLOWEST depth's lead, i.e. the maximum over depths, and the doc's own
+            # criterion ("a lead shorter than the teacher's service time cannot hide anything")
+            # then reads the most flattering number available. On a [2560,5120,7680] trajectory at
+            # ~1 tok/ms that is 5.4s reported against a 0.3s lead that actually binds.
+            out["spec_lead_s"] = max(0.0, min(leads))
+            out["spec_lead_first_s"] = max(0.0, max(leads))
+            # STILL AN UPPER BOUND, both ends. launched_at is stamped when launch() creates the
+            # task -- before the first yield, the key hash, the jitter sleep and the semaphore --
+            # not when the RPC is submitted; and t_eos is taken at commit entry, after scoring. Both
+            # errors inflate the lead, and the control prints nothing to cancel them. Treat a large
+            # lead as "not yet ruled out", never as "the work was hidden".
         return out
